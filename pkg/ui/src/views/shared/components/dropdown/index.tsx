@@ -18,6 +18,7 @@ import "./dropdown.styl";
 import {leftArrow, rightArrow} from "src/views/shared/components/icons";
 import { trustIcon } from "src/util/trust";
 import ReactSelectClass from "react-select";
+import { Icon } from "antd";
 
 export interface DropdownOption {
   value: string;
@@ -39,6 +40,7 @@ interface DropdownOwnProps {
   // Disable any arrows in the arrow direction array.
   disabledArrows?: ArrowDirection[];
   content?: any;
+  isTimeRange?: boolean;
 }
 
 /**
@@ -68,11 +70,19 @@ export default class Dropdown extends React.Component<DropdownOwnProps, {}> {
     }
   }
 
+  arrowRenderer = ({ isOpen }: { isOpen: boolean }) => {
+    if (!isOpen) {
+      return <span><Icon type="caret-up" /></span>;
+    }
+    return <span className="active"><Icon type="caret-down" /></span>;
+  }
+
   render() {
-    const {selected, options, onChange, onArrowClick, disabledArrows, content} = this.props;
+    const { selected, options, onChange, onArrowClick, disabledArrows, content, isTimeRange } = this.props;
 
     const className = classNames(
       "dropdown",
+      isTimeRange ? "_range" : "",
       { "dropdown--side-arrows": !_.isNil(onArrowClick) },
     );
     const leftClassName = classNames(
@@ -92,12 +102,13 @@ export default class Dropdown extends React.Component<DropdownOwnProps, {}> {
         onClick={() => this.props.onArrowClick(ArrowDirection.LEFT)}>
       </span>
       <span
-        className="dropdown__title"
+        className={isTimeRange ? "dropdown__range-title" : "dropdown__title"}
         ref={this.titleRef}>
-          {this.props.title}{this.props.title ? ":" : ""}
+          {this.props.title}{this.props.title && !isTimeRange ? ":" : ""}
       </span>
       {content ? content : <Select
         className="dropdown__select"
+        arrowRenderer={this.arrowRenderer}
         clearable={false}
         searchable={false}
         options={options}

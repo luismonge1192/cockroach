@@ -61,6 +61,11 @@ func newRemoteClient(blobClient blobspb.BlobClient) BlobClient {
 }
 
 func (c *remoteClient) ReadFile(ctx context.Context, file string) (io.ReadCloser, error) {
+	// Check that file exists before reading from it
+	_, err := c.Stat(ctx, file)
+	if err != nil {
+		return nil, err
+	}
 	stream, err := c.blobClient.GetStream(ctx, &blobspb.GetRequest{
 		Filename: file,
 	})
@@ -117,12 +122,12 @@ var _ BlobClient = &localClient{}
 // localClient executes the local blob service's code
 // to Read or Write bulk files on the current node.
 type localClient struct {
-	localStorage *localStorage
+	localStorage *LocalStorage
 }
 
 // newLocalClient instantiates a local blob service client.
 func newLocalClient(externalIODir string) (BlobClient, error) {
-	storage, err := newLocalStorage(externalIODir)
+	storage, err := NewLocalStorage(externalIODir)
 	if err != nil {
 		return nil, errors.Wrap(err, "creating local client")
 	}

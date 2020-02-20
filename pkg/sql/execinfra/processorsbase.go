@@ -233,7 +233,7 @@ func (h *ProcOutputHelper) EmitRow(
 	}
 
 	if log.V(3) {
-		log.InfofDepth(ctx, 1, "pushing row %s", outRow)
+		log.InfofDepth(ctx, 1, "pushing row %s", outRow.String(h.OutputTypes))
 	}
 	if r := h.output.Push(outRow, nil); r != NeedMoreRows {
 		log.VEventf(ctx, 1, "no more rows required. drain requested: %t",
@@ -275,7 +275,7 @@ func (h *ProcOutputHelper) ProcessRow(
 			return nil, false, err
 		}
 		if !passes {
-			if log.V(3) {
+			if log.V(4) {
 				log.Infof(ctx, "filtered out row %s", row.String(h.filter.Types))
 			}
 			return nil, true, nil
@@ -324,6 +324,21 @@ func (h *ProcOutputHelper) Close() {
 func (h *ProcOutputHelper) consumerClosed() {
 	h.rowIdx = h.maxRowIdx
 }
+
+// ProcessorConstructor is a function that creates a Processor. It is
+// abstracted away so that we could create mixed flows (i.e. a vectorized flow
+// with wrapped processors) without bringing a dependency on sql/rowexec
+// package into sql/colexec package.
+type ProcessorConstructor func(
+	ctx context.Context,
+	flowCtx *FlowCtx,
+	processorID int32,
+	core *execinfrapb.ProcessorCoreUnion,
+	post *execinfrapb.PostProcessSpec,
+	inputs []RowSource,
+	outputs []RowReceiver,
+	localProcessors []LocalProcessor,
+) (Processor, error)
 
 // ProcessorBase is supposed to be embedded by Processors. It provides
 // facilities for dealing with filtering and projection (through a
@@ -536,13 +551,13 @@ const (
 	//
 	// Other categories of errors might be safe to ignore too; however we
 	// can't ignore all of them. Generally, we need to ensure that all the
-	// trailing metadata (e.g. TxnCoordMeta's) make it to the gateway for
+	// trailing metadata (e.g. LeafTxnFinalState's) make it to the gateway for
 	// successful flows. If an error is telling us that some metadata might
 	// have been dropped, we can't ignore that.
 	StateDraining
 
 	// StateTrailingMeta is the state in which the processor is outputting final
-	// metadata such as the tracing information or the TxnCoordMeta. Once all the
+	// metadata such as the tracing information or the LeafTxnFinalState. Once all the
 	// trailing metadata has been produced, the processor transitions to
 	// StateExhausted.
 	StateTrailingMeta
@@ -708,6 +723,15 @@ func (pb *ProcessorBase) ProcessRowHelper(row sqlbase.EncDatumRow) sqlbase.EncDa
 		pb.MoveToDraining(nil /* err */)
 	}
 	// Note that outRow might be nil here.
+	// TODO(yuzefovich): there is a problem with this logging when MetadataTest*
+	// processors are planned - there is a mismatch between the row and the
+	// output types (rendering is added to the stage of test processors and the
+	// actual processors that are inputs to the test ones have an unset post
+	// processing; I think that we need to set the post processing on the stages
+	// of processors below the test ones).
+	//if outRow != nil && log.V(3) && pb.Ctx != nil {
+	//	log.InfofDepth(pb.Ctx, 1, "pushing row %s", outRow.String(pb.Out.OutputTypes))
+	//}
 	return outRow
 }
 
@@ -854,51 +878,19 @@ func NewMonitor(ctx context.Context, parent *mon.BytesMonitor, name string) *mon
 
 // NewLimitedMonitor is a utility function used by processors to create a new
 // limited memory monitor with the given name and start it. The returned
-// monitor must be closed. The limit is determined by SettingWorkMemBytes
-// or config.TestingKnobs.MemoryLimitBytes.
+// monitor must be closed. The limit is determined by SettingWorkMemBytes but
+// overridden to 1 if config.TestingKnobs.ForceDiskSpill is set or
+// config.TestingKnobs.MemoryLimitBytes if not.
 func NewLimitedMonitor(
 	ctx context.Context, parent *mon.BytesMonitor, config *ServerConfig, name string,
 ) *mon.BytesMonitor {
-	limit := config.TestingKnobs.MemoryLimitBytes
-	if limit <= 0 {
-		limit = SettingWorkMemBytes.Get(&config.Settings.SV)
+	limit := GetWorkMemLimit(config)
+	if config.TestingKnobs.ForceDiskSpill {
+		limit = 1
 	}
 	limitedMon := mon.MakeMonitorInheritWithLimit(name, limit, parent)
 	limitedMon.Start(ctx, parent, mon.BoundAccount{})
 	return &limitedMon
-}
-
-// GetInputStats is a utility function to check whether the given input is
-// collecting stats, returning true and the stats if so. If false is returned,
-// the input is not collecting stats.
-func GetInputStats(flowCtx *FlowCtx, input RowSource) (InputStats, bool) {
-	isc, ok := input.(*InputStatCollector)
-	if !ok {
-		return InputStats{}, false
-	}
-	return getStatsInner(flowCtx, isc.InputStats), true
-}
-
-func getStatsInner(flowCtx *FlowCtx, stats InputStats) InputStats {
-	if flowCtx.Cfg.TestingKnobs.DeterministicStats {
-		stats.StallTime = 0
-	}
-	return stats
-}
-
-// GetFetcherInputStats is a utility function to check whether the given input
-// is collecting row fetcher stats, returning true and the stats if so. If
-// false is returned, the input is not collecting row fetcher stats.
-func GetFetcherInputStats(flowCtx *FlowCtx, f RowFetcher) (InputStats, bool) {
-	rfsc, ok := f.(*RowFetcherStatCollector)
-	if !ok {
-		return InputStats{}, false
-	}
-	// Add row fetcher start scan stall time to Next() stall time.
-	if !flowCtx.Cfg.TestingKnobs.DeterministicStats {
-		rfsc.stats.StallTime += rfsc.startScanStallTime
-	}
-	return getStatsInner(flowCtx, rfsc.stats), true
 }
 
 // LocalProcessor is a RowSourcedProcessor that needs to be initialized with

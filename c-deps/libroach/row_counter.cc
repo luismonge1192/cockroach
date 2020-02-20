@@ -92,7 +92,6 @@ bool RowCounter::Count(const rocksdb::Slice& key, cockroach::roachpb::BulkOpSumm
     return true;
   }
 
-
   prev_key.assign(decoded_key.data(), decoded_key.size());
 
   uint64_t tbl;
@@ -100,17 +99,13 @@ bool RowCounter::Count(const rocksdb::Slice& key, cockroach::roachpb::BulkOpSumm
     return false;
   }
 
-  if (tbl < MaxReservedDescID) {
-    summary->set_system_records(summary->system_records() + 1);
+  uint64_t index_id;
+  if (!DecodeUvarint64(&decoded_key, &index_id)) {
+    return false;
+  } else if (index_id == 1) {
+    summary->set_rows(summary->rows() + 1);
   } else {
-    uint64_t index_id;
-    if (!DecodeUvarint64(&decoded_key, &index_id)) {
-      return false;
-    } else if (index_id == 1) {
-      summary->set_rows(summary->rows() + 1);
-    } else {
-      summary->set_index_entries(summary->index_entries() + 1);
-    }
+    summary->set_index_entries(summary->index_entries() + 1);
   }
 
   return true;

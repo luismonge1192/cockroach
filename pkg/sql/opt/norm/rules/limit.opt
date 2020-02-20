@@ -129,7 +129,7 @@ $input
         $on:*
         $private:*
     )
-    (Const $limit:*) & ^(LimitGeMaxRows $limit $left)
+    (Const $limit:*) & (IsPositiveLimit $limit) & ^(LimitGeMaxRows $limit $left)
     $ordering:* & (HasColsInOrdering $left $ordering)
 )
 =>
@@ -141,34 +141,6 @@ $input
             (PruneOrdering $ordering (OutputCols $left))
         )
         $right
-        $on
-        $private
-    )
-    (Const $limit)
-    $ordering
-)
-
-# PushLimitIntoRightJoin is symmetric with PushLimitIntoLeftJoin.
-[PushLimitIntoRightJoin, Normalize]
-(Limit
-    $input:(RightJoin
-        $left:*
-        $right:*
-        $on:*
-        $private:*
-    )
-    (Const $limit:*) & ^(LimitGeMaxRows $limit $right)
-    $ordering:* & (HasColsInOrdering $right $ordering)
-)
-=>
-(Limit
-    (RightJoin
-        $left
-        (Limit
-            $right
-            (Const $limit)
-            (PruneOrdering $ordering (OutputCols $right))
-        )
         $on
         $private
     )

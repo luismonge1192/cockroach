@@ -84,7 +84,7 @@ func TestClosedTimestampCanServe(t *testing.T) {
 				t.Fatal(pErr)
 			}
 			found = true
-			if !ts.Less(resp.Txn.WriteTimestamp) || resp.Txn.ReadTimestamp == resp.Txn.WriteTimestamp {
+			if resp.Txn.WriteTimestamp.LessEq(ts) || resp.Txn.ReadTimestamp == resp.Txn.WriteTimestamp {
 				t.Fatal("timestamp did not get bumped")
 			}
 			break
@@ -460,7 +460,16 @@ func setupTestClusterForClosedTimestampTesting(
 	repls []*storage.Replica,
 ) {
 
-	tc = serverutils.StartTestCluster(t, numNodes, base.TestClusterArgs{})
+	tc = serverutils.StartTestCluster(t, numNodes, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			Knobs: base.TestingKnobs{
+				Store: &storage.StoreTestingKnobs{
+					RangeFeedPushTxnsInterval: 10 * time.Millisecond,
+					RangeFeedPushTxnsAge:      20 * time.Millisecond,
+				},
+			},
+		},
+	})
 	db0 = tc.ServerConn(0)
 
 	if _, err := db0.Exec(fmt.Sprintf(`

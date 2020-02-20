@@ -22,12 +22,14 @@ import (
 )
 
 func init() {
-	RegisterCommand(roachpb.ResolveIntent, declareKeysResolveIntent, ResolveIntent)
+	RegisterReadWriteCommand(roachpb.ResolveIntent, declareKeysResolveIntent, ResolveIntent)
 }
 
 func declareKeysResolveIntentCombined(
 	desc *roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
 ) {
+	// TODO(nvanbenschoten): declare this span at the txn's MinTimestamp. See
+	// lockTable.UpdateLocks for more.
 	DefaultDeclareKeys(desc, header, req, spans)
 	var status roachpb.TransactionStatus
 	var txnID uuid.UUID
@@ -39,7 +41,9 @@ func declareKeysResolveIntentCombined(
 		status = t.Status
 		txnID = t.IntentTxn.ID
 	}
-	if WriteAbortSpanOnResolve(status) {
+	if status == roachpb.ABORTED {
+		// We don't always write to the abort span when resolving an ABORTED
+		// intent, but we can't tell whether we will or not ahead of time.
 		spans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{Key: keys.AbortSpanKey(header.RangeID, txnID)})
 	}
 }
@@ -52,7 +56,7 @@ func declareKeysResolveIntent(
 
 func resolveToMetricType(status roachpb.TransactionStatus, poison bool) *result.Metrics {
 	var typ result.Metrics
-	if WriteAbortSpanOnResolve(status) {
+	if status == roachpb.ABORTED {
 		if poison {
 			typ.ResolvePoison = 1
 		} else {
@@ -67,7 +71,7 @@ func resolveToMetricType(status roachpb.TransactionStatus, poison bool) *result.
 // ResolveIntent resolves a write intent from the specified key
 // according to the status of the transaction which created it.
 func ResolveIntent(
-	ctx context.Context, batch engine.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, readWriter engine.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
 ) (result.Result, error) {
 	args := cArgs.Args.(*roachpb.ResolveIntentRequest)
 	h := cArgs.Header
@@ -77,20 +81,17 @@ func ResolveIntent(
 		return result.Result{}, ErrTransactionUnsupported
 	}
 
-	intent := roachpb.Intent{
-		Span:   args.Span(),
-		Txn:    args.IntentTxn,
-		Status: args.Status,
-	}
-	if err := engine.MVCCResolveWriteIntent(ctx, batch, ms, intent); err != nil {
+	intent := args.AsIntent()
+	ok, err := engine.MVCCResolveWriteIntent(ctx, readWriter, ms, intent)
+	if err != nil {
 		return result.Result{}, err
 	}
 
 	var res result.Result
 	res.Local.Metrics = resolveToMetricType(args.Status, args.Poison)
 
-	if WriteAbortSpanOnResolve(args.Status) {
-		if err := SetAbortSpan(ctx, cArgs.EvalCtx, batch, ms, args.IntentTxn, args.Poison); err != nil {
+	if WriteAbortSpanOnResolve(args.Status, args.Poison, ok) {
+		if err := UpdateAbortSpan(ctx, cArgs.EvalCtx, readWriter, ms, args.IntentTxn, args.Poison); err != nil {
 			return result.Result{}, err
 		}
 	}

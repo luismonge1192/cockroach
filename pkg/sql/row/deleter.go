@@ -38,6 +38,7 @@ type Deleter struct {
 // expectation of which values are passed as values to DeleteRow. Any column
 // passed in requestedCols will be included in FetchCols.
 func MakeDeleter(
+	ctx context.Context,
 	txn *client.Txn,
 	tableDesc *sqlbase.ImmutableTableDescriptor,
 	fkTables FkTableMetadata,
@@ -47,14 +48,14 @@ func MakeDeleter(
 	alloc *sqlbase.DatumAlloc,
 ) (Deleter, error) {
 	rowDeleter, err := makeRowDeleterWithoutCascader(
-		txn, tableDesc, fkTables, requestedCols, checkFKs, alloc,
+		ctx, txn, tableDesc, fkTables, requestedCols, checkFKs, alloc,
 	)
 	if err != nil {
 		return Deleter{}, err
 	}
 	if checkFKs == CheckFKs {
 		var err error
-		rowDeleter.cascader, err = makeDeleteCascader(txn, tableDesc, fkTables, evalCtx, alloc)
+		rowDeleter.cascader, err = makeDeleteCascader(ctx, txn, tableDesc, fkTables, evalCtx, alloc)
 		if err != nil {
 			return Deleter{}, err
 		}
@@ -65,6 +66,7 @@ func MakeDeleter(
 // makeRowDeleterWithoutCascader creates a rowDeleter but does not create an
 // additional cascader.
 func makeRowDeleterWithoutCascader(
+	ctx context.Context,
 	txn *client.Txn,
 	tableDesc *sqlbase.ImmutableTableDescriptor,
 	fkTables FkTableMetadata,
@@ -114,7 +116,7 @@ func makeRowDeleterWithoutCascader(
 	}
 	if checkFKs == CheckFKs {
 		var err error
-		if rd.Fks, err = makeFkExistenceCheckHelperForDelete(txn, tableDesc, fkTables,
+		if rd.Fks, err = makeFkExistenceCheckHelperForDelete(ctx, txn, tableDesc, fkTables,
 			fetchColIDtoRowIndex, alloc); err != nil {
 			return Deleter{}, err
 		}
@@ -134,18 +136,25 @@ func (rd *Deleter) DeleteRow(
 	checkFKs checkFKConstraints,
 	traceKV bool,
 ) error {
-	primaryIndexKey, secondaryIndexEntries, err := rd.Helper.encodeIndexes(rd.FetchColIDtoRowIndex, values)
-	if err != nil {
-		return err
-	}
 
 	// Delete the row from any secondary indices.
-	for i := range secondaryIndexEntries {
-		secondaryIndexEntry := &secondaryIndexEntries[i]
-		if traceKV {
-			log.VEventf(ctx, 2, "Del %s", keys.PrettyPrint(rd.Helper.secIndexValDirs[i], secondaryIndexEntry.Key))
+	for i := range rd.Helper.Indexes {
+		entries, err := sqlbase.EncodeSecondaryIndex(
+			rd.Helper.TableDesc.TableDesc(), &rd.Helper.Indexes[i], rd.FetchColIDtoRowIndex, values)
+		if err != nil {
+			return err
 		}
-		b.Del(&secondaryIndexEntry.Key)
+		for _, e := range entries {
+			if traceKV {
+				log.VEventf(ctx, 2, "Del %s", keys.PrettyPrint(rd.Helper.secIndexValDirs[i], e.Key))
+			}
+			b.Del(&e.Key)
+		}
+	}
+
+	primaryIndexKey, err := rd.Helper.encodePrimaryIndex(rd.FetchColIDtoRowIndex, values)
+	if err != nil {
+		return err
 	}
 
 	// Delete the row.

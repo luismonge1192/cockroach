@@ -6,9 +6,7 @@ const: 1 [type=int]
 build-scalar
 1 + 2
 ----
-plus [type=int]
- ├── const: 1 [type=int]
- └── const: 2 [type=int]
+const: 3 [type=int]
 
 build-scalar vars=(string)
 @1
@@ -599,6 +597,37 @@ not [type=bool]
                      ├── const: 1 [type=int]
                      └── const: 2 [type=int]
 
+# The left side of BETWEEN is typed differently in the two comparisons.
+build-scalar
+'' BETWEEN ''::BYTES AND ''
+----
+and [type=bool]
+ ├── ge [type=bool]
+ │    ├── const: '\x' [type=bytes]
+ │    └── const: '\x' [type=bytes]
+ └── le [type=bool]
+      ├── const: '' [type=string]
+      └── const: '' [type=string]
+
+build-scalar
+'' BETWEEN SYMMETRIC ''::BYTES AND ''
+----
+or [type=bool]
+ ├── and [type=bool]
+ │    ├── ge [type=bool]
+ │    │    ├── const: '\x' [type=bytes]
+ │    │    └── const: '\x' [type=bytes]
+ │    └── le [type=bool]
+ │         ├── const: '' [type=string]
+ │         └── const: '' [type=string]
+ └── and [type=bool]
+      ├── ge [type=bool]
+      │    ├── const: '' [type=string]
+      │    └── const: '' [type=string]
+      └── le [type=bool]
+           ├── const: '\x' [type=bytes]
+           └── const: '\x' [type=bytes]
+
 build-scalar
 NULL
 ----
@@ -872,7 +901,7 @@ project
  └── projections
       └── array-flatten [type=tuple{int, int}[]]
            └── project
-                ├── columns: "?column?":1(tuple{int, int})
+                ├── columns: "?column?":1(tuple{int, int}!null)
                 ├── values
                 │    └── tuple [type=tuple]
                 └── projections
@@ -1011,9 +1040,7 @@ tuple [type=tuple{int, string, float}]
  │    └── const: 1 [type=int]
  ├── indirection [type=string]
  │    ├── variable: @2 [type=string[]]
- │    └── plus [type=int]
- │         ├── const: 1 [type=int]
- │         └── const: 1 [type=int]
+ │    └── const: 2 [type=int]
  └── indirection [type=float]
       ├── variable: @3 [type=float[]]
       └── variable: @4 [type=int]

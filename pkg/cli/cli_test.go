@@ -22,7 +22,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -127,10 +126,11 @@ func newCLITest(params cliTestParams) cliTest {
 		}
 
 		s, err := serverutils.StartServerRaw(base.TestServerArgs{
-			Insecure:    params.insecure,
-			SSLCertsDir: c.certsDir,
-			StoreSpecs:  params.storeSpecs,
-			Locality:    params.locality,
+			Insecure:      params.insecure,
+			SSLCertsDir:   c.certsDir,
+			StoreSpecs:    params.storeSpecs,
+			Locality:      params.locality,
+			ExternalIODir: filepath.Join(certsDir, "extern"),
 		})
 		if err != nil {
 			c.fail(err)
@@ -217,12 +217,8 @@ func (c *cliTest) cleanup() {
 }
 
 func (c cliTest) Run(line string) {
-	redirectOutput(func() { c.runUnredirected(line) })
-}
-
-func (c cliTest) runUnredirected(line string) {
 	a := strings.Fields(line)
-	c.runWithArgsUnredirected(a)
+	c.RunWithArgs(a)
 }
 
 // RunWithCapture runs c and returns a string containing the output of c
@@ -231,76 +227,14 @@ func (c cliTest) runUnredirected(line string) {
 // the output of c.
 func (c cliTest) RunWithCapture(line string) (out string, err error) {
 	return captureOutput(func() {
-		c.runUnredirected(line)
+		c.Run(line)
 	})
 }
 
 func (c cliTest) RunWithCaptureArgs(args []string) (string, error) {
 	return captureOutput(func() {
-		c.runWithArgsUnredirected(args)
+		c.RunWithArgs(args)
 	})
-}
-
-// stripWhitespaces removes whitespaces before each newline character.
-// We need to strip whitespace because otherwise we get test failures
-// in Example_tests: some tests produce whitespace at the end of each
-// line, the reference output is in Go comments here, and most text
-// editor remove trailing whitespaces in source files.
-func stripWhitespaces(s string) string {
-	start := 0
-	var res strings.Builder
-	for i := 0; i < len(s); i++ {
-		if s[i] != '\n' {
-			continue
-		}
-		end := i
-		for ; end > start && s[end-1] == ' '; end-- {
-		}
-		res.WriteString(s[start:end])
-		res.WriteByte('\n')
-		start = i + 1
-	}
-	end := len(s)
-	for ; end > start && s[end-1] == ' '; end-- {
-	}
-	res.WriteString(s[start:end])
-	return res.String()
-}
-
-func TestStripWhitespaces(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	testData := []struct {
-		in, out string
-	}{
-		{" ", ""},
-		{" \n", "\n"},
-		{"abc", "abc"},
-		{"abc  ", "abc"},
-		{"abc  \n", "abc\n"},
-		{"abc  \nxyz", "abc\nxyz"},
-	}
-	for _, test := range testData {
-		t.Run(test.in, func(t *testing.T) {
-			res := stripWhitespaces(test.in)
-			if res != test.out {
-				t.Errorf("%q: got %q, expected %q", test.in, res, test.out)
-			}
-		})
-	}
-}
-
-// redirectOutput runs f and prints out either its output, or the
-// error if one was produed. We use redirectOutput for the various
-// Run functions because this ensures that trailing whitespace
-// on each line is properly stripped out; otherwise Example_ tests
-// don't work properly.
-func redirectOutput(f func()) {
-	out, err := captureOutput(f)
-	if err != nil {
-		fmt.Fprintln(stderr, err)
-	} else {
-		fmt.Print(out)
-	}
 }
 
 // captureOutput runs f and returns a string containing the output and any
@@ -327,8 +261,7 @@ func captureOutput(f func()) (out string, err error) {
 		var buf bytes.Buffer
 		_, err := io.Copy(&buf, r)
 		r.Close()
-		s := stripWhitespaces(buf.String())
-		outC <- captureResult{s, err}
+		outC <- captureResult{buf.String(), err}
 	}()
 
 	// Clean up and record output in separate function to handle panics.
@@ -349,16 +282,12 @@ func captureOutput(f func()) (out string, err error) {
 	return
 }
 
-func (c cliTest) RunWithArgs(origArgs []string) {
-	redirectOutput(func() { c.runWithArgsUnredirected(origArgs) })
-}
-
 func isSQLCommand(args []string) bool {
 	if len(args) == 0 {
 		return false
 	}
 	switch args[0] {
-	case "user", "sql", "dump", "workload":
+	case "sql", "dump", "workload", "nodelocal":
 		return true
 	case "node":
 		if len(args) == 0 {
@@ -375,7 +304,7 @@ func isSQLCommand(args []string) bool {
 	}
 }
 
-func (c cliTest) runWithArgsUnredirected(origArgs []string) {
+func (c cliTest) RunWithArgs(origArgs []string) {
 	TestingReset()
 
 	if err := func() error {
@@ -391,7 +320,7 @@ func (c cliTest) runWithArgsUnredirected(origArgs []string) {
 			}
 			args = append(args, fmt.Sprintf("--host=%s", net.JoinHostPort(h, p)))
 			if c.Cfg.Insecure {
-				args = append(args, "--insecure")
+				args = append(args, "--insecure=true")
 			} else {
 				args = append(args, "--insecure=false")
 				args = append(args, fmt.Sprintf("--certs-dir=%s", c.certsDir))
@@ -406,16 +335,11 @@ func (c cliTest) runWithArgsUnredirected(origArgs []string) {
 
 		return Run(args)
 	}(); err != nil {
-		fmt.Println(err)
-		maybeShowErrorDetails(os.Stdout, err, false /*printNewLine*/)
+		cliOutputError(os.Stdout, err, true /*showSeverity*/, false /*verbose*/)
 	}
 }
 
 func (c cliTest) RunWithCAArgs(origArgs []string) {
-	redirectOutput(func() { c.runWithCAArgsUnredirected(origArgs) })
-}
-
-func (c cliTest) runWithCAArgsUnredirected(origArgs []string) {
 	TestingReset()
 
 	if err := func() error {
@@ -502,7 +426,7 @@ func Example_demo() {
 	// $ cockroach demo
 	// demo --format=table -e show database
 	//   database
-	// +----------+
+	// ------------
 	//   movr
 	// (1 row)
 	// demo -e select 1 as "1" -e select 3 as "3"
@@ -515,7 +439,8 @@ func Example_demo() {
 	// 1
 	// 1
 	// demo --set=errexit=0 -e select nonexistent -e select 123 as "123"
-	// pq: column "nonexistent" does not exist
+	// ERROR: column "nonexistent" does not exist
+	// SQLSTATE: 42703
 	// 123
 	// 123
 	// demo startrek -e show databases
@@ -526,7 +451,7 @@ func Example_demo() {
 	// system
 	// demo startrek -e show databases --format=table
 	//   database_name
-	// +---------------+
+	// -----------------
 	//   defaultdb
 	//   postgres
 	//   startrek
@@ -557,8 +482,6 @@ func Example_sql() {
 	c.RunWithArgs([]string{`sql`, `-d`, `nonexistent`, `-e`, `create database nonexistent; create table foo(x int); select * from foo`})
 	// COPY should return an intelligible error message.
 	c.RunWithArgs([]string{`sql`, `-e`, `copy t.f from stdin`})
-	// --echo-sql should print out the SQL statements.
-	c.RunWithArgs([]string{`user`, `ls`, `--echo-sql`})
 	// --set changes client-side variables before executing commands.
 	c.RunWithArgs([]string{`sql`, `--set=errexit=0`, `-e`, `select nonexistent`, `-e`, `select 123 as "123"`})
 	c.RunWithArgs([]string{`sql`, `--set`, `echo=true`, `-e`, `select 123 as "123"`})
@@ -607,14 +530,10 @@ func Example_sql() {
 	// sql -d nonexistent -e create database nonexistent; create table foo(x int); select * from foo
 	// x
 	// sql -e copy t.f from stdin
-	// woops! COPY has confused this client! Suggestion: use 'psql' for COPY
-	// user ls --echo-sql
-	// warning: This command is deprecated. Use SHOW USERS or SHOW ROLES in a SQL session.
-	// > SHOW USERS
-	// user_name
-	// root
+	// ERROR: woops! COPY has confused this client! Suggestion: use 'psql' for COPY
 	// sql --set=errexit=0 -e select nonexistent -e select 123 as "123"
-	// pq: column "nonexistent" does not exist
+	// ERROR: column "nonexistent" does not exist
+	// SQLSTATE: 42703
 	// 123
 	// 123
 	// sql --set echo=true -e select 123 as "123"
@@ -623,7 +542,7 @@ func Example_sql() {
 	// 123
 	// sql --set unknownoption -e select 123 as "123"
 	// invalid syntax: \set unknownoption. Try \? for help.
-	// invalid syntax
+	// ERROR: invalid syntax
 }
 
 func Example_sql_watch() {
@@ -641,7 +560,8 @@ func Example_sql_watch() {
 	// 0.5
 	// dec
 	// 1
-	// pq: division by zero
+	// ERROR: division by zero
+	// SQLSTATE: 22012
 }
 
 func Example_sql_format() {
@@ -841,7 +761,7 @@ func Example_sql_empty_table() {
 	// x
 	// sql --format=table -e select * from t.norows
 	//   x
-	// +---+
+	// -----
 	// (0 rows)
 	// sql --format=records -e select * from t.norows
 	// sql --format=sql -e select * from t.norows
@@ -1125,7 +1045,8 @@ func Example_sql_table() {
 	// sql -e insert into t.t values (e'a\tb\tc\n12\t123123213\t12313', 'tabs')
 	// INSERT 1
 	// sql -e insert into t.t values (e'\xc3\x28', 'non-UTF8 string')
-	// pq: lexical error: invalid UTF-8 byte sequence
+	// ERROR: lexical error: invalid UTF-8 byte sequence
+	// SQLSTATE: 42601
 	// DETAIL: source SQL:
 	// insert into t.t values (e'\xc3\x28', 'non-UTF8 string')
 	//                         ^
@@ -1171,7 +1092,7 @@ func Example_sql_table() {
 	// 12	123123213	12313",tabs
 	// sql --format=table -e select * from t.t
 	//            s          |               d
-	// +---------------------+--------------------------------+
+	// ----------------------+---------------------------------
 	//   foo                 | printable ASCII
 	//   "foo                | printable ASCII with quotes
 	//   \foo                | printable ASCII with backslash
@@ -1389,12 +1310,12 @@ func Example_misc_table() {
 	// CREATE TABLE
 	// sql --format=table -e select '  hai' as x
 	//     x
-	// +-------+
+	// ---------
 	//     hai
 	// (1 row)
 	// sql --format=table -e explain select s, 'foo' from t.t
 	//     tree    |    field    | description
-	// +-----------+-------------+-------------+
+	// ------------+-------------+--------------
 	//             | distributed | true
 	//             | vectorized  | false
 	//   render    |             |
@@ -1402,165 +1323,6 @@ func Example_misc_table() {
 	//             | table       | t@primary
 	//             | spans       | ALL
 	// (6 rows)
-}
-
-func Example_user() {
-	c := newCLITest(cliTestParams{})
-	defer c.cleanup()
-
-	c.Run("user ls")
-	c.Run("user ls --format=table")
-	c.Run("user ls --format=tsv")
-	c.Run("user set FOO")
-	c.RunWithArgs([]string{"sql", "-e", "create user if not exists 'FOO'"})
-	c.Run("user set Foo")
-	c.Run("user set fOo")
-	c.Run("user set foO")
-	c.Run("user set foo")
-	c.Run("user set _foo")
-	c.Run("user set f_oo")
-	c.Run("user set foo_")
-	c.Run("user set ,foo")
-	c.Run("user set f,oo")
-	c.Run("user set foo,")
-	c.Run("user set 0foo")
-	c.Run("user set 0123")
-	c.Run("user set foo0")
-	c.Run("user set f0oo")
-	c.Run("user set foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoof")
-	c.Run("user set foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoo")
-	c.Run("user set Ομηρος")
-	// Try some reserved keywords.
-	c.Run("user set and")
-	c.Run("user set table")
-	// Don't use get, since the output of hashedPassword is random.
-	// c.Run("user get foo")
-	c.Run("user ls --format=table")
-	c.Run("user rm foo")
-	c.Run("user ls --format=table")
-	c.RunWithArgs([]string{"sql", "-e", "drop database defaultdb"})
-	c.Run("user set foo")
-
-	// Output:
-	// user ls
-	// warning: This command is deprecated. Use SHOW USERS or SHOW ROLES in a SQL session.
-	// user_name
-	// root
-	// user ls --format=table
-	// warning: This command is deprecated. Use SHOW USERS or SHOW ROLES in a SQL session.
-	//   user_name
-	// +-----------+
-	//   root
-	// (1 row)
-	// user ls --format=tsv
-	// warning: This command is deprecated. Use SHOW USERS or SHOW ROLES in a SQL session.
-	// user_name
-	// root
-	// user set FOO
-	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
-	// CREATE USER 1
-	// sql -e create user if not exists 'FOO'
-	// CREATE USER 0
-	// user set Foo
-	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
-	// CREATE USER 0
-	// user set fOo
-	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
-	// CREATE USER 0
-	// user set foO
-	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
-	// CREATE USER 0
-	// user set foo
-	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
-	// CREATE USER 0
-	// user set _foo
-	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
-	// CREATE USER 1
-	// user set f_oo
-	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
-	// CREATE USER 1
-	// user set foo_
-	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
-	// CREATE USER 1
-	// user set ,foo
-	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
-	// pq: username ",foo" invalid; usernames are case insensitive, must start with a letter, digit or underscore, may contain letters, digits, dashes, or underscores, and must not exceed 63 characters
-	// user set f,oo
-	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
-	// pq: username "f,oo" invalid; usernames are case insensitive, must start with a letter, digit or underscore, may contain letters, digits, dashes, or underscores, and must not exceed 63 characters
-	// user set foo,
-	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
-	// pq: username "foo," invalid; usernames are case insensitive, must start with a letter, digit or underscore, may contain letters, digits, dashes, or underscores, and must not exceed 63 characters
-	// user set 0foo
-	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
-	// CREATE USER 1
-	// user set 0123
-	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
-	// CREATE USER 1
-	// user set foo0
-	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
-	// CREATE USER 1
-	// user set f0oo
-	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
-	// CREATE USER 1
-	// user set foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoof
-	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
-	// pq: username "foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoof" invalid; usernames are case insensitive, must start with a letter, digit or underscore, may contain letters, digits, dashes, or underscores, and must not exceed 63 characters
-	// user set foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoo
-	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
-	// CREATE USER 1
-	// user set Ομηρος
-	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
-	// CREATE USER 1
-	// user set and
-	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
-	// CREATE USER 1
-	// user set table
-	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
-	// CREATE USER 1
-	// user ls --format=table
-	// warning: This command is deprecated. Use SHOW USERS or SHOW ROLES in a SQL session.
-	//                              user_name
-	// +-----------------------------------------------------------------+
-	//   0123
-	//   0foo
-	//   _foo
-	//   and
-	//   f0oo
-	//   f_oo
-	//   foo
-	//   foo0
-	//   foo_
-	//   foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoo
-	//   root
-	//   table
-	//   ομηρος
-	// (13 rows)
-	// user rm foo
-	// warning: This command is deprecated. Use DROP USER or DROP ROLE in a SQL session.
-	// DROP USER 1
-	// user ls --format=table
-	// warning: This command is deprecated. Use SHOW USERS or SHOW ROLES in a SQL session.
-	//                              user_name
-	// +-----------------------------------------------------------------+
-	//   0123
-	//   0foo
-	//   _foo
-	//   and
-	//   f0oo
-	//   f_oo
-	//   foo0
-	//   foo_
-	//   foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoo
-	//   root
-	//   table
-	//   ομηρος
-	// (12 rows)
-	// sql -e drop database defaultdb
-	// DROP DATABASE
-	// user set foo
-	// warning: This command is deprecated. Use CREATE USER or ALTER USER ... WITH PASSWORD ... in a SQL session.
-	// CREATE USER 1
 }
 
 func Example_cert() {
@@ -1596,10 +1358,11 @@ Available Commands:
   quit              drain and shutdown node
 
   sql               open a sql shell
-  user              get, set, list and remove users (deprecated)
+  auth-session      log in and out of HTTP sessions
   node              list, inspect or remove nodes
   dump              dump sql tables
 
+  nodelocal         upload and delete nodelocal files
   demo              open a demo sql shell
   gen               generate auxiliary files
   version           output version information
@@ -1697,11 +1460,11 @@ func Example_node() {
 	// 1
 	// node ls --format=table
 	//   id
-	// +----+
+	// ------
 	//    1
 	// (1 row)
 	// node status 10000
-	// Error: node 10000 doesn't exist
+	// ERROR: node 10000 doesn't exist
 	// sql -e drop database defaultdb
 	// DROP DATABASE
 	// node ls
@@ -1726,7 +1489,8 @@ func TestCLITimeout(t *testing.T) {
 		}
 
 		const exp = `node status 1 --all --timeout 1ns
-pq: query execution canceled due to statement timeout
+ERROR: query execution canceled due to statement timeout
+SQLSTATE: 57014
 `
 		if out != exp {
 			err := errors.Errorf("unexpected output:\n%q\nwanted:\n%q", out, exp)
@@ -2088,168 +1852,11 @@ func TestJunkPositionalArguments(t *testing.T) {
 		if err != nil {
 			t.Fatal(errors.Wrap(err, strconv.Itoa(i)))
 		}
-		exp := fmt.Sprintf("%s\nunknown command %q for \"cockroach %s\"\n", line, junk, test)
+		exp := fmt.Sprintf("%s\nERROR: unknown command %q for \"cockroach %s\"\n", line, junk, test)
 		if exp != out {
 			t.Errorf("expected:\n%s\ngot:\n%s", exp, out)
 		}
 	}
-}
-
-// TestZipContainsAllInternalTables verifies that we don't add new internal tables
-// without also taking them into account in a `debug zip`. If this test fails,
-// add your table to either of the []string slices referenced in the test (which
-// are used by `debug zip`) or add it as an exception after having verified that
-// it indeed should not be collected (this is rare).
-// NB: if you're adding a new one, you'll also have to update TestZip.
-func TestZipContainsAllInternalTables(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.Background())
-
-	rows, err := db.Query(`
-SELECT concat('crdb_internal.', table_name) as name FROM [ SHOW TABLES FROM crdb_internal ] WHERE
-    table_name NOT IN (
--- whitelisted tables that don't need to be in debug zip
-'backward_dependencies',
-'builtin_functions',
-'create_statements',
-'forward_dependencies',
-'index_columns',
-'table_columns',
-'table_indexes',
-'ranges',
-'ranges_no_leases',
-'predefined_comments',
-'session_trace',
-'session_variables',
-'tables'
-)
-ORDER BY name ASC`)
-	assert.NoError(t, err)
-
-	var tables []string
-	for rows.Next() {
-		var table string
-		assert.NoError(t, rows.Scan(&table))
-		tables = append(tables, table)
-	}
-	tables = append(tables, "system.jobs", "system.descriptor", "system.namespace")
-	sort.Strings(tables)
-
-	var exp []string
-	exp = append(exp, debugZipTablesPerNode...)
-	exp = append(exp, debugZipTablesPerCluster...)
-	sort.Strings(exp)
-
-	assert.Equal(t, exp, tables)
-}
-
-func TestZip(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	dir, cleanupFn := testutils.TempDir(t)
-	defer cleanupFn()
-
-	c := newCLITest(cliTestParams{
-		storeSpecs: []base.StoreSpec{{
-			Path: dir,
-		}},
-	})
-	defer c.cleanup()
-
-	out, err := c.RunWithCapture("debug zip " + os.DevNull)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	const expected = `debug zip ` + os.DevNull + `
-writing ` + os.DevNull + `
-  debug/events.json
-  debug/rangelog.json
-  debug/liveness.json
-  debug/settings.json
-  debug/reports/problemranges.json
-  debug/crdb_internal.cluster_queries.txt
-  debug/crdb_internal.cluster_sessions.txt
-  debug/crdb_internal.cluster_settings.txt
-  debug/crdb_internal.jobs.txt
-  debug/system.jobs.txt
-  debug/system.descriptor.txt
-  debug/system.namespace.txt
-  debug/crdb_internal.kv_node_status.txt
-  debug/crdb_internal.kv_store_status.txt
-  debug/crdb_internal.schema_changes.txt
-  debug/crdb_internal.partitions.txt
-  debug/crdb_internal.zones.txt
-  debug/nodes/1/status.json
-  debug/nodes/1/crdb_internal.feature_usage.txt
-  debug/nodes/1/crdb_internal.gossip_alerts.txt
-  debug/nodes/1/crdb_internal.gossip_liveness.txt
-  debug/nodes/1/crdb_internal.gossip_network.txt
-  debug/nodes/1/crdb_internal.gossip_nodes.txt
-  debug/nodes/1/crdb_internal.leases.txt
-  debug/nodes/1/crdb_internal.node_build_info.txt
-  debug/nodes/1/crdb_internal.node_metrics.txt
-  debug/nodes/1/crdb_internal.node_queries.txt
-  debug/nodes/1/crdb_internal.node_runtime_info.txt
-  debug/nodes/1/crdb_internal.node_sessions.txt
-  debug/nodes/1/crdb_internal.node_statement_statistics.txt
-  debug/nodes/1/crdb_internal.node_txn_stats.txt
-  debug/nodes/1/details.json
-  debug/nodes/1/gossip.json
-  debug/nodes/1/enginestats.json
-  debug/nodes/1/stacks.txt
-  debug/nodes/1/heap.pprof
-  debug/nodes/1/ranges/1.json
-  debug/nodes/1/ranges/2.json
-  debug/nodes/1/ranges/3.json
-  debug/nodes/1/ranges/4.json
-  debug/nodes/1/ranges/5.json
-  debug/nodes/1/ranges/6.json
-  debug/nodes/1/ranges/7.json
-  debug/nodes/1/ranges/8.json
-  debug/nodes/1/ranges/9.json
-  debug/nodes/1/ranges/10.json
-  debug/nodes/1/ranges/11.json
-  debug/nodes/1/ranges/12.json
-  debug/nodes/1/ranges/13.json
-  debug/nodes/1/ranges/14.json
-  debug/nodes/1/ranges/15.json
-  debug/nodes/1/ranges/16.json
-  debug/nodes/1/ranges/17.json
-  debug/nodes/1/ranges/18.json
-  debug/nodes/1/ranges/19.json
-  debug/nodes/1/ranges/20.json
-  debug/nodes/1/ranges/21.json
-  debug/nodes/1/ranges/22.json
-  debug/nodes/1/ranges/23.json
-  debug/nodes/1/ranges/24.json
-  debug/schema/defaultdb@details.json
-  debug/schema/postgres@details.json
-  debug/schema/system@details.json
-  debug/schema/system/comments.json
-  debug/schema/system/descriptor.json
-  debug/schema/system/eventlog.json
-  debug/schema/system/jobs.json
-  debug/schema/system/lease.json
-  debug/schema/system/locations.json
-  debug/schema/system/namespace.json
-  debug/schema/system/rangelog.json
-  debug/schema/system/replication_constraint_stats.json
-  debug/schema/system/replication_critical_localities.json
-  debug/schema/system/replication_stats.json
-  debug/schema/system/reports_meta.json
-  debug/schema/system/role_members.json
-  debug/schema/system/settings.json
-  debug/schema/system/table_statistics.json
-  debug/schema/system/ui.json
-  debug/schema/system/users.json
-  debug/schema/system/web_sessions.json
-  debug/schema/system/zones.json
-`
-
-	assert.Equal(t, expected, out)
 }
 
 func TestWorkload(t *testing.T) {
@@ -2316,7 +1923,7 @@ func Example_pretty_print_numerical_strings() {
 	// INSERT 1
 	// sql --format=table -e select * from t.t
 	//     s   |             d
-	// +-------+---------------------------+
+	// --------+----------------------------
 	//   0     | positive numerical string
 	//   -1    | negative numerical string
 	//   1.0   | decimal numerical string
@@ -2388,7 +1995,7 @@ func Example_dump_no_visible_columns() {
 	// CREATE TABLE t (,
 	// 	FAMILY "primary" (rowid)
 	// );
-	// table "defaultdb.public.t" has no visible columns
+	// ERROR: table "defaultdb.public.t" has no visible columns
 	// HINT: To proceed with the dump, either omit this table from the list of tables to dump, drop the table, or add some visible columns.
 	// --
 	// See: https://github.com/cockroachdb/cockroach/issues/37768

@@ -347,13 +347,18 @@ func (s *SampleAggregatorSpec) summary() (string, []string) {
 	return "SampleAggregator", details
 }
 
-// summary implements the diagramCellType interface.
-func (is *InputSyncSpec) summary() (string, []string) {
+func (is *InputSyncSpec) summary(showTypes bool) (string, []string) {
+	typs := make([]string, 0, len(is.ColumnTypes)+1)
+	if showTypes {
+		for _, typ := range is.ColumnTypes {
+			typs = append(typs, typ.Name())
+		}
+	}
 	switch is.Type {
 	case InputSyncSpec_UNORDERED:
-		return "unordered", []string{}
+		return "unordered", typs
 	case InputSyncSpec_ORDERED:
-		return "ordered", []string{is.Ordering.diagramString()}
+		return "ordered", append(typs, is.Ordering.diagramString())
 	default:
 		return "unknown", []string{}
 	}
@@ -554,7 +559,9 @@ func (d *diagramData) AddSpans(spans []tracing.RecordedSpan) {
 	}
 }
 
-func generateDiagramData(sql string, flows []FlowSpec, nodeNames []string) (FlowDiagram, error) {
+func generateDiagramData(
+	sql string, flows []FlowSpec, nodeNames []string, showInputTypes bool,
+) (FlowDiagram, error) {
 	d := &diagramData{
 		SQL:       sql,
 		NodeNames: nodeNames,
@@ -579,7 +586,7 @@ func generateDiagramData(sql string, flows []FlowSpec, nodeNames []string) (Flow
 			if len(p.Input) > 1 || (len(p.Input) == 1 && len(p.Input[0].Streams) > 1) {
 				proc.Inputs = make([]diagramCell, len(p.Input))
 				for i, s := range p.Input {
-					proc.Inputs[i].Title, proc.Inputs[i].Details = s.summary()
+					proc.Inputs[i].Title, proc.Inputs[i].Details = s.summary(showInputTypes)
 				}
 			} else {
 				proc.Inputs = []diagramCell{}
@@ -676,7 +683,9 @@ func generateDiagramData(sql string, flows []FlowSpec, nodeNames []string) (Flow
 // GeneratePlanDiagram generates the data for a flow diagram. There should be
 // one FlowSpec per node. The function assumes that StreamIDs are unique across
 // all flows.
-func GeneratePlanDiagram(sql string, flows map[roachpb.NodeID]*FlowSpec) (FlowDiagram, error) {
+func GeneratePlanDiagram(
+	sql string, flows map[roachpb.NodeID]*FlowSpec, showInputTypes bool,
+) (FlowDiagram, error) {
 	// We sort the flows by node because we want the diagram data to be
 	// deterministic.
 	nodeIDs := make([]int, 0, len(flows))
@@ -693,18 +702,18 @@ func GeneratePlanDiagram(sql string, flows map[roachpb.NodeID]*FlowSpec) (FlowDi
 		nodeNames[i] = n.String()
 	}
 
-	return generateDiagramData(sql, flowSlice, nodeNames)
+	return generateDiagramData(sql, flowSlice, nodeNames, showInputTypes)
 }
 
 // GeneratePlanDiagramURL generates the json data for a flow diagram and a
 // URL which encodes the diagram. There should be one FlowSpec per node. The
 // function assumes that StreamIDs are unique across all flows.
 func GeneratePlanDiagramURL(
-	sql string, flows map[roachpb.NodeID]*FlowSpec,
+	sql string, flows map[roachpb.NodeID]*FlowSpec, showInputTypes bool,
 ) (string, url.URL, error) {
-	d, err := GeneratePlanDiagram(sql, flows)
+	d, err := GeneratePlanDiagram(sql, flows, showInputTypes)
 	if err != nil {
-		return "", url.URL{}, nil
+		return "", url.URL{}, err
 	}
 	return d.ToURL()
 }

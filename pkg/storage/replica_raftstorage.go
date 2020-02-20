@@ -95,7 +95,7 @@ func (r *Replica) raftEntriesLocked(lo, hi, maxBytes uint64) ([]raftpb.Entry, er
 func entries(
 	ctx context.Context,
 	rsl stateloader.StateLoader,
-	e engine.Reader,
+	reader engine.Reader,
 	rangeID roachpb.RangeID,
 	eCache *raftentry.Cache,
 	sideloaded SideloadStorage,
@@ -165,7 +165,7 @@ func entries(
 		return exceededMaxBytes, nil
 	}
 
-	if err := iterateEntries(ctx, e, rangeID, expectedIndex, hi, scanFunc); err != nil {
+	if err := iterateEntries(ctx, reader, rangeID, expectedIndex, hi, scanFunc); err != nil {
 		return nil, err
 	}
 	// Cache the fetched entries, if we may.
@@ -191,7 +191,7 @@ func entries(
 		}
 
 		// Was the missing index after the last index?
-		lastIndex, err := rsl.LoadLastIndex(ctx, e)
+		lastIndex, err := rsl.LoadLastIndex(ctx, reader)
 		if err != nil {
 			return nil, err
 		}
@@ -204,7 +204,7 @@ func entries(
 	}
 
 	// No results, was it due to unavailability or truncation?
-	ts, _, err := rsl.LoadRaftTruncatedState(ctx, e)
+	ts, _, err := rsl.LoadRaftTruncatedState(ctx, reader)
 	if err != nil {
 		return nil, err
 	}
@@ -218,13 +218,13 @@ func entries(
 
 func iterateEntries(
 	ctx context.Context,
-	e engine.Reader,
+	reader engine.Reader,
 	rangeID roachpb.RangeID,
 	lo, hi uint64,
 	scanFunc func(roachpb.KeyValue) (bool, error),
 ) error {
 	_, err := engine.MVCCIterate(
-		ctx, e,
+		ctx, reader,
 		keys.RaftLogKey(rangeID, lo),
 		keys.RaftLogKey(rangeID, hi),
 		hlc.Timestamp{},
@@ -264,16 +264,16 @@ func (r *Replica) raftTermRLocked(i uint64) (uint64, error) {
 func term(
 	ctx context.Context,
 	rsl stateloader.StateLoader,
-	eng engine.Reader,
+	reader engine.Reader,
 	rangeID roachpb.RangeID,
 	eCache *raftentry.Cache,
 	i uint64,
 ) (uint64, error) {
 	// entries() accepts a `nil` sideloaded storage and will skip inlining of
 	// sideloaded entries. We only need the term, so this is what we do.
-	ents, err := entries(ctx, rsl, eng, rangeID, eCache, nil /* sideloaded */, i, i+1, math.MaxUint64 /* maxBytes */)
+	ents, err := entries(ctx, rsl, reader, rangeID, eCache, nil /* sideloaded */, i, i+1, math.MaxUint64 /* maxBytes */)
 	if err == raft.ErrCompacted {
-		ts, _, err := rsl.LoadRaftTruncatedState(ctx, eng)
+		ts, _, err := rsl.LoadRaftTruncatedState(ctx, reader)
 		if err != nil {
 			return 0, err
 		}
@@ -478,7 +478,7 @@ func (s *OutgoingSnapshot) Close() {
 type IncomingSnapshot struct {
 	SnapUUID uuid.UUID
 	// The storage interface for the underlying SSTs.
-	SSSS *SSTSnapshotStorageScratch
+	SSTStorageScratch *SSTSnapshotStorageScratch
 	// The Raft log entries for this snapshot.
 	LogEntries [][]byte
 	// The replica state at the time the snapshot was generated (never nil).
@@ -542,18 +542,10 @@ func snapshot(
 		return OutgoingSnapshot{}, err
 	}
 
-	// Populate the snapshot's ReplicaState.DeprecatedTxnSpanGCThreshold field.
-	// 19.1 nodes will expect this to be here if the snapshot includes the key
-	// and 19.2 nodes will ignore it.
-	// TODO(nvanbenschoten): Remove in 20.1.
-	state.DeprecatedTxnSpanGCThreshold, err = rsl.LoadLegacyTxnSpanGCThreshold(ctx, snap)
-	if err != nil {
-		return OutgoingSnapshot{}, err
-	}
-
 	// Intentionally let this iterator and the snapshot escape so that the
 	// streamer can send chunks from it bit by bit.
-	iter := rditer.NewReplicaDataIterator(&desc, snap, true /* replicatedOnly */)
+	iter := rditer.NewReplicaDataIterator(&desc, snap,
+		true /* replicatedOnly */, false /* seekEnd */)
 
 	return OutgoingSnapshot{
 		RaftEntryCache: eCache,
@@ -591,7 +583,7 @@ func snapshot(
 // engine.ReadWriter must be passed in.
 func (r *Replica) append(
 	ctx context.Context,
-	eng engine.Writer,
+	writer engine.Writer,
 	prevLastIndex uint64,
 	prevLastTerm uint64,
 	prevRaftLogSize int64,
@@ -612,13 +604,13 @@ func (r *Replica) append(
 		value.InitChecksum(key)
 		var err error
 		if ent.Index > prevLastIndex {
-			err = engine.MVCCBlindPut(ctx, eng, &diff, key, hlc.Timestamp{}, value, nil /* txn */)
+			err = engine.MVCCBlindPut(ctx, writer, &diff, key, hlc.Timestamp{}, value, nil /* txn */)
 		} else {
-			// We type assert eng to also be an engine.Reader only in the case where
-			// we're replacing existing entries.
-			eng, ok := eng.(engine.ReadWriter)
+			// We type assert `writer` to also be an engine.ReadWriter only in
+			// the case where we're replacing existing entries.
+			eng, ok := writer.(engine.ReadWriter)
 			if !ok {
-				return 0, 0, 0, errors.Errorf("expected eng to be a engine.ReadWriter when overwriting log entries")
+				panic("expected writer to be a engine.ReadWriter when overwriting log entries")
 			}
 			err = engine.MVCCPut(ctx, eng, &diff, key, hlc.Timestamp{}, value, nil /* txn */)
 		}
@@ -631,11 +623,11 @@ func (r *Replica) append(
 	lastTerm := entries[len(entries)-1].Term
 	// Delete any previously appended log entries which never committed.
 	if prevLastIndex > 0 {
-		// We type assert eng to also be an engine.Reader only in the case where
-		// we're deleting existing entries.
-		eng, ok := eng.(engine.ReadWriter)
+		// We type assert `writer` to also be an engine.ReadWriter only in the
+		// case where we're deleting existing entries.
+		eng, ok := writer.(engine.ReadWriter)
 		if !ok {
-			return 0, 0, 0, errors.Errorf("expected eng to be a engine.ReadWriter when deleting log entries")
+			panic("expected writer to be a engine.ReadWriter when deleting log entries")
 		}
 		for i := lastIndex + 1; i <= prevLastIndex; i++ {
 			// Note that the caller is in charge of deleting any sideloaded payloads
@@ -691,7 +683,7 @@ func (r *Replica) updateRangeInfo(desc *roachpb.RangeDescriptor) error {
 // range.
 func clearRangeData(
 	desc *roachpb.RangeDescriptor,
-	eng engine.Reader,
+	reader engine.Reader,
 	writer engine.Writer,
 	rangeIDLocalOnly bool,
 	mustClearRange bool,
@@ -704,7 +696,7 @@ func clearRangeData(
 	}
 	var clearRangeFn func(engine.Reader, engine.Writer, roachpb.Key, roachpb.Key) error
 	if mustClearRange {
-		clearRangeFn = func(eng engine.Reader, writer engine.Writer, start, end roachpb.Key) error {
+		clearRangeFn = func(reader engine.Reader, writer engine.Writer, start, end roachpb.Key) error {
 			return writer.ClearRange(engine.MakeMVCCMetadataKey(start), engine.MakeMVCCMetadataKey(end))
 		}
 	} else {
@@ -712,7 +704,7 @@ func clearRangeData(
 	}
 
 	for _, keyRange := range keyRanges {
-		if err := clearRangeFn(eng, writer, keyRange.Start.Key, keyRange.End.Key); err != nil {
+		if err := clearRangeFn(reader, writer, keyRange.Start.Key, keyRange.End.Key); err != nil {
 			return err
 		}
 	}
@@ -746,14 +738,6 @@ func (r *Replica) applySnapshot(
 		log.Fatalf(ctx, "unexpected range ID %d", s.Desc.RangeID)
 	}
 
-	// Strip the DeprecatedTxnSpanGCThreshold. We don't care about it.
-	// TODO(nvanbenschoten): Remove in 20.1.
-	s.DeprecatedTxnSpanGCThreshold = nil
-
-	r.mu.RLock()
-	replicaID := r.mu.replicaID
-	r.mu.RUnlock()
-
 	snapType := inSnap.snapType
 	defer func() {
 		if err == nil {
@@ -762,8 +746,6 @@ func (r *Replica) applySnapshot(
 				r.store.metrics.RangeSnapshotsNormalApplied.Inc(1)
 			case SnapshotRequest_LEARNER:
 				r.store.metrics.RangeSnapshotsLearnerApplied.Inc(1)
-			case SnapshotRequest_PREEMPTIVE:
-				r.store.metrics.RangeSnapshotsPreemptiveApplied.Inc(1)
 			}
 		}
 	}()
@@ -813,7 +795,7 @@ func (r *Replica) applySnapshot(
 		}
 		ingestionLog := fmt.Sprintf(
 			"ingestion=%d@%0.0fms ",
-			len(inSnap.SSSS.SSTs()),
+			len(inSnap.SSTStorageScratch.SSTs()),
 			stats.ingestion.Sub(stats.subsumedReplicas).Seconds()*1000,
 		)
 		log.Infof(ctx, "applied %s snapshot [%s%s%sid=%s index=%d]",
@@ -848,19 +830,13 @@ func (r *Replica) applySnapshot(
 				return err
 			}
 		}
-		// If this replica doesn't know its ReplicaID yet, we're applying a
-		// preemptive snapshot. In this case, we're going to have to write the
-		// sideloaded proposals into the Raft log. Otherwise, sideload.
-		if replicaID != 0 {
-			var err error
-			var sideloadedEntriesSize int64
-			logEntries, sideloadedEntriesSize, err = r.maybeSideloadEntriesRaftMuLocked(ctx, logEntries)
-			if err != nil {
-				return err
-			}
-			raftLogSize += sideloadedEntriesSize
-		}
+		var sideloadedEntriesSize int64
 		var err error
+		logEntries, sideloadedEntriesSize, err = r.maybeSideloadEntriesRaftMuLocked(ctx, logEntries)
+		if err != nil {
+			return err
+		}
+		raftLogSize += sideloadedEntriesSize
 		_, lastTerm, raftLogSize, err = r.append(ctx, &unreplicatedSST, 0, invalidLastTerm, raftLogSize, logEntries)
 		if err != nil {
 			return err
@@ -885,7 +861,7 @@ func (r *Replica) applySnapshot(
 	if unreplicatedSST.DataSize > 0 {
 		// TODO(itsbilal): Write to SST directly in unreplicatedSST rather than
 		// buffering in a MemFile first.
-		if err := inSnap.SSSS.WriteSST(ctx, unreplicatedSSTFile.Data()); err != nil {
+		if err := inSnap.SSTStorageScratch.WriteSST(ctx, unreplicatedSSTFile.Data()); err != nil {
 			return err
 		}
 	}
@@ -922,19 +898,19 @@ func (r *Replica) applySnapshot(
 	// problematic, as it would prevent this store from ever having a new replica
 	// of the removed range. In this case, however, it's copacetic, as subsumed
 	// ranges _can't_ have new replicas.
-	if err := r.clearSubsumedReplicaDiskData(ctx, inSnap.SSSS, s.Desc, subsumedRepls, mergedTombstoneReplicaID); err != nil {
+	if err := r.clearSubsumedReplicaDiskData(ctx, inSnap.SSTStorageScratch, s.Desc, subsumedRepls, mergedTombstoneReplicaID); err != nil {
 		return err
 	}
 	stats.subsumedReplicas = timeutil.Now()
 
 	// Ingest all SSTs atomically.
 	if fn := r.store.cfg.TestingKnobs.BeforeSnapshotSSTIngestion; fn != nil {
-		if err := fn(inSnap, snapType, inSnap.SSSS.SSTs()); err != nil {
+		if err := fn(inSnap, snapType, inSnap.SSTStorageScratch.SSTs()); err != nil {
 			return err
 		}
 	}
-	if err := r.store.engine.IngestExternalFiles(ctx, inSnap.SSSS.SSTs()); err != nil {
-		return errors.Wrapf(err, "while ingesting %s", inSnap.SSSS.SSTs())
+	if err := r.store.engine.IngestExternalFiles(ctx, inSnap.SSTStorageScratch.SSTs()); err != nil {
+		return errors.Wrapf(err, "while ingesting %s", inSnap.SSTStorageScratch.SSTs())
 	}
 	stats.ingestion = timeutil.Now()
 
@@ -952,7 +928,7 @@ func (r *Replica) applySnapshot(
 	if r.store.removePlaceholderLocked(ctx, r.RangeID) {
 		atomic.AddInt32(&r.store.counts.filledPlaceholders, 1)
 	}
-	r.setDesc(ctx, s.Desc)
+	r.setDescRaftMuLocked(ctx, s.Desc)
 	if err := r.store.maybeMarkReplicaInitializedLocked(ctx, r); err != nil {
 		log.Fatalf(ctx, "unable to mark replica initialized while applying snapshot: %+v", err)
 	}
@@ -979,7 +955,7 @@ func (r *Replica) applySnapshot(
 	r.store.metrics.subtractMVCCStats(*r.mu.state.Stats)
 	r.store.metrics.addMVCCStats(*s.Stats)
 	// Update the rest of the Raft state. Changes to r.mu.state.Desc must be
-	// managed by r.setDesc and changes to r.mu.state.Lease must be handled
+	// managed by r.setDescRaftMuLocked and changes to r.mu.state.Lease must be handled
 	// by r.leasePostApply, but we called those above, so now it's safe to
 	// wholesale replace r.mu.state.
 	r.mu.state = s
@@ -1013,7 +989,7 @@ func (r *Replica) applySnapshot(
 // method requires that each of the subsumed replicas raftMu is held.
 func (r *Replica) clearSubsumedReplicaDiskData(
 	ctx context.Context,
-	ssss *SSTSnapshotStorageScratch,
+	scratch *SSTSnapshotStorageScratch,
 	desc *roachpb.RangeDescriptor,
 	subsumedRepls []*Replica,
 	subsumedNextReplicaID roachpb.ReplicaID,
@@ -1032,7 +1008,7 @@ func (r *Replica) clearSubsumedReplicaDiskData(
 		subsumedReplSST := engine.MakeIngestionSSTWriter(subsumedReplSSTFile)
 		defer subsumedReplSST.Close()
 		// NOTE: We set mustClearRange to true because we are setting
-		// RaftTombstoneKey. Since Clears and Puts need to be done in increasing
+		// RangeTombstoneKey. Since Clears and Puts need to be done in increasing
 		// order of keys, it is not safe to use ClearRangeIter.
 		if err := sr.preDestroyRaftMuLocked(
 			ctx,
@@ -1051,7 +1027,7 @@ func (r *Replica) clearSubsumedReplicaDiskData(
 		if subsumedReplSST.DataSize > 0 {
 			// TODO(itsbilal): Write to SST directly in subsumedReplSST rather than
 			// buffering in a MemFile first.
-			if err := ssss.WriteSST(ctx, subsumedReplSSTFile.Data()); err != nil {
+			if err := scratch.WriteSST(ctx, subsumedReplSSTFile.Data()); err != nil {
 				return err
 			}
 		}
@@ -1102,7 +1078,7 @@ func (r *Replica) clearSubsumedReplicaDiskData(
 			if subsumedReplSST.DataSize > 0 {
 				// TODO(itsbilal): Write to SST directly in subsumedReplSST rather than
 				// buffering in a MemFile first.
-				if err := ssss.WriteSST(ctx, subsumedReplSSTFile.Data()); err != nil {
+				if err := scratch.WriteSST(ctx, subsumedReplSSTFile.Data()); err != nil {
 					return err
 				}
 			}

@@ -22,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -142,7 +141,7 @@ const (
 	RejectSubqueries
 
 	// RejectSpecial is used in common places like the LIMIT clause.
-	RejectSpecial SemaRejectFlags = RejectAggregates | RejectGenerators | RejectWindowApplications
+	RejectSpecial = RejectAggregates | RejectGenerators | RejectWindowApplications
 )
 
 // ScalarProperties contains the properties of the current scalar
@@ -206,11 +205,6 @@ func (sc *SemaContext) GetLocation() *time.Location {
 		return time.UTC
 	}
 	return *sc.Location
-}
-
-// GetAdditionMode implements ParseTimeContext.
-func (sc *SemaContext) GetAdditionMode() duration.AdditionMode {
-	return duration.AdditionModeCompatible
 }
 
 // GetRelativeParseTime implements ParseTimeContext.
@@ -606,8 +600,11 @@ func (expr *ColumnAccessExpr) TypeCheck(ctx *SemaContext, desired *types.T) (Typ
 	expr.ColIndex = -1
 	for i, label := range resolvedType.TupleLabels() {
 		if label == expr.ColName {
+			if expr.ColIndex != -1 {
+				// Found a duplicate label.
+				return nil, pgerror.Newf(pgcode.AmbiguousColumn, "column reference %q is ambiguous", label)
+			}
 			expr.ColIndex = i
-			break
 		}
 	}
 	if expr.ColIndex < 0 {
@@ -1022,13 +1019,15 @@ func (expr *NotExpr) TypeCheck(ctx *SemaContext, desired *types.T) (TypedExpr, e
 
 // TypeCheck implements the Expr interface.
 func (expr *NullIfExpr) TypeCheck(ctx *SemaContext, desired *types.T) (TypedExpr, error) {
-	typedSubExprs, retType, err := TypeCheckSameTypedExprs(ctx, desired, expr.Expr1, expr.Expr2)
+	typedSubExprs, _, err := TypeCheckSameTypedExprs(ctx, desired, expr.Expr1, expr.Expr2)
 	if err != nil {
 		return nil, decorateTypeCheckError(err, "incompatible NULLIF expressions")
 	}
 
 	expr.Expr1, expr.Expr2 = typedSubExprs[0], typedSubExprs[1]
-	expr.typ = retType
+
+	// The return type of NULLIF is the type of the first expression.
+	expr.typ = typedSubExprs[0].ResolvedType()
 	return expr, nil
 }
 
@@ -1092,16 +1091,21 @@ func (expr *AllColumnsSelector) TypeCheck(_ *SemaContext, desired *types.T) (Typ
 
 // TypeCheck implements the Expr interface.
 func (expr *RangeCond) TypeCheck(ctx *SemaContext, desired *types.T) (TypedExpr, error) {
-	leftTyped, fromTyped, _, _, err := typeCheckComparisonOp(ctx, GT, expr.Left, expr.From)
+	leftFromTyped, fromTyped, _, _, err := typeCheckComparisonOp(ctx, GT, expr.Left, expr.From)
 	if err != nil {
 		return nil, err
 	}
-	_, toTyped, _, _, err := typeCheckComparisonOp(ctx, LT, expr.Left, expr.To)
+	leftToTyped, toTyped, _, _, err := typeCheckComparisonOp(ctx, LT, expr.Left, expr.To)
 	if err != nil {
 		return nil, err
 	}
-
-	expr.Left, expr.From, expr.To = leftTyped, fromTyped, toTyped
+	// Ensure that the boundaries of the comparison are well typed.
+	_, _, _, _, err = typeCheckComparisonOp(ctx, LT, expr.From, expr.To)
+	if err != nil {
+		return nil, err
+	}
+	expr.Left, expr.From = leftFromTyped, fromTyped
+	expr.leftTo, expr.To = leftToTyped, toTyped
 	expr.typ = types.Bool
 	return expr, nil
 }
@@ -1217,17 +1221,6 @@ func (expr *Tuple) TypeCheck(ctx *SemaContext, desired *types.T) (TypedExpr, err
 	}
 	// Copy the labels if there are any.
 	if len(expr.Labels) > 0 {
-		// Ensure that there are no repeat labels.
-		for i := range expr.Labels {
-			for j := 0; j < i; j++ {
-				if expr.Labels[i] == expr.Labels[j] {
-					return nil, pgerror.Newf(pgcode.Syntax,
-						"found duplicate tuple label: %q", ErrNameStringP(&expr.Labels[i]),
-					)
-				}
-			}
-		}
-
 		labels = make([]string, len(expr.Labels))
 		for i := range expr.Labels {
 			labels[i] = lex.NormalizeName(expr.Labels[i])
@@ -1583,7 +1576,7 @@ func typeCheckComparisonOpWithSubOperator(
 			return nil, nil, nil, false, pgerror.Newf(pgcode.InvalidParameterValue, unsupportedCompErrFmt, sigWithErr)
 		}
 	}
-	fn, ok := ops.lookupImpl(cmpTypeLeft, cmpTypeRight)
+	fn, ok := ops.LookupImpl(cmpTypeLeft, cmpTypeRight)
 	if !ok {
 		return nil, nil, nil, false, subOpCompError(cmpTypeLeft, rightTyped.ResolvedType(), subOp, op)
 	}
@@ -1636,7 +1629,7 @@ func typeCheckComparisonOp(
 				pgerror.Newf(pgcode.InvalidParameterValue, unsupportedCompErrFmt, sigWithErr)
 		}
 
-		fn, ok := ops.lookupImpl(retType, types.AnyTuple)
+		fn, ok := ops.LookupImpl(retType, types.AnyTuple)
 		if !ok {
 			sig := fmt.Sprintf(compSignatureFmt, retType, op, types.AnyTuple)
 			return nil, nil, nil, false,
@@ -1665,7 +1658,7 @@ func typeCheckComparisonOp(
 		}
 
 		typ := typedLeft.ResolvedType()
-		fn, ok := ops.lookupImpl(typ, types.AnyTuple)
+		fn, ok := ops.LookupImpl(typ, types.AnyTuple)
 		if !ok {
 			sig := fmt.Sprintf(compSignatureFmt, typ, op, types.AnyTuple)
 			return nil, nil, nil, false,
@@ -1688,7 +1681,7 @@ func typeCheckComparisonOp(
 		return typedLeft, typedRight, fn, false, nil
 
 	case leftIsTuple && rightIsTuple:
-		fn, ok := ops.lookupImpl(types.AnyTuple, types.AnyTuple)
+		fn, ok := ops.LookupImpl(types.AnyTuple, types.AnyTuple)
 		if !ok {
 			sig := fmt.Sprintf(compSignatureFmt, types.AnyTuple, op, types.AnyTuple)
 			return nil, nil, nil, false,

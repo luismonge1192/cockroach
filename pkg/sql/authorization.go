@@ -20,16 +20,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
 )
 
-type membershipCache struct {
+// MembershipCache is a shared cache for role membership information.
+type MembershipCache struct {
 	syncutil.Mutex
 	tableVersion sqlbase.DescriptorVersion
 	// userCache is a mapping from username to userRoleMembership.
 	userCache map[string]userRoleMembership
 }
-
-var roleMembersCache membershipCache
 
 // userRoleMembership is a mapping of "rolename" -> "with admin option".
 type userRoleMembership map[string]bool
@@ -62,19 +62,6 @@ type AuthorizationAccessor interface {
 }
 
 var _ AuthorizationAccessor = &planner{}
-
-// CheckPrivilegeForUser verifies that `user`` has `privilege` on `descriptor`.
-// This is not part of the planner as the only caller (ccl/sqlccl/restore.go) does not have one.
-func CheckPrivilegeForUser(
-	_ context.Context, user string, descriptor sqlbase.DescriptorProto, privilege privilege.Kind,
-) error {
-	if descriptor.GetPrivileges().CheckPrivilege(user, privilege) {
-		return nil
-	}
-	return pgerror.Newf(pgcode.InsufficientPrivilege,
-		"user %s does not have %s privilege on %s %s",
-		user, privilege, descriptor.TypeName(), descriptor.GetName())
-}
 
 // CheckPrivilege implements the AuthorizationAccessor interface.
 func (p *planner) CheckPrivilege(
@@ -154,6 +141,9 @@ func (p *planner) CheckAnyPrivilege(ctx context.Context, descriptor sqlbase.Desc
 // HasAdminRole implements the AuthorizationAccessor interface.
 func (p *planner) HasAdminRole(ctx context.Context) (bool, error) {
 	user := p.SessionData().User
+	if user == "" {
+		return false, errors.AssertionFailedf("empty user")
+	}
 
 	// Check if user is 'root' or 'node'.
 	if user == security.RootUser || user == security.NodeUser {
@@ -195,8 +185,10 @@ func (p *planner) RequireAdminRole(ctx context.Context, action string) error {
 func (p *planner) MemberOfWithAdminOption(
 	ctx context.Context, member string,
 ) (map[string]bool, error) {
+	roleMembersCache := p.execCfg.RoleMemberCache
+
 	// Lookup table version.
-	objDesc, err := p.PhysicalSchemaAccessor().GetObjectDesc(ctx, p.txn, &roleMembersTableName,
+	objDesc, err := p.PhysicalSchemaAccessor().GetObjectDesc(ctx, p.txn, p.ExecCfg().Settings, &roleMembersTableName,
 		p.ObjectLookupFlags(true /*required*/, false /*requireMutable*/))
 	if err != nil {
 		return nil, err
@@ -212,7 +204,7 @@ func (p *planner) MemberOfWithAdminOption(
 		roleMembersCache.Lock()
 		if roleMembersCache.tableVersion != tableVersion {
 			// Update version and drop the map.
-			roleMembersCache.tableVersion = tableDesc.Version
+			roleMembersCache.tableVersion = tableVersion
 			roleMembersCache.userCache = make(map[string]userRoleMembership)
 		}
 
@@ -242,7 +234,6 @@ func (p *planner) MemberOfWithAdminOption(
 		// Table version remains the same: update map, unlock, return.
 		roleMembersCache.userCache[member] = memberships
 		roleMembersCache.Unlock()
-
 		return memberships, nil
 	}
 }

@@ -70,10 +70,10 @@ func TestInterner(t *testing.T) {
 	dec4, _ := tree.ParseDDecimal("1e0")
 	dec5, _ := tree.ParseDDecimal("1")
 
-	coll1 := tree.NewDCollatedString("foo", "sv_SE", &tree.CollationEnvironment{})
-	coll2 := tree.NewDCollatedString("foo", "sv_SE", &tree.CollationEnvironment{})
-	coll3 := tree.NewDCollatedString("foo", "en_US", &tree.CollationEnvironment{})
-	coll4 := tree.NewDCollatedString("food", "en_US", &tree.CollationEnvironment{})
+	coll1, _ := tree.NewDCollatedString("foo", "sv_SE", &tree.CollationEnvironment{})
+	coll2, _ := tree.NewDCollatedString("foo", "sv_SE", &tree.CollationEnvironment{})
+	coll3, _ := tree.NewDCollatedString("foo", "en_US", &tree.CollationEnvironment{})
+	coll4, _ := tree.NewDCollatedString("food", "en_US", &tree.CollationEnvironment{})
 
 	tz1 := tree.MakeDTimestampTZ(time.Date(2018, 10, 6, 11, 49, 30, 123, time.UTC), 0)
 	tz2 := tree.MakeDTimestampTZ(time.Date(2018, 10, 6, 11, 49, 30, 123, time.UTC), 0)
@@ -87,23 +87,23 @@ func TestInterner(t *testing.T) {
 	scanNode := &ScanExpr{}
 	andExpr := &AndExpr{}
 
-	projections1 := ProjectionsExpr{{Element: andExpr, ColPrivate: ColPrivate{Col: 0}}}
-	projections2 := ProjectionsExpr{{Element: andExpr, ColPrivate: ColPrivate{Col: 0}}}
-	projections3 := ProjectionsExpr{{Element: andExpr, ColPrivate: ColPrivate{Col: 1}}}
+	projections1 := ProjectionsExpr{{Element: andExpr, Col: 0}}
+	projections2 := ProjectionsExpr{{Element: andExpr, Col: 0}}
+	projections3 := ProjectionsExpr{{Element: andExpr, Col: 1}}
 	projections4 := ProjectionsExpr{
-		{Element: andExpr, ColPrivate: ColPrivate{Col: 1}},
-		{Element: andExpr, ColPrivate: ColPrivate{Col: 2}},
+		{Element: andExpr, Col: 1},
+		{Element: andExpr, Col: 2},
 	}
-	projections5 := ProjectionsExpr{{Element: &AndExpr{}, ColPrivate: ColPrivate{Col: 1}}}
+	projections5 := ProjectionsExpr{{Element: &AndExpr{}, Col: 1}}
 
-	aggs1 := AggregationsExpr{{Agg: CountRowsSingleton, ColPrivate: ColPrivate{Col: 0}}}
-	aggs2 := AggregationsExpr{{Agg: CountRowsSingleton, ColPrivate: ColPrivate{Col: 0}}}
-	aggs3 := AggregationsExpr{{Agg: CountRowsSingleton, ColPrivate: ColPrivate{Col: 1}}}
+	aggs1 := AggregationsExpr{{Agg: CountRowsSingleton, Col: 0}}
+	aggs2 := AggregationsExpr{{Agg: CountRowsSingleton, Col: 0}}
+	aggs3 := AggregationsExpr{{Agg: CountRowsSingleton, Col: 1}}
 	aggs4 := AggregationsExpr{
-		{Agg: CountRowsSingleton, ColPrivate: ColPrivate{Col: 1}},
-		{Agg: CountRowsSingleton, ColPrivate: ColPrivate{Col: 2}},
+		{Agg: CountRowsSingleton, Col: 1},
+		{Agg: CountRowsSingleton, Col: 2},
 	}
-	aggs5 := AggregationsExpr{{Agg: &CountRowsExpr{}, ColPrivate: ColPrivate{Col: 1}}}
+	aggs5 := AggregationsExpr{{Agg: &CountRowsExpr{}, Col: 1}}
 
 	int1 := &ConstExpr{Value: tree.NewDInt(10)}
 	int2 := &ConstExpr{Value: tree.NewDInt(20)}
@@ -121,39 +121,24 @@ func TestInterner(t *testing.T) {
 	}
 
 	wins1 := WindowsExpr{{
-		Function: RankSingleton,
-		WindowsItemPrivate: WindowsItemPrivate{
-			ColPrivate: ColPrivate{Col: 0},
-			Frame:      frame1,
-		},
+		Function:           RankSingleton,
+		WindowsItemPrivate: WindowsItemPrivate{Col: 0, Frame: frame1},
 	}}
 	wins2 := WindowsExpr{{
-		Function: RankSingleton,
-		WindowsItemPrivate: WindowsItemPrivate{
-			ColPrivate: ColPrivate{Col: 0},
-			Frame:      frame1,
-		},
+		Function:           RankSingleton,
+		WindowsItemPrivate: WindowsItemPrivate{Col: 0, Frame: frame1},
 	}}
 	wins3 := WindowsExpr{{
-		Function: &WindowFromOffsetExpr{Input: RankSingleton, Offset: int1},
-		WindowsItemPrivate: WindowsItemPrivate{
-			ColPrivate: ColPrivate{Col: 0},
-			Frame:      frame1,
-		},
+		Function:           &WindowFromOffsetExpr{Input: RankSingleton, Offset: int1},
+		WindowsItemPrivate: WindowsItemPrivate{Col: 0, Frame: frame1},
 	}}
 	wins4 := WindowsExpr{{
-		Function: &WindowFromOffsetExpr{Input: RankSingleton, Offset: int2},
-		WindowsItemPrivate: WindowsItemPrivate{
-			ColPrivate: ColPrivate{Col: 0},
-			Frame:      frame1,
-		},
+		Function:           &WindowFromOffsetExpr{Input: RankSingleton, Offset: int2},
+		WindowsItemPrivate: WindowsItemPrivate{Col: 0, Frame: frame1},
 	}}
 	wins5 := WindowsExpr{{
-		Function: RankSingleton,
-		WindowsItemPrivate: WindowsItemPrivate{
-			ColPrivate: ColPrivate{Col: 0},
-			Frame:      frame2,
-		},
+		Function:           RankSingleton,
+		WindowsItemPrivate: WindowsItemPrivate{Col: 0, Frame: frame2},
 	}}
 
 	type testVariation struct {
@@ -192,11 +177,25 @@ func TestInterner(t *testing.T) {
 			{val1: float64(0), val2: math.Copysign(0, -1), equal: false},
 		}},
 
+		{hashFn: in.hasher.HashRune, eqFn: in.hasher.IsRuneEqual, variations: []testVariation{
+			{val1: rune(0), val2: rune(0), equal: true},
+			{val1: rune('a'), val2: rune('b'), equal: false},
+			{val1: rune('a'), val2: rune('A'), equal: false},
+			{val1: rune('🐛'), val2: rune('🐛'), equal: true},
+		}},
+
 		{hashFn: in.hasher.HashString, eqFn: in.hasher.IsStringEqual, variations: []testVariation{
 			{val1: "", val2: "", equal: true},
 			{val1: "abc", val2: "abcd", equal: false},
 			{val1: "", val2: " ", equal: false},
 			{val1: "the quick brown fox", val2: "the quick brown fox", equal: true},
+		}},
+
+		{hashFn: in.hasher.HashByte, eqFn: in.hasher.IsByteEqual, variations: []testVariation{
+			{val1: byte(0), val2: byte(0), equal: true},
+			{val1: byte('a'), val2: byte('b'), equal: false},
+			{val1: byte('a'), val2: byte('A'), equal: false},
+			{val1: byte('z'), val2: byte('z'), equal: true},
 		}},
 
 		{hashFn: in.hasher.HashBytes, eqFn: in.hasher.IsBytesEqual, variations: []testVariation{
@@ -342,9 +341,42 @@ func TestInterner(t *testing.T) {
 
 		{hashFn: in.hasher.HashScanFlags, eqFn: in.hasher.IsScanFlagsEqual, variations: []testVariation{
 			{val1: ScanFlags{}, val2: ScanFlags{}, equal: true},
+			{val1: ScanFlags{NoIndexJoin: false}, val2: ScanFlags{NoIndexJoin: true}, equal: false},
+			{val1: ScanFlags{NoIndexJoin: true}, val2: ScanFlags{NoIndexJoin: true}, equal: true},
+			{val1: ScanFlags{ForceIndex: false}, val2: ScanFlags{ForceIndex: true}, equal: false},
+			{val1: ScanFlags{ForceIndex: true}, val2: ScanFlags{ForceIndex: true}, equal: true},
+			{val1: ScanFlags{Direction: tree.Descending}, val2: ScanFlags{Direction: tree.Ascending}, equal: false},
+			{val1: ScanFlags{Direction: tree.Ascending}, val2: ScanFlags{Direction: tree.Ascending}, equal: true},
+			{val1: ScanFlags{Index: 1}, val2: ScanFlags{Index: 2}, equal: false},
+			{val1: ScanFlags{Index: 2}, val2: ScanFlags{Index: 2}, equal: true},
 			{val1: ScanFlags{NoIndexJoin: true, Index: 1}, val2: ScanFlags{NoIndexJoin: true, Index: 1}, equal: true},
 			{val1: ScanFlags{NoIndexJoin: true, Index: 1}, val2: ScanFlags{NoIndexJoin: true, Index: 2}, equal: false},
 			{val1: ScanFlags{NoIndexJoin: true, Index: 1}, val2: ScanFlags{NoIndexJoin: false, Index: 1}, equal: false},
+			{
+				val1:  ScanFlags{NoIndexJoin: true, ForceIndex: true, Direction: tree.Ascending, Index: 1},
+				val2:  ScanFlags{NoIndexJoin: false, ForceIndex: true, Direction: tree.Ascending, Index: 1},
+				equal: false,
+			},
+			{
+				val1:  ScanFlags{NoIndexJoin: true, ForceIndex: true, Direction: tree.Ascending, Index: 1},
+				val2:  ScanFlags{NoIndexJoin: true, ForceIndex: false, Direction: tree.Ascending, Index: 1},
+				equal: false,
+			},
+			{
+				val1:  ScanFlags{NoIndexJoin: true, ForceIndex: true, Direction: tree.Ascending, Index: 1},
+				val2:  ScanFlags{NoIndexJoin: true, ForceIndex: true, Direction: tree.Descending, Index: 1},
+				equal: false,
+			},
+			{
+				val1:  ScanFlags{NoIndexJoin: true, ForceIndex: true, Direction: tree.Ascending, Index: 1},
+				val2:  ScanFlags{NoIndexJoin: true, ForceIndex: true, Direction: tree.Ascending, Index: 2},
+				equal: false,
+			},
+			{
+				val1:  ScanFlags{NoIndexJoin: true, ForceIndex: true, Direction: tree.Ascending, Index: 1},
+				val2:  ScanFlags{NoIndexJoin: true, ForceIndex: true, Direction: tree.Ascending, Index: 1},
+				equal: true,
+			},
 		}},
 
 		{hashFn: in.hasher.HashPointer, eqFn: in.hasher.IsPointerEqual, variations: []testVariation{
@@ -393,6 +425,30 @@ func TestInterner(t *testing.T) {
 		}},
 
 		// PhysProps hash/isEqual methods are tested in TestInternerPhysProps.
+
+		{hashFn: in.hasher.HashLockingItem, eqFn: in.hasher.IsLockingItemEqual, variations: []testVariation{
+			{val1: (*tree.LockingItem)(nil), val2: (*tree.LockingItem)(nil), equal: true},
+			{
+				val1:  (*tree.LockingItem)(nil),
+				val2:  &tree.LockingItem{Strength: tree.ForUpdate},
+				equal: false,
+			},
+			{
+				val1:  &tree.LockingItem{Strength: tree.ForShare},
+				val2:  &tree.LockingItem{Strength: tree.ForUpdate},
+				equal: false,
+			},
+			{
+				val1:  &tree.LockingItem{WaitPolicy: tree.LockWaitSkip},
+				val2:  &tree.LockingItem{WaitPolicy: tree.LockWaitError},
+				equal: false,
+			},
+			{
+				val1:  &tree.LockingItem{Strength: tree.ForUpdate, WaitPolicy: tree.LockWaitError},
+				val2:  &tree.LockingItem{Strength: tree.ForUpdate, WaitPolicy: tree.LockWaitError},
+				equal: true,
+			},
+		}},
 
 		{hashFn: in.hasher.HashRelExpr, eqFn: in.hasher.IsRelExprEqual, variations: []testVariation{
 			{val1: (*ScanExpr)(nil), val2: (*ScanExpr)(nil), equal: true},

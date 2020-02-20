@@ -14,7 +14,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -23,28 +23,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
 
-func init() {
-	// We use a hook to avoid a dependency on the sqlbase package. We
-	// should probably move keys/protos elsewhere.
-	config.SplitAtIDHook = SplitAtIDHook
-}
-
-// SplitAtIDHook determines whether a specific descriptor ID
+// ShouldSplitAtID determines whether a specific descriptor ID
 // should be considered for a split at all. If it is a database
 // or a view table descriptor, it should not be considered.
-func SplitAtIDHook(id uint32, cfg *config.SystemConfig) bool {
-	descVal := cfg.GetDesc(MakeDescMetadataKey(ID(id)))
-	if descVal == nil {
-		return false
-	}
+func ShouldSplitAtID(id uint32, rawDesc *roachpb.Value) bool {
 	var desc Descriptor
-	if err := descVal.GetProto(&desc); err != nil {
+	if err := rawDesc.GetProto(&desc); err != nil {
 		return false
 	}
 	if dbDesc := desc.GetDatabase(); dbDesc != nil {
 		return false
 	}
-	if tableDesc := desc.Table(descVal.Timestamp); tableDesc != nil {
+	if tableDesc := desc.Table(rawDesc.Timestamp); tableDesc != nil {
 		if viewStr := tableDesc.GetViewQuery(); viewStr != "" {
 			return false
 		}
@@ -63,9 +53,10 @@ const (
 	NamespaceTableSchema = `
 CREATE TABLE system.namespace (
   "parentID" INT8,
+  "parentSchemaID" INT8,
   name       STRING,
   id         INT8,
-  PRIMARY KEY ("parentID", name)
+  PRIMARY KEY ("parentID", "parentSchemaID", name)
 );`
 
 	DescriptorTableSchema = `
@@ -225,6 +216,31 @@ CREATE TABLE system.comments (
    comment   STRING NOT NULL, -- the comment
    PRIMARY KEY (type, object_id, sub_id)
 );`
+
+	// protected_ts_meta stores a single row of metadata for the protectedts
+	// subsystem.
+	ProtectedTimestampsMetaTableSchema = `
+CREATE TABLE system.protected_ts_meta (
+   singleton   BOOL NOT NULL PRIMARY KEY DEFAULT (true),
+   version     INT8 NOT NULL,
+   num_records INT8 NOT NULL,
+   num_spans   INT8 NOT NULL,
+   total_bytes INT8 NOT NULL,
+   CONSTRAINT check_singleton  CHECK (singleton),
+   FAMILY "primary" (singleton, version, num_records, num_spans, total_bytes)
+);`
+
+	ProtectedTimestampsRecordsTableSchema = `
+CREATE TABLE system.protected_ts_records (
+   id        UUID NOT NULL PRIMARY KEY,
+   ts        DECIMAL NOT NULL,
+   meta_type STRING NOT NULL,
+   meta      BYTES,
+   num_spans INT8 NOT NULL, -- num spans is important to know how to decode spans
+   spans     BYTES NOT NULL,
+   verified  BOOL NOT NULL DEFAULT (false),
+   FAMILY "primary" (id, ts, meta_type, meta, num_spans, spans, verified)
+);`
 )
 
 func pk(name string) IndexDescriptor {
@@ -235,6 +251,7 @@ func pk(name string) IndexDescriptor {
 		ColumnNames:      []string{name},
 		ColumnDirections: singleASC,
 		ColumnIDs:        singleID1,
+		Version:          SecondaryIndexFamilyFormatVersion,
 	}
 }
 
@@ -242,11 +259,12 @@ func pk(name string) IndexDescriptor {
 // system object. Super users (root and admin) must have exactly the specified privileges,
 // other users must not exceed the specified privileges.
 var SystemAllowedPrivileges = map[ID]privilege.List{
-	keys.SystemDatabaseID:  privilege.ReadData,
-	keys.NamespaceTableID:  privilege.ReadData,
-	keys.DescriptorTableID: privilege.ReadData,
-	keys.UsersTableID:      privilege.ReadWriteData,
-	keys.ZonesTableID:      privilege.ReadWriteData,
+	keys.SystemDatabaseID:           privilege.ReadData,
+	keys.NamespaceTableID:           privilege.ReadData,
+	keys.DeprecatedNamespaceTableID: privilege.ReadData,
+	keys.DescriptorTableID:          privilege.ReadData,
+	keys.UsersTableID:               privilege.ReadWriteData,
+	keys.ZonesTableID:               privilege.ReadWriteData,
 	// We eventually want to migrate the table to appear read-only to force the
 	// the use of a validating, logging accessor, so we'll go ahead and tolerate
 	// read-only privs to make that migration possible later.
@@ -269,6 +287,8 @@ var SystemAllowedPrivileges = map[ID]privilege.List{
 	keys.ReplicationCriticalLocalitiesTableID: privilege.ReadWriteData,
 	keys.ReplicationStatsTableID:              privilege.ReadWriteData,
 	keys.ReportsMetaTableID:                   privilege.ReadWriteData,
+	keys.ProtectedTimestampsMetaTableID:       privilege.ReadData,
+	keys.ProtectedTimestampsRecordsTableID:    privilege.ReadData,
 }
 
 // Helpers used to make some of the TableDescriptor literals below more concise.
@@ -296,12 +316,13 @@ var (
 	// SystemDB is the descriptor for the system database.
 	SystemDB = MakeSystemDatabaseDesc()
 
-	// NamespaceTable is the descriptor for the namespace table.
-	NamespaceTable = TableDescriptor{
-		Name:     "namespace",
-		ID:       keys.NamespaceTableID,
-		ParentID: keys.SystemDatabaseID,
-		Version:  1,
+	// DeprecatedNamespaceTable is the descriptor for the deprecated namespace table.
+	DeprecatedNamespaceTable = TableDescriptor{
+		Name:                    "namespace_deprecated",
+		ID:                      keys.DeprecatedNamespaceTableID,
+		ParentID:                keys.SystemDatabaseID,
+		UnexposedParentSchemaID: keys.PublicSchemaID,
+		Version:                 1,
 		Columns: []ColumnDescriptor{
 			{Name: "parentID", ID: 1, Type: *types.Int},
 			{Name: "name", ID: 2, Type: *types.String},
@@ -320,28 +341,70 @@ var (
 			ColumnNames:      []string{"parentID", "name"},
 			ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC, IndexDescriptor_ASC},
 			ColumnIDs:        []ColumnID{1, 2},
+			Version:          SecondaryIndexFamilyFormatVersion,
 		},
 		NextIndexID:    2,
-		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.NamespaceTableID]),
+		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.DeprecatedNamespaceTableID]),
+		FormatVersion:  InterleavedFormatVersion,
+		NextMutationID: 1,
+	}
+
+	// NamespaceTable is the descriptor for the namespace table. Note that this
+	// table should only be written to via KV puts, not via the SQL layer. Some
+	// code assumes that it only has KV entries for column family 4, not the
+	// "sentinel" column family 0 which would be written by SQL.
+	NamespaceTable = TableDescriptor{
+		Name:                    "namespace",
+		ID:                      keys.NamespaceTableID,
+		ParentID:                keys.SystemDatabaseID,
+		UnexposedParentSchemaID: keys.PublicSchemaID,
+		Version:                 1,
+		Columns: []ColumnDescriptor{
+			{Name: "parentID", ID: 1, Type: *types.Int},
+			{Name: "parentSchemaID", ID: 2, Type: *types.Int},
+			{Name: "name", ID: 3, Type: *types.String},
+			{Name: "id", ID: 4, Type: *types.Int, Nullable: true},
+		},
+		NextColumnID: 5,
+		Families: []ColumnFamilyDescriptor{
+			{Name: "primary", ID: 0, ColumnNames: []string{"parentID", "parentSchemaID", "name"}, ColumnIDs: []ColumnID{1, 2, 3}},
+			{Name: "fam_4_id", ID: 4, ColumnNames: []string{"id"}, ColumnIDs: []ColumnID{4}, DefaultColumnID: 4},
+		},
+		NextFamilyID: 5,
+		PrimaryIndex: IndexDescriptor{
+			Name:             "primary",
+			ID:               1,
+			Unique:           true,
+			ColumnNames:      []string{"parentID", "parentSchemaID", "name"},
+			ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC, IndexDescriptor_ASC, IndexDescriptor_ASC},
+			ColumnIDs:        []ColumnID{1, 2, 3},
+			Version:          SecondaryIndexFamilyFormatVersion,
+		},
+		NextIndexID:    2,
+		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.DeprecatedNamespaceTableID]),
 		FormatVersion:  InterleavedFormatVersion,
 		NextMutationID: 1,
 	}
 
 	// DescriptorTable is the descriptor for the descriptor table.
 	DescriptorTable = TableDescriptor{
-		Name:       "descriptor",
-		ID:         keys.DescriptorTableID,
-		Privileges: NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.DescriptorTableID]),
-		ParentID:   keys.SystemDatabaseID,
-		Version:    1,
+		Name:                    "descriptor",
+		ID:                      keys.DescriptorTableID,
+		Privileges:              NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.DescriptorTableID]),
+		ParentID:                keys.SystemDatabaseID,
+		UnexposedParentSchemaID: keys.PublicSchemaID,
+		Version:                 1,
 		Columns: []ColumnDescriptor{
 			{Name: "id", ID: 1, Type: *types.Int},
-			{Name: "descriptor", ID: 2, Type: *types.Bytes, Nullable: true},
+			{Name: "descriptor", ID: keys.DescriptorTableDescriptorColID, Type: *types.Bytes, Nullable: true},
 		},
 		NextColumnID: 3,
 		Families: []ColumnFamilyDescriptor{
+			// The id of the first col fam is hardcoded in keys.MakeDescMetadataKey().
 			{Name: "primary", ID: 0, ColumnNames: []string{"id"}, ColumnIDs: singleID1},
-			{Name: "fam_2_descriptor", ID: 2, ColumnNames: []string{"descriptor"}, ColumnIDs: []ColumnID{2}, DefaultColumnID: 2},
+			{Name: "fam_2_descriptor", ID: keys.DescriptorTableDescriptorColFamID,
+				ColumnNames: []string{"descriptor"},
+				ColumnIDs:   []ColumnID{keys.DescriptorTableDescriptorColID}, DefaultColumnID: keys.DescriptorTableDescriptorColID},
 		},
 		PrimaryIndex:   pk("id"),
 		NextFamilyID:   3,
@@ -351,13 +414,15 @@ var (
 	}
 
 	falseBoolString = "false"
+	trueBoolString  = "true"
 
 	// UsersTable is the descriptor for the users table.
 	UsersTable = TableDescriptor{
-		Name:     "users",
-		ID:       keys.UsersTableID,
-		ParentID: keys.SystemDatabaseID,
-		Version:  1,
+		Name:                    "users",
+		ID:                      keys.UsersTableID,
+		ParentID:                keys.SystemDatabaseID,
+		UnexposedParentSchemaID: keys.PublicSchemaID,
+		Version:                 1,
 		Columns: []ColumnDescriptor{
 			{Name: "username", ID: 1, Type: *types.String},
 			{Name: "hashedPassword", ID: 2, Type: *types.Bytes, Nullable: true},
@@ -379,10 +444,11 @@ var (
 
 	// ZonesTable is the descriptor for the zones table.
 	ZonesTable = TableDescriptor{
-		Name:     "zones",
-		ID:       keys.ZonesTableID,
-		ParentID: keys.SystemDatabaseID,
-		Version:  1,
+		Name:                    "zones",
+		ID:                      keys.ZonesTableID,
+		ParentID:                keys.SystemDatabaseID,
+		UnexposedParentSchemaID: keys.PublicSchemaID,
+		Version:                 1,
 		Columns: []ColumnDescriptor{
 			{Name: "id", ID: 1, Type: *types.Int},
 			{Name: "config", ID: keys.ZonesTableConfigColumnID, Type: *types.Bytes, Nullable: true},
@@ -400,6 +466,7 @@ var (
 			ColumnNames:      []string{"id"},
 			ColumnDirections: singleASC,
 			ColumnIDs:        []ColumnID{keys.ZonesTablePrimaryIndexID},
+			Version:          SecondaryIndexFamilyFormatVersion,
 		},
 		NextFamilyID:   3,
 		NextIndexID:    2,
@@ -411,10 +478,11 @@ var (
 	// SettingsTable is the descriptor for the settings table.
 	// It contains all cluster settings for which a value has been set.
 	SettingsTable = TableDescriptor{
-		Name:     "settings",
-		ID:       keys.SettingsTableID,
-		ParentID: keys.SystemDatabaseID,
-		Version:  1,
+		Name:                    "settings",
+		ID:                      keys.SettingsTableID,
+		ParentID:                keys.SystemDatabaseID,
+		UnexposedParentSchemaID: keys.PublicSchemaID,
+		Version:                 1,
 		Columns: []ColumnDescriptor{
 			{Name: "name", ID: 1, Type: *types.String},
 			{Name: "value", ID: 2, Type: *types.String},
@@ -447,10 +515,11 @@ var (
 var (
 	// LeaseTable is the descriptor for the leases table.
 	LeaseTable = TableDescriptor{
-		Name:     "lease",
-		ID:       keys.LeaseTableID,
-		ParentID: keys.SystemDatabaseID,
-		Version:  1,
+		Name:                    "lease",
+		ID:                      keys.LeaseTableID,
+		ParentID:                keys.SystemDatabaseID,
+		UnexposedParentSchemaID: keys.PublicSchemaID,
+		Version:                 1,
 		Columns: []ColumnDescriptor{
 			{Name: "descID", ID: 1, Type: *types.Int},
 			{Name: "version", ID: 2, Type: *types.Int},
@@ -468,6 +537,7 @@ var (
 			ColumnNames:      []string{"descID", "version", "expiration", "nodeID"},
 			ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC, IndexDescriptor_ASC, IndexDescriptor_ASC, IndexDescriptor_ASC},
 			ColumnIDs:        []ColumnID{1, 2, 4, 3},
+			Version:          SecondaryIndexFamilyFormatVersion,
 		},
 		NextFamilyID:   1,
 		NextIndexID:    2,
@@ -480,10 +550,11 @@ var (
 
 	// EventLogTable is the descriptor for the event log table.
 	EventLogTable = TableDescriptor{
-		Name:     "eventlog",
-		ID:       keys.EventLogTableID,
-		ParentID: keys.SystemDatabaseID,
-		Version:  1,
+		Name:                    "eventlog",
+		ID:                      keys.EventLogTableID,
+		ParentID:                keys.SystemDatabaseID,
+		UnexposedParentSchemaID: keys.PublicSchemaID,
+		Version:                 1,
 		Columns: []ColumnDescriptor{
 			{Name: "timestamp", ID: 1, Type: *types.Timestamp},
 			{Name: "eventType", ID: 2, Type: *types.String},
@@ -507,6 +578,7 @@ var (
 			ColumnNames:      []string{"timestamp", "uniqueID"},
 			ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC, IndexDescriptor_ASC},
 			ColumnIDs:        []ColumnID{1, 6},
+			Version:          SecondaryIndexFamilyFormatVersion,
 		},
 		NextFamilyID:   6,
 		NextIndexID:    2,
@@ -519,10 +591,11 @@ var (
 
 	// RangeEventTable is the descriptor for the range log table.
 	RangeEventTable = TableDescriptor{
-		Name:     "rangelog",
-		ID:       keys.RangeEventTableID,
-		ParentID: keys.SystemDatabaseID,
-		Version:  1,
+		Name:                    "rangelog",
+		ID:                      keys.RangeEventTableID,
+		ParentID:                keys.SystemDatabaseID,
+		UnexposedParentSchemaID: keys.PublicSchemaID,
+		Version:                 1,
 		Columns: []ColumnDescriptor{
 			{Name: "timestamp", ID: 1, Type: *types.Timestamp},
 			{Name: "rangeID", ID: 2, Type: *types.Int},
@@ -548,6 +621,7 @@ var (
 			ColumnNames:      []string{"timestamp", "uniqueID"},
 			ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC, IndexDescriptor_ASC},
 			ColumnIDs:        []ColumnID{1, 7},
+			Version:          SecondaryIndexFamilyFormatVersion,
 		},
 		NextFamilyID:   7,
 		NextIndexID:    2,
@@ -558,10 +632,11 @@ var (
 
 	// UITable is the descriptor for the ui table.
 	UITable = TableDescriptor{
-		Name:     "ui",
-		ID:       keys.UITableID,
-		ParentID: keys.SystemDatabaseID,
-		Version:  1,
+		Name:                    "ui",
+		ID:                      keys.UITableID,
+		ParentID:                keys.SystemDatabaseID,
+		UnexposedParentSchemaID: keys.PublicSchemaID,
+		Version:                 1,
 		Columns: []ColumnDescriptor{
 			{Name: "key", ID: 1, Type: *types.String},
 			{Name: "value", ID: 2, Type: *types.Bytes, Nullable: true},
@@ -585,10 +660,11 @@ var (
 
 	// JobsTable is the descriptor for the jobs table.
 	JobsTable = TableDescriptor{
-		Name:     "jobs",
-		ID:       keys.JobsTableID,
-		ParentID: keys.SystemDatabaseID,
-		Version:  1,
+		Name:                    "jobs",
+		ID:                      keys.JobsTableID,
+		ParentID:                keys.SystemDatabaseID,
+		UnexposedParentSchemaID: keys.PublicSchemaID,
+		Version:                 1,
 		Columns: []ColumnDescriptor{
 			{Name: "id", ID: 1, Type: *types.Int, DefaultExpr: &uniqueRowIDString},
 			{Name: "status", ID: 2, Type: *types.String},
@@ -615,6 +691,7 @@ var (
 				ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC, IndexDescriptor_ASC},
 				ColumnIDs:        []ColumnID{2, 3},
 				ExtraColumnIDs:   []ColumnID{1},
+				Version:          SecondaryIndexFamilyFormatVersion,
 			},
 		},
 		NextIndexID:    3,
@@ -625,10 +702,11 @@ var (
 
 	// WebSessions table to authenticate sessions over stateless connections.
 	WebSessionsTable = TableDescriptor{
-		Name:     "web_sessions",
-		ID:       keys.WebSessionsTableID,
-		ParentID: keys.SystemDatabaseID,
-		Version:  1,
+		Name:                    "web_sessions",
+		ID:                      keys.WebSessionsTableID,
+		ParentID:                keys.SystemDatabaseID,
+		UnexposedParentSchemaID: keys.PublicSchemaID,
+		Version:                 1,
 		Columns: []ColumnDescriptor{
 			{Name: "id", ID: 1, Type: *types.Int, DefaultExpr: &uniqueRowIDString},
 			{Name: "hashedSecret", ID: 2, Type: *types.Bytes},
@@ -668,6 +746,7 @@ var (
 				ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC},
 				ColumnIDs:        []ColumnID{5},
 				ExtraColumnIDs:   []ColumnID{1},
+				Version:          SecondaryIndexFamilyFormatVersion,
 			},
 			{
 				Name:             "web_sessions_createdAt_idx",
@@ -677,6 +756,7 @@ var (
 				ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC},
 				ColumnIDs:        []ColumnID{4},
 				ExtraColumnIDs:   []ColumnID{1},
+				Version:          SecondaryIndexFamilyFormatVersion,
 			},
 		},
 		NextIndexID:    4,
@@ -687,10 +767,11 @@ var (
 
 	// TableStatistics table to hold statistics about columns and column groups.
 	TableStatisticsTable = TableDescriptor{
-		Name:     "table_statistics",
-		ID:       keys.TableStatisticsTableID,
-		ParentID: keys.SystemDatabaseID,
-		Version:  1,
+		Name:                    "table_statistics",
+		ID:                      keys.TableStatisticsTableID,
+		ParentID:                keys.SystemDatabaseID,
+		UnexposedParentSchemaID: keys.PublicSchemaID,
+		Version:                 1,
 		Columns: []ColumnDescriptor{
 			{Name: "tableID", ID: 1, Type: *types.Int},
 			{Name: "statisticID", ID: 2, Type: *types.Int, DefaultExpr: &uniqueRowIDString},
@@ -729,6 +810,7 @@ var (
 			ColumnNames:      []string{"tableID", "statisticID"},
 			ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC, IndexDescriptor_ASC},
 			ColumnIDs:        []ColumnID{1, 2},
+			Version:          SecondaryIndexFamilyFormatVersion,
 		},
 		NextIndexID:    2,
 		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.TableStatisticsTableID]),
@@ -740,10 +822,11 @@ var (
 
 	// LocationsTable is the descriptor for the locations table.
 	LocationsTable = TableDescriptor{
-		Name:     "locations",
-		ID:       keys.LocationsTableID,
-		ParentID: keys.SystemDatabaseID,
-		Version:  1,
+		Name:                    "locations",
+		ID:                      keys.LocationsTableID,
+		ParentID:                keys.SystemDatabaseID,
+		UnexposedParentSchemaID: keys.PublicSchemaID,
+		Version:                 1,
 		Columns: []ColumnDescriptor{
 			{Name: "localityKey", ID: 1, Type: *types.String},
 			{Name: "localityValue", ID: 2, Type: *types.String},
@@ -767,6 +850,7 @@ var (
 			ColumnNames:      []string{"localityKey", "localityValue"},
 			ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC, IndexDescriptor_ASC},
 			ColumnIDs:        []ColumnID{1, 2},
+			Version:          SecondaryIndexFamilyFormatVersion,
 		},
 		NextIndexID:    2,
 		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.LocationsTableID]),
@@ -776,10 +860,11 @@ var (
 
 	// RoleMembersTable is the descriptor for the role_members table.
 	RoleMembersTable = TableDescriptor{
-		Name:     "role_members",
-		ID:       keys.RoleMembersTableID,
-		ParentID: keys.SystemDatabaseID,
-		Version:  1,
+		Name:                    "role_members",
+		ID:                      keys.RoleMembersTableID,
+		ParentID:                keys.SystemDatabaseID,
+		UnexposedParentSchemaID: keys.PublicSchemaID,
+		Version:                 1,
 		Columns: []ColumnDescriptor{
 			{Name: "role", ID: 1, Type: *types.String},
 			{Name: "member", ID: 2, Type: *types.String},
@@ -809,6 +894,7 @@ var (
 			ColumnNames:      []string{"role", "member"},
 			ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC, IndexDescriptor_ASC},
 			ColumnIDs:        []ColumnID{1, 2},
+			Version:          SecondaryIndexFamilyFormatVersion,
 		},
 		Indexes: []IndexDescriptor{
 			{
@@ -818,8 +904,8 @@ var (
 				ColumnNames:      []string{"role"},
 				ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC},
 				ColumnIDs:        []ColumnID{1},
-
-				ExtraColumnIDs: []ColumnID{2},
+				ExtraColumnIDs:   []ColumnID{2},
+				Version:          SecondaryIndexFamilyFormatVersion,
 			},
 			{
 				Name:             "role_members_member_idx",
@@ -829,6 +915,7 @@ var (
 				ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC},
 				ColumnIDs:        []ColumnID{2},
 				ExtraColumnIDs:   []ColumnID{1},
+				Version:          SecondaryIndexFamilyFormatVersion,
 			},
 		},
 		NextIndexID:    4,
@@ -839,10 +926,11 @@ var (
 
 	// CommentsTable is the descriptor for the comments table.
 	CommentsTable = TableDescriptor{
-		Name:     "comments",
-		ID:       keys.CommentsTableID,
-		ParentID: keys.SystemDatabaseID,
-		Version:  1,
+		Name:                    "comments",
+		ID:                      keys.CommentsTableID,
+		ParentID:                keys.SystemDatabaseID,
+		UnexposedParentSchemaID: keys.PublicSchemaID,
+		Version:                 1,
 		Columns: []ColumnDescriptor{
 			{Name: "type", ID: 1, Type: *types.Int},
 			{Name: "object_id", ID: 2, Type: *types.Int},
@@ -862,6 +950,7 @@ var (
 			ColumnNames:      []string{"type", "object_id", "sub_id"},
 			ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC, IndexDescriptor_ASC, IndexDescriptor_ASC},
 			ColumnIDs:        []ColumnID{1, 2, 3},
+			Version:          SecondaryIndexFamilyFormatVersion,
 		},
 		NextIndexID:    2,
 		Privileges:     newCommentPrivilegeDescriptor(SystemAllowedPrivileges[keys.CommentsTableID]),
@@ -870,10 +959,11 @@ var (
 	}
 
 	ReportsMetaTable = TableDescriptor{
-		Name:     "reports_meta",
-		ID:       keys.ReportsMetaTableID,
-		ParentID: keys.SystemDatabaseID,
-		Version:  1,
+		Name:                    "reports_meta",
+		ID:                      keys.ReportsMetaTableID,
+		ParentID:                keys.SystemDatabaseID,
+		UnexposedParentSchemaID: keys.PublicSchemaID,
+		Version:                 1,
 		Columns: []ColumnDescriptor{
 			{Name: "id", ID: 1, Type: *types.Int},
 			{Name: "generated", ID: 2, Type: *types.TimestampTZ},
@@ -897,6 +987,7 @@ var (
 				IndexDescriptor_ASC,
 			},
 			ColumnIDs: []ColumnID{1},
+			Version:   SecondaryIndexFamilyFormatVersion,
 		},
 		NextIndexID:    2,
 		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.ReportsMetaTableID]),
@@ -909,10 +1000,11 @@ var (
 	// reports_meta table. Until then, it would cost us having to create an index
 	// on report_id.
 	ReplicationConstraintStatsTable = TableDescriptor{
-		Name:     "replication_constraint_stats",
-		ID:       keys.ReplicationConstraintStatsTableID,
-		ParentID: keys.SystemDatabaseID,
-		Version:  1,
+		Name:                    "replication_constraint_stats",
+		ID:                      keys.ReplicationConstraintStatsTableID,
+		ParentID:                keys.SystemDatabaseID,
+		UnexposedParentSchemaID: keys.PublicSchemaID,
+		Version:                 1,
 		Columns: []ColumnDescriptor{
 			{Name: "zone_id", ID: 1, Type: *types.Int},
 			{Name: "subzone_id", ID: 2, Type: *types.Int},
@@ -949,6 +1041,7 @@ var (
 				IndexDescriptor_ASC, IndexDescriptor_ASC, IndexDescriptor_ASC, IndexDescriptor_ASC,
 			},
 			ColumnIDs: []ColumnID{1, 2, 3, 4},
+			Version:   SecondaryIndexFamilyFormatVersion,
 		},
 		NextIndexID:    2,
 		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.ReplicationConstraintStatsTableID]),
@@ -960,10 +1053,11 @@ var (
 	// reports_meta table. Until then, it would cost us having to create an index
 	// on report_id.
 	ReplicationCriticalLocalitiesTable = TableDescriptor{
-		Name:     "replication_critical_localities",
-		ID:       keys.ReplicationCriticalLocalitiesTableID,
-		ParentID: keys.SystemDatabaseID,
-		Version:  1,
+		Name:                    "replication_critical_localities",
+		ID:                      keys.ReplicationCriticalLocalitiesTableID,
+		ParentID:                keys.SystemDatabaseID,
+		UnexposedParentSchemaID: keys.PublicSchemaID,
+		Version:                 1,
 		Columns: []ColumnDescriptor{
 			{Name: "zone_id", ID: 1, Type: *types.Int},
 			{Name: "subzone_id", ID: 2, Type: *types.Int},
@@ -996,6 +1090,7 @@ var (
 				IndexDescriptor_ASC, IndexDescriptor_ASC, IndexDescriptor_ASC,
 			},
 			ColumnIDs: []ColumnID{1, 2, 3},
+			Version:   SecondaryIndexFamilyFormatVersion,
 		},
 		NextIndexID:    2,
 		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.ReplicationCriticalLocalitiesTableID]),
@@ -1008,10 +1103,11 @@ var (
 	// reports_meta table. Until then, it would cost us having to create an index
 	// on report_id.
 	ReplicationStatsTable = TableDescriptor{
-		Name:     "replication_stats",
-		ID:       keys.ReplicationStatsTableID,
-		ParentID: keys.SystemDatabaseID,
-		Version:  1,
+		Name:                    "replication_stats",
+		ID:                      keys.ReplicationStatsTableID,
+		ParentID:                keys.SystemDatabaseID,
+		UnexposedParentSchemaID: keys.PublicSchemaID,
+		Version:                 1,
 		Columns: []ColumnDescriptor{
 			{Name: "zone_id", ID: 1, Type: *types.Int},
 			{Name: "subzone_id", ID: 2, Type: *types.Int},
@@ -1046,22 +1142,115 @@ var (
 			ColumnNames:      []string{"zone_id", "subzone_id"},
 			ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC, IndexDescriptor_ASC},
 			ColumnIDs:        []ColumnID{1, 2},
+			Version:          SecondaryIndexFamilyFormatVersion,
 		},
 		NextIndexID:    2,
 		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.ReplicationStatsTableID]),
 		FormatVersion:  InterleavedFormatVersion,
 		NextMutationID: 1,
 	}
+
+	ProtectedTimestampsMetaTable = TableDescriptor{
+		Name:                    "protected_ts_meta",
+		ID:                      keys.ProtectedTimestampsMetaTableID,
+		ParentID:                keys.SystemDatabaseID,
+		UnexposedParentSchemaID: keys.PublicSchemaID,
+		Version:                 1,
+		Columns: []ColumnDescriptor{
+			{
+				Name:        "singleton",
+				ID:          1,
+				Type:        *types.Bool,
+				DefaultExpr: &trueBoolString,
+			},
+			{Name: "version", ID: 2, Type: *types.Int},
+			{Name: "num_records", ID: 3, Type: *types.Int},
+			{Name: "num_spans", ID: 4, Type: *types.Int},
+			{Name: "total_bytes", ID: 5, Type: *types.Int},
+		},
+		Checks: []*TableDescriptor_CheckConstraint{
+			{
+				Name:      "check_singleton",
+				Expr:      "singleton",
+				ColumnIDs: []ColumnID{1},
+			},
+		},
+		NextColumnID: 6,
+		Families: []ColumnFamilyDescriptor{
+			{
+				Name:        "primary",
+				ColumnNames: []string{"singleton", "version", "num_records", "num_spans", "total_bytes"},
+				ColumnIDs:   []ColumnID{1, 2, 3, 4, 5},
+			},
+		},
+		NextFamilyID: 1,
+		PrimaryIndex: IndexDescriptor{
+			Name:        "primary",
+			ID:          1,
+			Version:     1,
+			Unique:      true,
+			ColumnNames: []string{"singleton"},
+			ColumnIDs:   []ColumnID{1},
+			ColumnDirections: []IndexDescriptor_Direction{
+				IndexDescriptor_ASC,
+			},
+		},
+		NextIndexID:    2,
+		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.ReplicationStatsTableID]),
+		FormatVersion:  InterleavedFormatVersion,
+		NextMutationID: 1,
+	}
+
+	ProtectedTimestampsRecordsTable = TableDescriptor{
+		Name:                    "protected_ts_records",
+		ID:                      keys.ProtectedTimestampsRecordsTableID,
+		ParentID:                keys.SystemDatabaseID,
+		UnexposedParentSchemaID: keys.PublicSchemaID,
+		Version:                 1,
+		Columns: []ColumnDescriptor{
+			{Name: "id", ID: 1, Type: *types.Uuid},
+			{Name: "ts", ID: 2, Type: *types.Decimal},
+			{Name: "meta_type", ID: 3, Type: *types.String},
+			{Name: "meta", ID: 4, Type: *types.Bytes, Nullable: true},
+			{Name: "num_spans", ID: 5, Type: *types.Int},
+			{Name: "spans", ID: 6, Type: *types.Bytes},
+			{Name: "verified", ID: 7, Type: *types.Bool, DefaultExpr: &falseBoolString},
+		},
+		NextColumnID: 8,
+		Families: []ColumnFamilyDescriptor{
+			{
+				Name:        "primary",
+				ColumnNames: []string{"id", "ts", "meta_type", "meta", "num_spans", "spans", "verified"},
+				ColumnIDs:   []ColumnID{1, 2, 3, 4, 5, 6, 7},
+			},
+		},
+		NextFamilyID: 1,
+		PrimaryIndex: IndexDescriptor{
+			Name:        "primary",
+			ID:          1,
+			Version:     1,
+			Unique:      true,
+			ColumnNames: []string{"id"},
+			ColumnIDs:   []ColumnID{1},
+			ColumnDirections: []IndexDescriptor_Direction{
+				IndexDescriptor_ASC,
+			},
+		},
+		NextIndexID:    2,
+		Privileges:     NewCustomSuperuserPrivilegeDescriptor(SystemAllowedPrivileges[keys.ProtectedTimestampsRecordsTableID]),
+		FormatVersion:  InterleavedFormatVersion,
+		NextMutationID: 1,
+	}
 )
 
 // Create a kv pair for the zone config for the given key and config value.
-func createZoneConfigKV(keyID int, zoneConfig *config.ZoneConfig) roachpb.KeyValue {
+func createZoneConfigKV(keyID int, zoneConfig *zonepb.ZoneConfig) roachpb.KeyValue {
 	value := roachpb.Value{}
 	if err := value.SetProto(zoneConfig); err != nil {
 		panic(fmt.Sprintf("could not marshal ZoneConfig for ID: %d: %s", keyID, err))
 	}
 	return roachpb.KeyValue{
-		Key:   config.MakeZoneKey(uint32(keyID)),
+		Key:   keys.ZoneKey(uint32(keyID)),
 		Value: value,
 	}
 }
@@ -1075,6 +1264,7 @@ func addSystemDescriptorsToSchema(target *MetadataSchema) {
 	target.AddDescriptor(keys.RootNamespaceID, &SystemDB)
 
 	// Add system config tables.
+	target.AddDescriptor(keys.SystemDatabaseID, &DeprecatedNamespaceTable)
 	target.AddDescriptor(keys.SystemDatabaseID, &NamespaceTable)
 	target.AddDescriptor(keys.SystemDatabaseID, &DescriptorTable)
 	target.AddDescriptor(keys.SystemDatabaseID, &UsersTable)
@@ -1101,14 +1291,16 @@ func addSystemDescriptorsToSchema(target *MetadataSchema) {
 	target.AddDescriptor(keys.SystemDatabaseID, &ReplicationConstraintStatsTable)
 	target.AddDescriptor(keys.SystemDatabaseID, &ReplicationStatsTable)
 	target.AddDescriptor(keys.SystemDatabaseID, &ReplicationCriticalLocalitiesTable)
+	target.AddDescriptor(keys.SystemDatabaseID, &ProtectedTimestampsMetaTable)
+	target.AddDescriptor(keys.SystemDatabaseID, &ProtectedTimestampsRecordsTable)
 }
 
 // addSystemDatabaseToSchema populates the supplied MetadataSchema with the
 // System database, its tables and zone configurations.
 func addSystemDatabaseToSchema(
 	target *MetadataSchema,
-	defaultZoneConfig *config.ZoneConfig,
-	defaultSystemZoneConfig *config.ZoneConfig,
+	defaultZoneConfig *zonepb.ZoneConfig,
+	defaultSystemZoneConfig *zonepb.ZoneConfig,
 ) {
 	addSystemDescriptorsToSchema(target)
 
@@ -1121,9 +1313,9 @@ func addSystemDatabaseToSchema(
 	target.otherKV = append(target.otherKV, createZoneConfigKV(keys.RootNamespaceID, defaultZoneConfig))
 
 	systemZoneConf := defaultSystemZoneConfig
-	metaRangeZoneConf := protoutil.Clone(defaultSystemZoneConfig).(*config.ZoneConfig)
-	jobsZoneConf := protoutil.Clone(defaultSystemZoneConfig).(*config.ZoneConfig)
-	livenessZoneConf := protoutil.Clone(defaultSystemZoneConfig).(*config.ZoneConfig)
+	metaRangeZoneConf := protoutil.Clone(defaultSystemZoneConfig).(*zonepb.ZoneConfig)
+	jobsZoneConf := protoutil.Clone(defaultSystemZoneConfig).(*zonepb.ZoneConfig)
+	livenessZoneConf := protoutil.Clone(defaultSystemZoneConfig).(*zonepb.ZoneConfig)
 
 	// .meta zone config entry with a shorter GC time.
 	metaRangeZoneConf.GC.TTLSeconds = 60 * 60 // 1h
@@ -1134,11 +1326,11 @@ func addSystemDatabaseToSchema(
 	target.otherKV = append(target.otherKV, createZoneConfigKV(keys.JobsTableID, jobsZoneConf))
 
 	// Some reporting tables have shorter GC times.
-	replicationConstraintStatsZoneConf := &config.ZoneConfig{
-		GC: &config.GCPolicy{TTLSeconds: int32(ReplicationConstraintStatsTableTTL.Seconds())},
+	replicationConstraintStatsZoneConf := &zonepb.ZoneConfig{
+		GC: &zonepb.GCPolicy{TTLSeconds: int32(ReplicationConstraintStatsTableTTL.Seconds())},
 	}
-	replicationStatsZoneConf := &config.ZoneConfig{
-		GC: &config.GCPolicy{TTLSeconds: int32(ReplicationStatsTableTTL.Seconds())},
+	replicationStatsZoneConf := &zonepb.ZoneConfig{
+		GC: &zonepb.GCPolicy{TTLSeconds: int32(ReplicationStatsTableTTL.Seconds())},
 	}
 
 	// Liveness zone config entry with a shorter GC time.

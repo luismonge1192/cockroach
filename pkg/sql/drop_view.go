@@ -14,9 +14,11 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -69,7 +71,14 @@ func (p *planner) DropView(ctx context.Context, n *tree.DropView) (planNode, err
 	return &dropViewNode{n: n, td: td}, nil
 }
 
+// ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
+// This is because DROP VIEW performs multiple KV operations on descriptors
+// and expects to see its own writes.
+func (n *dropViewNode) ReadingOwnWrites() {}
+
 func (n *dropViewNode) startExec(params runParams) error {
+	telemetry.Inc(sqltelemetry.SchemaChangeDrop("view"))
+
 	ctx := params.ctx
 	for _, toDel := range n.td {
 		droppedDesc := toDel.desc

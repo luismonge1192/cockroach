@@ -20,7 +20,7 @@ import (
 )
 
 func init() {
-	RegisterCommand(roachpb.ResolveIntentRange, declareKeysResolveIntentRange, ResolveIntentRange)
+	RegisterReadWriteCommand(roachpb.ResolveIntentRange, declareKeysResolveIntentRange, ResolveIntentRange)
 }
 
 func declareKeysResolveIntentRange(
@@ -32,7 +32,7 @@ func declareKeysResolveIntentRange(
 // ResolveIntentRange resolves write intents in the specified
 // key range according to the status of the transaction which created it.
 func ResolveIntentRange(
-	ctx context.Context, batch engine.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, readWriter engine.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
 ) (result.Result, error) {
 	args := cArgs.Args.(*roachpb.ResolveIntentRangeRequest)
 	h := cArgs.Header
@@ -42,17 +42,13 @@ func ResolveIntentRange(
 		return result.Result{}, ErrTransactionUnsupported
 	}
 
-	intent := roachpb.Intent{
-		Span:   args.Span(),
-		Txn:    args.IntentTxn,
-		Status: args.Status,
-	}
+	intent := args.AsIntent()
 
-	iterAndBuf := engine.GetIterAndBuf(batch, engine.IterOptions{UpperBound: args.EndKey})
+	iterAndBuf := engine.GetIterAndBuf(readWriter, engine.IterOptions{UpperBound: args.EndKey})
 	defer iterAndBuf.Cleanup()
 
 	numKeys, resumeSpan, err := engine.MVCCResolveWriteIntentRangeUsingIter(
-		ctx, batch, iterAndBuf, ms, intent, cArgs.MaxKeys,
+		ctx, readWriter, iterAndBuf, ms, intent, cArgs.MaxKeys,
 	)
 	if err != nil {
 		return result.Result{}, err
@@ -67,8 +63,8 @@ func ResolveIntentRange(
 	var res result.Result
 	res.Local.Metrics = resolveToMetricType(args.Status, args.Poison)
 
-	if WriteAbortSpanOnResolve(args.Status) {
-		if err := SetAbortSpan(ctx, cArgs.EvalCtx, batch, ms, args.IntentTxn, args.Poison); err != nil {
+	if WriteAbortSpanOnResolve(args.Status, args.Poison, numKeys > 0) {
+		if err := UpdateAbortSpan(ctx, cArgs.EvalCtx, readWriter, ms, args.IntentTxn, args.Poison); err != nil {
 			return result.Result{}, err
 		}
 	}

@@ -578,6 +578,7 @@ func (b *BoundAccount) Shrink(ctx context.Context, delta int64) {
 
 // reserveBytes declares an allocation to this monitor. An error is returned if
 // the allocation is denied.
+// x must be a multiple of `poolAllocationSize`.
 func (mm *BytesMonitor) reserveBytes(ctx context.Context, x int64) error {
 	mm.mu.Lock()
 	defer mm.mu.Unlock()
@@ -632,10 +633,10 @@ func (mm *BytesMonitor) releaseBytes(ctx context.Context, sz int64) {
 	mm.mu.Lock()
 	defer mm.mu.Unlock()
 	if mm.mu.curAllocated < sz {
-		sz = mm.mu.curAllocated
 		log.ReportOrPanic(ctx, &mm.settings.SV,
 			"%s: no bytes to release, current %d, free %d",
 			mm.name, mm.mu.curAllocated, sz)
+		sz = mm.mu.curAllocated
 	}
 	mm.mu.curAllocated -= sz
 	if mm.curBytesCount != nil {
@@ -647,11 +648,12 @@ func (mm *BytesMonitor) releaseBytes(ctx context.Context, sz int64) {
 		// We avoid VEventf here because we want to avoid computing the
 		// trace string if there is nothing to log.
 		log.Infof(ctx, "%s: now at %d bytes (-%d) - %s",
-			mm.name, mm.mu.curAllocated, sz, util.GetSmallTrace(3))
+			mm.name, mm.mu.curAllocated, sz, util.GetSmallTrace(5))
 	}
 }
 
 // increaseBudget requests more bytes from the pool.
+// minExtra must be a multiple of `poolAllocationSize`.
 func (mm *BytesMonitor) increaseBudget(ctx context.Context, minExtra int64) error {
 	// NB: mm.mu Already locked by reserveBytes().
 	if mm.mu.curBudget.mon == nil {
@@ -659,7 +661,6 @@ func (mm *BytesMonitor) increaseBudget(ctx context.Context, minExtra int64) erro
 			minExtra, mm.mu.curAllocated, mm.reserved.used), mm.name,
 		)
 	}
-	minExtra = mm.roundSize(minExtra)
 	if log.V(2) {
 		log.Infof(ctx, "%s: requesting %d bytes from the pool", mm.name, minExtra)
 	}

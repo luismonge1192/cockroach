@@ -25,6 +25,7 @@ import (
 
 	circuit "github.com/cockroachdb/circuitbreaker"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
@@ -49,7 +50,7 @@ func (s *Store) Transport() *RaftTransport {
 }
 
 func (s *Store) FindTargetAndTransferLease(
-	ctx context.Context, repl *Replica, desc *roachpb.RangeDescriptor, zone *config.ZoneConfig,
+	ctx context.Context, repl *Replica, desc *roachpb.RangeDescriptor, zone *zonepb.ZoneConfig,
 ) (bool, error) {
 	return s.replicateQueue.findTargetAndTransferLease(
 		ctx, repl, desc, zone, transferLeaseOptions{},
@@ -301,6 +302,15 @@ func (r *Replica) QuotaAvailable() uint64 {
 	return r.mu.proposalQuota.ApproximateQuota()
 }
 
+// GetProposalQuota returns the Replica's internal proposal quota.
+// It is not safe to be used concurrently so do ensure that the Replica is
+// no longer active.
+func (r *Replica) GetProposalQuota() *quotapool.IntPool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.mu.proposalQuota
+}
+
 func (r *Replica) QuotaReleaseQueueLen() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -318,10 +328,7 @@ func (r *Replica) IsFollowerActive(ctx context.Context, followerID roachpb.Repli
 func (r *Replica) GetTSCacheHighWater() hlc.Timestamp {
 	start := roachpb.Key(r.Desc().StartKey)
 	end := roachpb.Key(r.Desc().EndKey)
-	t, _ := r.store.tsCache.GetMaxRead(start, end)
-	if w, _ := r.store.tsCache.GetMaxWrite(start, end); t.Less(w) {
-		t = w
-	}
+	t, _ := r.store.tsCache.GetMax(start, end)
 	return t
 }
 
@@ -421,7 +428,7 @@ func SetMockAddSSTable() (undo func()) {
 	// TODO(tschottdorf): this already does nontrivial work. Worth open-sourcing the relevant
 	// subparts of the real evalAddSSTable to make this test less likely to rot.
 	evalAddSSTable := func(
-		ctx context.Context, batch engine.ReadWriter, cArgs batcheval.CommandArgs, _ roachpb.Response,
+		ctx context.Context, _ engine.ReadWriter, cArgs batcheval.CommandArgs, _ roachpb.Response,
 	) (result.Result, error) {
 		log.Event(ctx, "evaluated testing-only AddSSTable mock")
 		args := cArgs.Args.(*roachpb.AddSSTableRequest)
@@ -437,10 +444,10 @@ func SetMockAddSSTable() (undo func()) {
 	}
 
 	batcheval.UnregisterCommand(roachpb.AddSSTable)
-	batcheval.RegisterCommand(roachpb.AddSSTable, batcheval.DefaultDeclareKeys, evalAddSSTable)
+	batcheval.RegisterReadWriteCommand(roachpb.AddSSTable, batcheval.DefaultDeclareKeys, evalAddSSTable)
 	return func() {
 		batcheval.UnregisterCommand(roachpb.AddSSTable)
-		batcheval.RegisterCommand(roachpb.AddSSTable, prev.DeclareKeys, prev.Eval)
+		batcheval.RegisterReadWriteCommand(roachpb.AddSSTable, prev.DeclareKeys, prev.EvalRW)
 	}
 }
 

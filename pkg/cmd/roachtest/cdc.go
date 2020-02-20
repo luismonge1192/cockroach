@@ -27,8 +27,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
+	"github.com/cockroachdb/errors"
 	"github.com/codahale/hdrhistogram"
-	"github.com/pkg/errors"
 )
 
 type workloadType string
@@ -246,7 +246,7 @@ func runCDCBank(ctx context.Context, t *test, c *cluster) {
 		nodes: kafkaNode,
 	}
 	kafka.install(ctx)
-	if !kafka.c.isLocal() {
+	if !c.isLocal() {
 		// TODO(dan): This test currently connects to kafka from the test
 		// runner, so kafka needs to advertise the external address. Better
 		// would be a binary we could run on one of the roachprod machines.
@@ -298,10 +298,15 @@ func runCDCBank(ctx context.Context, t *test, c *cluster) {
 		if atomic.LoadInt64(&doneAtomic) > 0 {
 			return nil
 		}
-		return err
+		return errors.Wrap(err, "workload failed")
 	})
-	m.Go(func(ctx context.Context) error {
+	m.Go(func(ctx context.Context) (_err error) {
 		defer workloadCancel()
+
+		defer func() {
+			_err = errors.Wrap(_err, "CDC failed")
+		}()
+
 		l, err := t.l.ChildLogger(`changefeed`)
 		if err != nil {
 			return err
@@ -317,13 +322,13 @@ func runCDCBank(ctx context.Context, t *test, c *cluster) {
 		if _, err := db.Exec(
 			`CREATE TABLE fprint (id INT PRIMARY KEY, balance INT, payload STRING)`,
 		); err != nil {
-			return err
+			return errors.Wrap(err, "CREATE TABLE failed")
 		}
 
 		const requestedResolved = 100
 		fprintV, err := cdctest.NewFingerprintValidator(db, `bank.bank`, `fprint`, tc.partitions, 0)
 		if err != nil {
-			return err
+			return errors.Wrap(err, "error creating validator")
 		}
 		validators := cdctest.Validators{
 			cdctest.NewOrderValidator(`bank`),
@@ -366,7 +371,7 @@ func runCDCBank(ctx context.Context, t *test, c *cluster) {
 			}
 		}
 		if failures := v.Failures(); len(failures) > 0 {
-			return errors.New(strings.Join(failures, "\n"))
+			return errors.New("validator failures:\n" + strings.Join(failures, "\n"))
 		}
 		return nil
 	})
@@ -509,6 +514,7 @@ func registerCDC(r *testRegistry) {
 
 	r.Add(testSpec{
 		Name:       fmt.Sprintf("cdc/tpcc-1000/rangefeed=%t", useRangeFeed),
+		Owner:      `cdc`,
 		MinVersion: "v2.1.0",
 		Cluster:    makeClusterSpec(4, cpu(16)),
 		Run: func(ctx context.Context, t *test, c *cluster) {
@@ -524,6 +530,7 @@ func registerCDC(r *testRegistry) {
 	})
 	r.Add(testSpec{
 		Name:       fmt.Sprintf("cdc/initial-scan/rangefeed=%t", useRangeFeed),
+		Owner:      `cdc`,
 		MinVersion: "v2.1.0",
 		Cluster:    makeClusterSpec(4, cpu(16)),
 		Run: func(ctx context.Context, t *test, c *cluster) {
@@ -539,7 +546,8 @@ func registerCDC(r *testRegistry) {
 		},
 	})
 	r.Add(testSpec{
-		Name: "cdc/poller/rangefeed=false",
+		Name:  "cdc/poller/rangefeed=false",
+		Owner: `cdc`,
 		// When testing a 2.1 binary, we use the poller for all the other tests
 		// and this is close enough to cdc/tpcc-1000 test to be redundant, so
 		// skip it.
@@ -557,7 +565,8 @@ func registerCDC(r *testRegistry) {
 		},
 	})
 	r.Add(testSpec{
-		Name: fmt.Sprintf("cdc/sink-chaos/rangefeed=%t", useRangeFeed),
+		Name:  fmt.Sprintf("cdc/sink-chaos/rangefeed=%t", useRangeFeed),
+		Owner: `cdc`,
 		// TODO(dan): Re-enable this test on 2.1 if we decide to backport #36852.
 		MinVersion: "v19.1.0",
 		Cluster:    makeClusterSpec(4, cpu(16)),
@@ -574,8 +583,9 @@ func registerCDC(r *testRegistry) {
 		},
 	})
 	r.Add(testSpec{
-		Name: fmt.Sprintf("cdc/crdb-chaos/rangefeed=%t", useRangeFeed),
-		Skip: "#37716",
+		Name:  fmt.Sprintf("cdc/crdb-chaos/rangefeed=%t", useRangeFeed),
+		Owner: `cdc`,
+		Skip:  "#37716",
 		// TODO(dan): Re-enable this test on 2.1 if we decide to backport #36852.
 		MinVersion: "v19.1.0",
 		Cluster:    makeClusterSpec(4, cpu(16)),
@@ -597,6 +607,7 @@ func registerCDC(r *testRegistry) {
 	})
 	r.Add(testSpec{
 		Name:       fmt.Sprintf("cdc/ledger/rangefeed=%t", useRangeFeed),
+		Owner:      `cdc`,
 		MinVersion: "v2.1.0",
 		// TODO(mrtracy): This workload is designed to be running on a 20CPU nodes,
 		// but this cannot be allocated without some sort of configuration outside
@@ -616,6 +627,7 @@ func registerCDC(r *testRegistry) {
 	})
 	r.Add(testSpec{
 		Name:       "cdc/cloud-sink-gcs/rangefeed=true",
+		Owner:      `cdc`,
 		MinVersion: "v19.1.0",
 		Cluster:    makeClusterSpec(4, cpu(16)),
 		Run: func(ctx context.Context, t *test, c *cluster) {
@@ -636,11 +648,9 @@ func registerCDC(r *testRegistry) {
 			})
 		},
 	})
-	// TODO(dan): This currently gets its own cluster during the nightly
-	// acceptance tests. Decide whether it's safe to share with the one made for
-	// "acceptance/*".
 	r.Add(testSpec{
 		Name:       "cdc/bank",
+		Owner:      `cdc`,
 		MinVersion: "v2.1.0",
 		Cluster:    makeClusterSpec(4),
 		Run: func(ctx context.Context, t *test, c *cluster) {
@@ -649,6 +659,7 @@ func registerCDC(r *testRegistry) {
 	})
 	r.Add(testSpec{
 		Name:       "cdc/schemareg",
+		Owner:      `cdc`,
 		MinVersion: "v19.1.0",
 		Cluster:    makeClusterSpec(1),
 		Run: func(ctx context.Context, t *test, c *cluster) {
@@ -670,6 +681,7 @@ func (k kafkaManager) basePath() string {
 }
 
 func (k kafkaManager) install(ctx context.Context) {
+	k.c.status("installing kafka")
 	folder := k.basePath()
 	k.c.Run(ctx, k.nodes, `mkdir -p `+folder)
 	k.c.Run(ctx, k.nodes, `curl -s https://packages.confluent.io/archive/4.0/confluent-oss-4.0.0-2.11.tar.gz | tar -xz -C `+folder)

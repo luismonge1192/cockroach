@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -114,13 +115,15 @@ func (t virtualSchemaTable) initVirtualTableDesc(
 		st,
 		create,
 		0, /* parentID */
+		0, /* parentSchemaID */
 		id,
 		hlc.Timestamp{}, /* creationTime */
 		publicSelectPrivileges,
-		nil,   /* affected */
-		nil,   /* semaCtx */
-		nil,   /* evalCtx */
-		false, /* temporary */
+		nil,                        /* affected */
+		nil,                        /* semaCtx */
+		nil,                        /* evalCtx */
+		&sessiondata.SessionData{}, /* sessionData */
+		false,                      /* temporary */
 	)
 	return mutDesc.TableDescriptor, err
 }
@@ -154,11 +157,13 @@ func (v virtualSchemaView) initVirtualTableDesc(
 		create.Name.Table(),
 		tree.AsStringWithFlags(create.AsSource, tree.FmtParsable),
 		0, /* parentID */
+		0, /* parentSchemaID */
 		id,
 		columns,
 		hlc.Timestamp{}, /* creationTime */
 		publicSelectPrivileges,
-		nil, /* semaCtx */
+		nil,   /* semaCtx */
+		false, /* temporary */
 	)
 	return mutDesc.TableDescriptor, err
 }
@@ -240,8 +245,8 @@ func (e virtualDefEntry) getPlanInfo() (sqlbase.ResultColumns, virtualTableConst
 		var dbDesc *DatabaseDescriptor
 		if dbName != "" {
 			var err error
-			dbDesc, err = p.LogicalSchemaAccessor().GetDatabaseDesc(ctx, p.txn, dbName,
-				tree.DatabaseLookupFlags{Required: true, AvoidCached: p.avoidCachedDescriptors})
+			dbDesc, err = p.LogicalSchemaAccessor().GetDatabaseDesc(ctx, p.txn,
+				dbName, tree.DatabaseLookupFlags{Required: true, AvoidCached: p.avoidCachedDescriptors})
 			if err != nil {
 				return nil, err
 			}
@@ -395,7 +400,8 @@ func (vs *VirtualSchemaHolder) getVirtualTableEntry(tn *tree.TableName) (virtual
 			return t, nil
 		}
 		if _, ok := db.allTableNames[tableName]; ok {
-			return virtualDefEntry{}, unimplemented.Newf(tn.Schema()+"."+tableName,
+			return virtualDefEntry{}, unimplemented.NewWithIssueDetailf(8675,
+				tn.Schema()+"."+tableName,
 				"virtual schema table not implemented: %s.%s", tn.Schema(), tableName)
 		}
 		return virtualDefEntry{}, sqlbase.NewUndefinedRelationError(tn)

@@ -58,11 +58,11 @@ func (n *controlJobsNode) startExec(params runParams) error {
 
 		switch n.desiredStatus {
 		case jobs.StatusPaused:
-			err = reg.Pause(params.ctx, params.p.txn, int64(jobID))
+			err = reg.PauseRequested(params.ctx, params.p.txn, int64(jobID))
 		case jobs.StatusRunning:
 			err = reg.Resume(params.ctx, params.p.txn, int64(jobID))
 		case jobs.StatusCanceled:
-			err = reg.Cancel(params.ctx, params.p.txn, int64(jobID))
+			err = reg.CancelRequested(params.ctx, params.p.txn, int64(jobID))
 		default:
 			err = errors.AssertionFailedf("unhandled status %v", n.desiredStatus)
 		}

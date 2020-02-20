@@ -19,20 +19,20 @@ import (
 )
 
 func init() {
-	RegisterCommand(roachpb.Increment, DefaultDeclareKeys, Increment)
+	RegisterReadWriteCommand(roachpb.Increment, DefaultDeclareKeys, Increment)
 }
 
 // Increment increments the value (interpreted as varint64 encoded) and
 // returns the newly incremented value (encoded as varint64). If no value
 // exists for the key, zero is incremented.
 func Increment(
-	ctx context.Context, batch engine.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, readWriter engine.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
 ) (result.Result, error) {
 	args := cArgs.Args.(*roachpb.IncrementRequest)
 	h := cArgs.Header
 	reply := resp.(*roachpb.IncrementResponse)
 
-	newVal, err := engine.MVCCIncrement(ctx, batch, cArgs.Stats, args.Key, h.Timestamp, h.Txn, args.Increment)
+	newVal, err := engine.MVCCIncrement(ctx, readWriter, cArgs.Stats, args.Key, h.Timestamp, h.Txn, args.Increment)
 	reply.NewValue = newVal
 	return result.Result{}, err
 }

@@ -234,6 +234,7 @@ func (mb *mutationBuilder) buildInputForUpdate(
 		mb.b.addTable(mb.tab, &mb.alias),
 		nil, /* ordinals */
 		indexFlags,
+		noRowLocking,
 		includeMutations,
 		inScope,
 	)
@@ -244,7 +245,7 @@ func (mb *mutationBuilder) buildInputForUpdate(
 	// If there is a FROM clause present, we must join all the tables
 	// together with the table being updated.
 	if fromClausePresent {
-		fromScope := mb.b.buildFromTables(from, inScope)
+		fromScope := mb.b.buildFromTables(from, noRowLocking, inScope)
 
 		// Check that the same table name is not used multiple times.
 		mb.b.validateJoinTableNames(mb.outScope, fromScope)
@@ -335,6 +336,7 @@ func (mb *mutationBuilder) buildInputForDelete(
 		mb.b.addTable(mb.tab, &mb.alias),
 		nil, /* ordinals */
 		indexFlags,
+		noRowLocking,
 		includeMutations,
 		inScope,
 	)
@@ -653,7 +655,7 @@ func findRoundingFunction(typ *types.T, precision int) (*tree.FunctionProperties
 // constraint defined on the target table. The mutation operator will report
 // a constraint violation error if the value of the column is false.
 func (mb *mutationBuilder) addCheckConstraintCols() {
-	if mb.tab.CheckCount() > 0 {
+	if mb.tab.CheckCount() != 0 {
 		// Disambiguate names so that references in the constraint expression refer
 		// to the correct columns.
 		mb.disambiguateColumns()
@@ -810,17 +812,7 @@ func (mb *mutationBuilder) buildReturning(returning tree.ReturningExprs) {
 	//
 	inScope := mb.outScope.replace()
 	inScope.expr = mb.outScope.expr
-	inScope.cols = make([]scopeColumn, 0, mb.tab.ColumnCount())
-	for i, n := 0, mb.tab.ColumnCount(); i < n; i++ {
-		tabCol := mb.tab.Column(i)
-		inScope.cols = append(inScope.cols, scopeColumn{
-			name:   tabCol.ColName(),
-			table:  mb.alias,
-			typ:    tabCol.DatumType(),
-			id:     mb.tabID.ColumnID(i),
-			hidden: tabCol.IsHidden(),
-		})
-	}
+	inScope.appendColumnsFromTable(mb.md.TableMeta(mb.tabID), &mb.alias)
 
 	// extraAccessibleCols contains all the columns that the RETURNING
 	// clause can refer to in addition to the table columns. This is useful for
@@ -908,7 +900,7 @@ func (mb *mutationBuilder) buildFKChecksForInsert() {
 	}
 
 	for i, n := 0, mb.tab.OutboundForeignKeyCount(); i < n; i++ {
-		mb.addInsertionCheck(i, insertCols)
+		mb.addInsertionCheck(i, mb.insertOrds, checkAllRows)
 	}
 }
 
@@ -1027,7 +1019,7 @@ func (mb *mutationBuilder) buildFKChecksForUpdate() {
 			continue
 		}
 
-		mb.addInsertionCheck(i, newRowColIDs)
+		mb.addInsertionCheck(i, newRowCols, checkAllRows)
 	}
 
 	// The "deletion" incurred by an update is the rows deleted for a given
@@ -1054,8 +1046,8 @@ func (mb *mutationBuilder) buildFKChecksForUpdate() {
 			continue
 		}
 
-		oldRows, colsForOldRow := mb.projectOrdinals(oldRowFKColOrdinals)
-		newRows, colsForNewRow := mb.projectOrdinals(newRowFKColOrdinals)
+		oldRows, colsForOldRow, _ := mb.projectInput(oldRowFKColOrdinals, false /* includeCanary */)
+		newRows, colsForNewRow, _ := mb.projectInput(newRowFKColOrdinals, false /* includeCanary */)
 
 		// The rows that no longer exist are the ones that were "deleted" by virtue
 		// of being updated _from_, minus the ones that were "added" by virtue of
@@ -1082,12 +1074,10 @@ func (mb *mutationBuilder) buildFKChecksForUpdate() {
 		for j := 0; j < len(deletedFKCols); j++ {
 			c := mb.b.factory.Metadata().ColumnMeta(deletedFKCols[j])
 			outCols[j] = mb.md.AddColumn(c.Alias, c.Type)
-			proj = append(proj, memo.ProjectionsItem{
-				ColPrivate: memo.ColPrivate{
-					Col: outCols[j],
-				},
-				Element: mb.b.factory.ConstructVariable(deletedFKCols[j]),
-			})
+			proj = append(proj, mb.b.factory.ConstructProjectionsItem(
+				mb.b.factory.ConstructVariable(deletedFKCols[j]),
+				outCols[j],
+			))
 		}
 		// TODO(justin): add rules to allow this to get pushed down.
 		input := mb.b.factory.ConstructProject(deletions, proj, opt.ColSet{})
@@ -1109,15 +1099,58 @@ func (mb *mutationBuilder) buildFKChecksForUpsert() {
 		mb.fkFallback = true
 		return
 	}
-	// TODO(justin): not implemented yet.
-	mb.fkFallback = true
+
+	mb.withID = mb.b.factory.Memo().NextWithID()
+
+	// Add the check for the insertion portion of the the upsert.
+	for i, n := 0, mb.tab.OutboundForeignKeyCount(); i < n; i++ {
+		mb.addInsertionCheck(i, mb.insertOrds, checkInsertedRows)
+	}
+
+	// TODO(justin): include checks for the set of updated rows.
 }
+
+// rowInclusion determines the mode in which an insertion check should be
+// constructed.
+type rowInclusion int
+
+const (
+	checkAllRows rowInclusion = iota
+	checkInsertedRows
+)
 
 // addInsertionCheck adds a FK check for rows which are added to a table.
 // The input to the insertion check will be the input to the mutation operator.
-// insertCols is a list of the columns for the rows being inserted, indexed by
+// insertOrds is a list of the columns for the rows being inserted, indexed by
 // their ordinal position in the table.
-func (mb *mutationBuilder) addInsertionCheck(fkOrdinal int, insertCols opt.ColList) {
+// rows is either checkAllRows or checkInsertedRows, and denotes whether we
+// should add a filter for the canary column. It should only be
+// checkInsertedRows if we are performing an UPSERT.
+func (mb *mutationBuilder) addInsertionCheck(
+	fkOrdinal int, insertOrds []scopeOrdinal, rows rowInclusion,
+) {
+	inputExpr, insertCols, canaryID := mb.projectInput(insertOrds, rows == checkInsertedRows)
+
+	// If we were an upsert, then we have to filter out the rows that were the ones actually inserted.
+	if rows == checkInsertedRows {
+		// We need to add a project on top of this so that the we remove the canary column.
+		inputExpr = mb.b.factory.ConstructProject(
+			mb.b.factory.ConstructSelect(
+				inputExpr,
+				memo.FiltersExpr{
+					mb.b.factory.ConstructFiltersItem(
+						mb.b.factory.ConstructIs(
+							mb.b.factory.ConstructVariable(canaryID),
+							memo.NullSingleton,
+						),
+					),
+				},
+			),
+			memo.ProjectionsExpr{},
+			insertCols.ToSet(),
+		)
+	}
+
 	fk := mb.tab.OutboundForeignKey(fkOrdinal)
 	numCols := fk.ColumnCount()
 	var notNullInputCols opt.ColSet
@@ -1135,17 +1168,17 @@ func (mb *mutationBuilder) addInsertionCheck(fkOrdinal int, insertCols opt.ColLi
 		// If a table column is not nullable, NULLs cannot be inserted (the
 		// mutation will fail). So for the purposes of FK checks, we can treat
 		// these columns as not null.
-		if mb.outScope.expr.Relational().NotNullCols.Contains(inputColID) || !mb.tab.Column(ord).IsNullable() {
+		if inputExpr.Relational().NotNullCols.Contains(inputColID) || !mb.tab.Column(ord).IsNullable() {
 			notNullInputCols.Add(inputColID)
 		}
 	}
 
-	item := memo.FKChecksItem{FKChecksItemPrivate: memo.FKChecksItemPrivate{
+	private := memo.FKChecksItemPrivate{
 		OriginTable: mb.tabID,
 		FKOutbound:  true,
 		FKOrdinal:   fkOrdinal,
 		OpName:      mb.opName,
-	}}
+	}
 
 	// Build an anti-join, with the origin FK columns on the left and the
 	// referenced columns on the right.
@@ -1167,17 +1200,19 @@ func (mb *mutationBuilder) addInsertionCheck(fkOrdinal int, insertCols opt.ColLi
 		refOrdinals[j] = fk.ReferencedColumnOrdinal(refTab, j)
 	}
 	refTabMeta := mb.b.addTable(refTab.(cat.Table), tree.NewUnqualifiedTableName(refTab.Name()))
-	item.ReferencedTable = refTabMeta.MetaID
+	private.ReferencedTable = refTabMeta.MetaID
 	scanScope := mb.b.buildScan(
 		refTabMeta,
 		refOrdinals,
 		&tree.IndexFlags{IgnoreForeignKeys: true},
+		noRowLocking,
 		includeMutations,
 		mb.b.allocScope(),
 	)
 
-	left, withScanCols := mb.makeFKInputScan(insertedFKCols)
-	item.KeyCols = withScanCols
+	inputExpr = mb.b.factory.ConstructProject(inputExpr, memo.ProjectionsExpr{}, insertedFKCols.ToSet())
+
+	private.KeyCols = insertedFKCols
 	if notNullInputCols.Len() < numCols {
 		// The columns we are inserting might have NULLs. These require special
 		// handling, depending on the match method:
@@ -1203,15 +1238,15 @@ func (mb *mutationBuilder) addInsertionCheck(fkOrdinal int, insertCols opt.ColLi
 			filters := make(memo.FiltersExpr, 0, numCols-notNullInputCols.Len())
 			for i := range insertedFKCols {
 				if !notNullInputCols.Contains(insertedFKCols[i]) {
-					filters = append(filters, memo.FiltersItem{
-						Condition: mb.b.factory.ConstructIsNot(
-							mb.b.factory.ConstructVariable(withScanCols[i]),
+					filters = append(filters, mb.b.factory.ConstructFiltersItem(
+						mb.b.factory.ConstructIsNot(
+							mb.b.factory.ConstructVariable(insertedFKCols[i]),
 							memo.NullSingleton,
 						),
-					})
+					))
 				}
 			}
-			left = mb.b.factory.ConstructSelect(left, filters)
+			inputExpr = mb.b.factory.ConstructSelect(inputExpr, filters)
 
 		case tree.MatchFull:
 			// Filter out any rows which have NULLs on all referencing columns.
@@ -1224,7 +1259,7 @@ func (mb *mutationBuilder) addInsertionCheck(fkOrdinal int, insertCols opt.ColLi
 			// Build a filter of the form
 			//   (a IS NOT NULL) OR (b IS NOT NULL) ...
 			var condition opt.ScalarExpr
-			for _, col := range withScanCols {
+			for _, col := range insertedFKCols {
 				is := mb.b.factory.ConstructIsNot(
 					mb.b.factory.ConstructVariable(col),
 					memo.NullSingleton,
@@ -1235,7 +1270,10 @@ func (mb *mutationBuilder) addInsertionCheck(fkOrdinal int, insertCols opt.ColLi
 					condition = mb.b.factory.ConstructOr(condition, is)
 				}
 			}
-			left = mb.b.factory.ConstructSelect(left, memo.FiltersExpr{{Condition: condition}})
+			inputExpr = mb.b.factory.ConstructSelect(
+				inputExpr,
+				memo.FiltersExpr{mb.b.factory.ConstructFiltersItem(condition)},
+			)
 
 		default:
 			panic(errors.AssertionFailedf("match method %s not supported", m))
@@ -1246,17 +1284,20 @@ func (mb *mutationBuilder) addInsertionCheck(fkOrdinal int, insertCols opt.ColLi
 	//   (origin_a = referenced_a) AND (origin_b = referenced_b) AND ...
 	antiJoinFilters := make(memo.FiltersExpr, numCols)
 	for j := 0; j < numCols; j++ {
-		antiJoinFilters[j].Condition = mb.b.factory.ConstructEq(
-			mb.b.factory.ConstructVariable(withScanCols[j]),
-			mb.b.factory.ConstructVariable(scanScope.cols[j].id),
+		antiJoinFilters[j] = mb.b.factory.ConstructFiltersItem(
+			mb.b.factory.ConstructEq(
+				mb.b.factory.ConstructVariable(insertedFKCols[j]),
+				mb.b.factory.ConstructVariable(scanScope.cols[j].id),
+			),
 		)
 	}
 
-	item.Check = mb.b.factory.ConstructAntiJoin(
-		left, scanScope.expr, antiJoinFilters, &memo.JoinPrivate{},
-	)
-
-	mb.checks = append(mb.checks, item)
+	mb.checks = append(mb.checks, mb.b.factory.ConstructFKChecksItem(
+		mb.b.factory.ConstructAntiJoin(
+			inputExpr, scanScope.expr, antiJoinFilters, &memo.JoinPrivate{},
+		),
+		&private,
+	))
 }
 
 // addDeletionCheck adds a FK check for rows which are removed from a table.
@@ -1270,12 +1311,12 @@ func (mb *mutationBuilder) addDeletionCheck(
 	fkOrdinal int, deletedRows memo.RelExpr, deleteCols opt.ColList, action tree.ReferenceAction,
 ) (ok bool) {
 	fk := mb.tab.InboundForeignKey(fkOrdinal)
-	item := memo.FKChecksItem{FKChecksItemPrivate: memo.FKChecksItemPrivate{
+	private := memo.FKChecksItemPrivate{
 		ReferencedTable: mb.tabID,
 		FKOutbound:      false,
 		FKOrdinal:       fkOrdinal,
 		OpName:          mb.opName,
-	}}
+	}
 
 	// Build a semi join, with the referenced FK columns on the left and the
 	// origin columns on the right.
@@ -1304,17 +1345,18 @@ func (mb *mutationBuilder) addDeletionCheck(
 	}
 
 	origTabMeta := mb.b.addTable(origTab, tree.NewUnqualifiedTableName(origTab.Name()))
-	item.OriginTable = origTabMeta.MetaID
+	private.OriginTable = origTabMeta.MetaID
 	scanScope := mb.b.buildScan(
 		origTabMeta,
 		origOrdinals,
 		&tree.IndexFlags{IgnoreForeignKeys: true},
+		noRowLocking,
 		includeMutations,
 		mb.b.allocScope(),
 	)
 
 	left, withScanCols := deletedRows, deleteCols
-	item.KeyCols = withScanCols
+	private.KeyCols = withScanCols
 
 	// Note that it's impossible to orphan a row whose FK key columns contain a
 	// NULL, since by definition a NULL never refers to an actual row (in
@@ -1323,40 +1365,53 @@ func (mb *mutationBuilder) addDeletionCheck(
 	//   (origin_a = referenced_a) AND (origin_b = referenced_b) AND ...
 	semiJoinFilters := make(memo.FiltersExpr, numCols)
 	for j := 0; j < numCols; j++ {
-		semiJoinFilters[j].Condition = mb.b.factory.ConstructEq(
-			mb.b.factory.ConstructVariable(withScanCols[j]),
-			mb.b.factory.ConstructVariable(scanScope.cols[j].id),
+		semiJoinFilters[j] = mb.b.factory.ConstructFiltersItem(
+			mb.b.factory.ConstructEq(
+				mb.b.factory.ConstructVariable(withScanCols[j]),
+				mb.b.factory.ConstructVariable(scanScope.cols[j].id),
+			),
 		)
 	}
-	item.Check = mb.b.factory.ConstructSemiJoin(
-		left, scanScope.expr, semiJoinFilters, &memo.JoinPrivate{},
-	)
-	mb.checks = append(mb.checks, item)
+	mb.checks = append(mb.checks, mb.b.factory.ConstructFKChecksItem(
+		mb.b.factory.ConstructSemiJoin(
+			left, scanScope.expr, semiJoinFilters, &memo.JoinPrivate{},
+		),
+		&private,
+	))
 
 	return true
 }
 
-// projectOrdinals returns a WithScan that returns each row in the input to the
+// projectInput returns a WithScan that returns each row in the input to the
 // mutation operator, projecting only the column ordinals provided, mapping them
 // to new column ids. Returns the new expression along with the column ids
 // they've been mapped to.
-func (mb *mutationBuilder) projectOrdinals(
-	ords []scopeOrdinal,
-) (_ memo.RelExpr, outCols opt.ColList) {
-	outCols = make(opt.ColList, len(ords))
-	inCols := make(opt.ColList, len(ords))
+// If includeCanary is set, the resulting expression will also render the canary
+// column and its id will be returned. Should only be set if this is an UPSERT.
+func (mb *mutationBuilder) projectInput(
+	ords []scopeOrdinal, includeCanary bool,
+) (_ memo.RelExpr, outCols opt.ColList, canaryOutID opt.ColumnID) {
+	outCols = make(opt.ColList, len(ords), len(ords)+1)
+	inCols := make(opt.ColList, len(ords), len(ords)+1)
 	for i := 0; i < len(ords); i++ {
 		c := mb.b.factory.Metadata().ColumnMeta(mb.outScope.cols[ords[i]].id)
 		outCols[i] = mb.md.AddColumn(c.Alias, c.Type)
 		inCols[i] = mb.outScope.cols[ords[i]].id
 	}
+	if includeCanary {
+		c := mb.md.ColumnMeta(mb.canaryColID)
+		canaryOutID = mb.md.AddColumn(c.Alias, c.Type)
+		outCols = append(outCols, canaryOutID)
+		inCols = append(inCols, mb.canaryColID)
+	}
 	out := mb.b.factory.ConstructWithScan(&memo.WithScanPrivate{
-		ID:           mb.withID,
+		With:         mb.withID,
 		InCols:       inCols,
 		OutCols:      outCols,
 		BindingProps: mb.outScope.expr.Relational(),
+		ID:           mb.b.factory.Metadata().NextUniqueID(),
 	})
-	return out, outCols
+	return out, outCols, canaryOutID
 }
 
 // makeFKInputScan constructs a WithScan that iterates over the input to the
@@ -1372,10 +1427,11 @@ func (mb *mutationBuilder) makeFKInputScan(
 		outCols[i] = mb.md.AddColumn(c.Alias, c.Type)
 	}
 	scan = mb.b.factory.ConstructWithScan(&memo.WithScanPrivate{
-		ID:           mb.withID,
+		With:         mb.withID,
 		InCols:       inputCols,
 		OutCols:      outCols,
 		BindingProps: mb.outScope.expr.Relational(),
+		ID:           mb.b.factory.Metadata().NextUniqueID(),
 	})
 	return scan, outCols
 }

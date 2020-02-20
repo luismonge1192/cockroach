@@ -68,6 +68,7 @@ func TestTypeCheck(t *testing.T) {
 		{`NULLIF(NULL, 2)`, `NULLIF(NULL, 2:::INT8)`},
 		{`NULLIF(2, NULL)`, `NULLIF(2:::INT8, NULL)`},
 		{`NULLIF((1, 2), (1, 3))`, `NULLIF((1:::INT8, 2:::INT8), (1:::INT8, 3:::INT8))`},
+		{`NULLIF(NULL, 0) + NULLIF(NULL, 0)`, `NULL`},
 		{`COALESCE(1, 2, 3, 4, 5)`, `COALESCE(1:::INT8, 2:::INT8, 3:::INT8, 4:::INT8, 5:::INT8)`},
 		{`COALESCE(1, 2.0)`, `COALESCE(1:::DECIMAL, 2.0:::DECIMAL)`},
 		{`COALESCE(NULL, 2)`, `COALESCE(NULL, 2:::INT8)`},
@@ -136,6 +137,11 @@ func TestTypeCheck(t *testing.T) {
 			`(ROW(1:::INT8, 2:::INT8, 3:::INT8) AS "One", two, "Three")`,
 			`((1:::INT8, 2:::INT8, 3:::INT8) AS "One", two, "Three")`,
 		},
+		// Tuples with duplicate labels are allowed, but raise error when accessed by a duplicate label name.
+		// This satisfies a postgres-compatible implementation of unnest(array, array...), where all columns
+		// have the same label (unnest).
+		{`((1,2) AS a,a)`, `((1:::INT8, 2:::INT8) AS a, a)`},
+		{`((1,2,3) AS a,a,a)`, `((1:::INT8, 2:::INT8, 3:::INT8) AS a, a, a)`},
 		// And tuples without labels still work as advertized
 		{`(ROW (1))`, `(1:::INT8,)`},
 		{`ROW(1:::INT8)`, `(1:::INT8,)`},
@@ -225,6 +231,7 @@ func TestTypeCheckError(t *testing.T) {
 		{`1 = ANY ARRAY[2, 'a']`, `unsupported comparison operator: 1 = ANY ARRAY[2, 'a']: could not parse "a" as type int`},
 		{`1 = ALL current_schemas(true)`, `unsupported comparison operator: <int> = ALL <string[]>`},
 		{`1.0 BETWEEN 2 AND 'a'`, `unsupported comparison operator: <decimal> < <string>`},
+		{`NULL BETWEEN 2 AND 'a'`, `unsupported comparison operator: <int> < <string>`},
 		{`IF(1, 2, 3)`, `incompatible IF condition type: int`},
 		{`IF(true, 'a', 2)`, `incompatible IF expressions: could not parse "a" as type int`},
 		{`IF(true, 2, 'a')`, `incompatible IF expressions: could not parse "a" as type int`},
@@ -246,12 +253,12 @@ func TestTypeCheckError(t *testing.T) {
 			`mismatch in tuple definition: 1 expressions, 2 labels`,
 		},
 		{
-			`((1,2) AS a,a)`,
-			`duplicate tuple label: "a"`,
+			`(((1,2) AS a,a)).a`,
+			`column reference "a" is ambiguous`,
 		},
 		{
-			`((1,2,3) AS a,b,a)`,
-			`duplicate tuple label: "a"`,
+			`((ROW (1, '2') AS b,b)).b`,
+			`column reference "b" is ambiguous`,
 		},
 		{
 			`((ROW (1, '2') AS a,b)).x`,

@@ -60,6 +60,9 @@ func TestingOverrideTxnLivenessThreshold(t time.Duration) func() {
 // ABORT nor TIMESTAMP, but also for ABORT and TIMESTAMP pushes where
 // the pushee has min priority or pusher has max priority.
 func ShouldPushImmediately(req *roachpb.PushTxnRequest) bool {
+	if req.Force {
+		return true
+	}
 	if !(req.PushType == roachpb.PUSH_ABORT || req.PushType == roachpb.PUSH_TIMESTAMP) {
 		return true
 	}
@@ -75,7 +78,7 @@ func ShouldPushImmediately(req *roachpb.PushTxnRequest) bool {
 // for transactions with pushed timestamps.
 func isPushed(req *roachpb.PushTxnRequest, txn *roachpb.Transaction) bool {
 	return (txn.Status.IsFinalized() ||
-		(req.PushType == roachpb.PUSH_TIMESTAMP && !txn.WriteTimestamp.Less(req.PushTo)))
+		(req.PushType == roachpb.PUSH_TIMESTAMP && req.PushTo.LessEq(txn.WriteTimestamp)))
 }
 
 // TxnExpiration computes the timestamp after which the transaction will be
@@ -183,6 +186,7 @@ type TestingKnobs struct {
 // Queue is thread safe.
 type Queue struct {
 	store StoreInterface
+	repl  ReplicaInterface
 	mu    struct {
 		syncutil.Mutex
 		txns    map[uuid.UUID]*pendingTxn
@@ -191,9 +195,10 @@ type Queue struct {
 }
 
 // NewQueue instantiates a new Queue.
-func NewQueue(store StoreInterface) *Queue {
+func NewQueue(store StoreInterface, repl ReplicaInterface) *Queue {
 	return &Queue{
 		store: store,
+		repl:  repl,
 	}
 }
 
@@ -272,10 +277,10 @@ func (q *Queue) IsEnabled() bool {
 	return q.mu.txns != nil
 }
 
-// Enqueue creates a new pendingTxn for the target txn of a failed
+// EnqueueTxn creates a new pendingTxn for the target txn of a failed
 // PushTxn command. Subsequent PushTxn requests for the same txn
 // will be enqueued behind the pendingTxn via MaybeWait().
-func (q *Queue) Enqueue(txn *roachpb.Transaction) {
+func (q *Queue) EnqueueTxn(txn *roachpb.Transaction) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.mu.txns == nil {
@@ -294,9 +299,8 @@ func (q *Queue) Enqueue(txn *roachpb.Transaction) {
 	}
 }
 
-// UpdateTxn is invoked to update a transaction's status after a
-// successful PushTxn or EndTransaction command. It unblocks all
-// pending waiters.
+// UpdateTxn is invoked to update a transaction's status after a successful
+// PushTxn or EndTxn command. It unblocks all pending waiters.
 func (q *Queue) UpdateTxn(ctx context.Context, txn *roachpb.Transaction) {
 	txn.AssertInitialized(ctx)
 	q.mu.Lock()
@@ -327,7 +331,7 @@ func (q *Queue) UpdateTxn(ctx context.Context, txn *roachpb.Transaction) {
 	q.store.GetTxnWaitMetrics().PusherWaiting.Dec(int64(len(waitingPushes)))
 
 	if log.V(1) && len(waitingPushes) > 0 {
-		log.Infof(context.Background(), "updating %d push waiters for %s", len(waitingPushes), txn.ID.Short())
+		log.Infof(ctx, "updating %d push waiters for %s", len(waitingPushes), txn.ID.Short())
 	}
 	// Send on pending waiter channels outside of the mutex lock.
 	for _, w := range waitingPushes {
@@ -388,10 +392,6 @@ func (q *Queue) releaseWaitingQueriesLocked(ctx context.Context, txnID uuid.UUID
 	}
 }
 
-// ErrDeadlock is a sentinel error returned when a cyclic dependency between
-// waiting transactions is detected.
-var ErrDeadlock = roachpb.NewErrorf("deadlock detected")
-
 // MaybeWaitForPush checks whether there is a queue already
 // established for pushing the transaction. If not, or if the PushTxn
 // request isn't queueable, return immediately. If there is a queue,
@@ -400,11 +400,8 @@ var ErrDeadlock = roachpb.NewErrorf("deadlock detected")
 //
 // If the transaction is successfully pushed while this method is waiting,
 // the first return value is a non-nil PushTxnResponse object.
-//
-// In the event of a dependency cycle of pushers leading to deadlock,
-// this method will return an ErrDeadlock error.
 func (q *Queue) MaybeWaitForPush(
-	ctx context.Context, repl ReplicaInterface, req *roachpb.PushTxnRequest,
+	ctx context.Context, req *roachpb.PushTxnRequest,
 ) (*roachpb.PushTxnResponse, *roachpb.Error) {
 	if ShouldPushImmediately(req) {
 		return nil, nil
@@ -416,7 +413,7 @@ func (q *Queue) MaybeWaitForPush(
 	// outside of the replica after a split or merge. Note that the
 	// ContainsKey check is done under the txn wait queue's lock to
 	// ensure that it's not cleared before an incorrect insertion happens.
-	if q.mu.txns == nil || !repl.ContainsKey(req.Key) {
+	if q.mu.txns == nil || !q.repl.ContainsKey(req.Key) {
 		q.mu.Unlock()
 		return nil, nil
 	}
@@ -654,7 +651,7 @@ func (q *Queue) MaybeWaitForPush(
 						dependents,
 					)
 					metrics.DeadlocksTotal.Inc(1)
-					return nil, ErrDeadlock
+					return q.forcePushAbort(ctx, req)
 				}
 			}
 			// Signal the pusher query txn loop to continue.
@@ -673,7 +670,7 @@ func (q *Queue) MaybeWaitForPush(
 // there is a queue, enqueue this request as a waiter and enter a
 // select loop waiting for any updates to the target transaction.
 func (q *Queue) MaybeWaitForQuery(
-	ctx context.Context, repl ReplicaInterface, req *roachpb.QueryTxnRequest,
+	ctx context.Context, req *roachpb.QueryTxnRequest,
 ) *roachpb.Error {
 	if !req.WaitForUpdate {
 		return nil
@@ -685,7 +682,7 @@ func (q *Queue) MaybeWaitForQuery(
 	// outside of the replica after a split or merge. Note that the
 	// ContainsKey check is done under the txn wait queue's lock to
 	// ensure that it's not cleared before an incorrect insertion happens.
-	if q.mu.txns == nil || !repl.ContainsKey(req.Key) {
+	if q.mu.txns == nil || !q.repl.ContainsKey(req.Key) {
 		q.mu.Unlock()
 		return nil
 	}
@@ -796,8 +793,8 @@ func (q *Queue) startQueryPusherTxn(
 					errCh <- pErr
 					return
 				} else if updatedPusher == nil {
-					// No pusher to query; the BeginTransaction hasn't yet created the
-					// pusher's record. Continue in order to backoff and retry.
+					// No pusher to query; the pusher's record hasn't yet been
+					// created. Continue in order to backoff and retry.
 					// TODO(nvanbenschoten): we shouldn't hit this case in a 2.2
 					// cluster now that QueryTxn requests synthesize
 					// transactions from their provided TxnMeta. However, we
@@ -893,13 +890,33 @@ func (q *Queue) queryTxnStatus(
 	}
 	br := b.RawResponse()
 	resp := br.Responses[0].GetInner().(*roachpb.QueryTxnResponse)
-	// ID can be nil if no BeginTransaction has been sent yet and we're talking
-	// to a 2.1 node.
+	// ID can be nil if no HeartbeatTxn has been sent yet and we're talking to a
+	// 2.1 node.
 	// TODO(nvanbenschoten): Remove this in 2.3.
 	if updatedTxn := &resp.QueriedTxn; updatedTxn.ID != (uuid.UUID{}) {
 		return updatedTxn, resp.WaitingTxns, nil
 	}
 	return nil, nil, nil
+}
+
+// forcePushAbort upgrades the PushTxn request to a "forced" push abort, which
+// overrides the normal expiration and priority checks to ensure that it aborts
+// the pushee. This mechanism can be used to break deadlocks between conflicting
+// transactions.
+func (q *Queue) forcePushAbort(
+	ctx context.Context, req *roachpb.PushTxnRequest,
+) (*roachpb.PushTxnResponse, *roachpb.Error) {
+	log.VEventf(ctx, 1, "force pushing %v to break deadlock", req.PusheeTxn.ID)
+	forcePush := *req
+	forcePush.Force = true
+	forcePush.PushType = roachpb.PUSH_ABORT
+	b := &client.Batch{}
+	b.Header.Timestamp = q.store.Clock().Now()
+	b.AddRawRequest(&forcePush)
+	if err := q.store.DB().Run(ctx, b); err != nil {
+		return nil, b.MustPErr()
+	}
+	return b.RawResponse().Responses[0].GetPushTxn(), nil
 }
 
 // TrackedTxns returns a (newly minted) set containing the transaction IDs which

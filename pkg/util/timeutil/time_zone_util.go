@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/cockroachdb/errors"
 )
 
 const (
@@ -23,7 +25,7 @@ const (
 	offsetBoundSecs   = 167*60*60 + 59*60
 )
 
-var timezoneOffsetRegex = regexp.MustCompile(`(?i)(GMT|UTC)([+-])(\d{1,3}(:[0-5]?\d){0,2})\b$`)
+var timezoneOffsetRegex = regexp.MustCompile(`(?i)^(GMT|UTC)?([+-])?(\d{1,3}(:[0-5]?\d){0,2})$`)
 
 // FixedOffsetTimeZoneToLocation creates a time.Location with a set offset and
 // with a name that can be marshaled by crdb between nodes.
@@ -33,15 +35,58 @@ func FixedOffsetTimeZoneToLocation(offset int, origRepr string) *time.Location {
 		offset)
 }
 
+// TimeZoneStringToLocationStandard is an option for the standard to use
+// for parsing in TimeZoneStringToLocation.
+type TimeZoneStringToLocationStandard uint32
+
+const (
+	// TimeZoneStringToLocationISO8601Standard parses UTC offsets as *east* of
+	// the GMT line, e.g. UTC-5 would be 'America/New_York' without daylight savings.
+	TimeZoneStringToLocationISO8601Standard TimeZoneStringToLocationStandard = iota
+	// TimeZoneStringToLocationPOSIXStandard parses UTC offsets as *west* of the
+	// GMT line, e.g. UTC+5 would be 'America/New_York' without daylight savings.
+	TimeZoneStringToLocationPOSIXStandard
+)
+
 // TimeZoneStringToLocation transforms a string into a time.Location. It
 // supports the usual locations and also time zones with fixed offsets created
 // by FixedOffsetTimeZoneToLocation().
-func TimeZoneStringToLocation(location string) (*time.Location, error) {
-	offset, origRepr, parsed := ParseFixedOffsetTimeZone(location)
+func TimeZoneStringToLocation(
+	locStr string, std TimeZoneStringToLocationStandard,
+) (*time.Location, error) {
+	offset, origRepr, parsed := ParseFixedOffsetTimeZone(locStr)
 	if parsed {
 		return FixedOffsetTimeZoneToLocation(offset, origRepr), nil
 	}
-	return LoadLocation(location)
+
+	// The time may just be a raw int value.
+	intVal, err := strconv.ParseInt(locStr, 10, 64)
+	if err == nil {
+		if std == TimeZoneStringToLocationPOSIXStandard {
+			intVal *= -1
+		}
+		return FixedOffsetTimeZoneToLocation(int(intVal)*60*60, locStr), nil
+	}
+
+	locTransforms := []func(string) string{
+		func(s string) string { return s },
+		strings.ToUpper,
+		strings.ToTitle,
+	}
+	for _, transform := range locTransforms {
+		if loc, err := LoadLocation(transform(locStr)); err == nil {
+			return loc, nil
+		}
+	}
+
+	tzOffset, ok := timeZoneOffsetStringConversion(locStr)
+	if ok {
+		if std == TimeZoneStringToLocationPOSIXStandard {
+			tzOffset *= -1
+		}
+		return FixedOffsetTimeZoneToLocation(int(tzOffset), locStr), nil
+	}
+	return nil, errors.Newf("could not parse %q as time zone", locStr)
 }
 
 // ParseFixedOffsetTimeZone takes the string representation of a time.Location
@@ -75,16 +120,16 @@ func ParseFixedOffsetTimeZone(location string) (offset int, origRepr string, suc
 	return offset, strings.TrimSuffix(strings.TrimPrefix(origRepr, "("), ")"), true
 }
 
-// TimeZoneOffsetStringConversion converts a time string to offset seconds.
+// timeZoneOffsetStringConversion converts a time string to offset seconds.
 // Supported time zone strings: GMT/UTC±[00:00:00 - 169:59:00].
 // Seconds/minutes omittable and is case insensitive.
-func TimeZoneOffsetStringConversion(s string) (offset int64, ok bool) {
+func timeZoneOffsetStringConversion(s string) (offset int64, ok bool) {
 	submatch := timezoneOffsetRegex.FindStringSubmatch(strings.ReplaceAll(s, " ", ""))
 	if len(submatch) == 0 {
 		return 0, false
 	}
-	prefix := string(submatch[0][3])
-	timeString := string(submatch[3])
+	prefix := submatch[2]
+	timeString := submatch[3]
 
 	var (
 		hoursString   = "0"

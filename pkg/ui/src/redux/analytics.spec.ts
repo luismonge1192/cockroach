@@ -12,7 +12,7 @@ import { assert } from "chai";
 import * as sinon from "sinon";
 
 import Analytics from "analytics-node";
-import { Location } from "history";
+import { Location, createLocation, createHashHistory } from "history";
 import _ from "lodash";
 import { Store } from "redux";
 
@@ -22,7 +22,7 @@ import { AdminUIState, createAdminUIStore } from "./state";
 
 import * as protos from "src/js/protos";
 
-import { createLocation } from "src/hacks/createLocation";
+const sandbox = sinon.createSandbox();
 
 describe("analytics listener", function() {
   const clusterID = "a49f0ced-7ada-4135-af37-8acf6b548df0";
@@ -32,14 +32,18 @@ describe("analytics listener", function() {
     let pageSpy: sinon.SinonSpy;
 
     beforeEach(function () {
-      store = createAdminUIStore();
-      pageSpy = sinon.spy();
+      store = createAdminUIStore(createHashHistory());
+      pageSpy = sandbox.spy();
 
       // Analytics is a completely fake object, we don't want to call
       // segment if an unexpected method is called.
       analytics = {
         page: pageSpy,
       } as any;
+    });
+
+    afterEach(() => {
+      sandbox.reset();
     });
 
     const setClusterData = function (enabled = true) {
@@ -215,14 +219,18 @@ describe("analytics listener", function() {
     let identifySpy: sinon.SinonSpy;
 
     beforeEach(function () {
-      store = createAdminUIStore();
-      identifySpy = sinon.spy();
+      store = createAdminUIStore(createHashHistory());
+      identifySpy = sandbox.spy();
 
       // Analytics is a completely fake object, we don't want to call
       // segment if an unexpected method is called.
       analytics = {
         identify: identifySpy,
       } as any;
+    });
+
+    afterEach(() => {
+      sandbox.reset();
     });
 
     const setClusterData = function (enabled = true, enterprise = true) {
@@ -277,7 +285,7 @@ describe("analytics listener", function() {
       setVersionData();
 
       _.each([false, true], (enterpriseSetting) => {
-        identifySpy.reset();
+        sandbox.reset();
         setClusterData(true, enterpriseSetting);
         const sync = new AnalyticsSync(analytics, store, []);
         sync.identify();

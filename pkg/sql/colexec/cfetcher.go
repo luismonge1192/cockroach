@@ -57,9 +57,6 @@ type cTableInfo struct {
 	// schema changes.
 	cols []sqlbase.ColumnDescriptor
 
-	// The exec types corresponding to the table columns in cols.
-	typs []coltypes.T
-
 	// The ordered list of ColumnIDs that are required.
 	neededColsList []int
 
@@ -72,6 +69,9 @@ type cTableInfo struct {
 	// One value per column that is part of the key; each value is a column
 	// index (into cols); -1 if we don't need the value for that column.
 	indexColOrdinals []int
+	// allIndexColOrdinals is the same as indexColOrdinals but
+	// does not contain any -1's. It is meant to be used only in logging.
+	allIndexColOrdinals []int
 
 	// The set of column ordinals which are both composite and part of the index
 	// key.
@@ -179,6 +179,9 @@ type cFetcher struct {
 	// table has no interleave children.
 	mustDecodeIndexKey bool
 
+	// lockStr represents the row-level locking mode to use when fetching rows.
+	lockStr sqlbase.ScanLockingStrength
+
 	// returnRangeInfo, if set, causes the underlying kvBatchFetcher to return
 	// information about the ranges descriptors/leases uses in servicing the
 	// requests. This has some cost, so it's only enabled by DistSQL when this
@@ -241,7 +244,12 @@ type cFetcher struct {
 // non-primary index, tables.ValNeededForCol can only refer to columns in the
 // index.
 func (rf *cFetcher) Init(
-	allocator *Allocator, reverse, returnRangeInfo bool, isCheck bool, tables ...row.FetcherTableArgs,
+	allocator *Allocator,
+	reverse bool,
+	lockStr sqlbase.ScanLockingStrength,
+	returnRangeInfo bool,
+	isCheck bool,
+	tables ...row.FetcherTableArgs,
 ) error {
 	rf.adapter.allocator = allocator
 	if len(tables) == 0 {
@@ -249,6 +257,7 @@ func (rf *cFetcher) Init(
 	}
 
 	rf.reverse = reverse
+	rf.lockStr = lockStr
 	rf.returnRangeInfo = returnRangeInfo
 
 	if len(tables) > 1 {
@@ -268,13 +277,6 @@ func (rf *cFetcher) Init(
 	}
 	sort.Sort(m)
 	colDescriptors := tableArgs.Cols
-	typs := make([]coltypes.T, len(colDescriptors))
-	for i := range typs {
-		typs[i] = typeconv.FromColumnType(&colDescriptors[i].Type)
-		if typs[i] == coltypes.Unhandled {
-			return errors.Errorf("unhandled type %+v", &colDescriptors[i].Type)
-		}
-	}
 	table := cTableInfo{
 		spans:            tableArgs.Spans,
 		desc:             tableArgs.Desc,
@@ -282,14 +284,25 @@ func (rf *cFetcher) Init(
 		index:            tableArgs.Index,
 		isSecondaryIndex: tableArgs.IsSecondaryIndex,
 		cols:             colDescriptors,
-		typs:             typs,
 
 		// These slice fields might get re-allocated below, so reslice them from
 		// the old table here in case they've got enough capacity already.
 		indexColOrdinals:       oldTable.indexColOrdinals[:0],
 		extraValColOrdinals:    oldTable.extraValColOrdinals[:0],
+		allIndexColOrdinals:    oldTable.allIndexColOrdinals[:0],
 		allExtraValColOrdinals: oldTable.allExtraValColOrdinals[:0],
 	}
+
+	typs := make([]coltypes.T, len(colDescriptors))
+	for i := range typs {
+		typs[i] = typeconv.FromColumnType(&colDescriptors[i].Type)
+		if typs[i] == coltypes.Unhandled && tableArgs.ValNeededForCol.Contains(i) {
+			// Only return an error if the type is unhandled and needed. If not needed,
+			// a placeholder Vec will be created.
+			return errors.Errorf("unhandled type %+v", &colDescriptors[i].Type)
+		}
+	}
+
 	rf.machine.batch = allocator.NewMemBatch(typs)
 	rf.machine.colvecs = rf.machine.batch.ColVecs()
 
@@ -326,19 +339,23 @@ func (rf *cFetcher) Init(
 	} else {
 		table.indexColOrdinals = make([]int, nIndexCols)
 	}
+	if cap(table.allIndexColOrdinals) >= nIndexCols {
+		table.allIndexColOrdinals = table.allIndexColOrdinals[:nIndexCols]
+	} else {
+		table.allIndexColOrdinals = make([]int, nIndexCols)
+	}
 	for i, id := range indexColumnIDs {
 		colIdx, ok := tableArgs.ColIdxMap[id]
-		if ok {
+		table.allIndexColOrdinals[i] = colIdx
+		if ok && neededCols.Contains(int(id)) {
 			table.indexColOrdinals[i] = colIdx
-			if neededCols.Contains(int(id)) {
-				neededIndexCols++
-				// A composite column might also have a value encoding which must be
-				// decoded. Others can be removed from neededValueColsByIdx.
-				if compositeColumnIDs.Contains(int(id)) {
-					table.compositeIndexColOrdinals.Add(colIdx)
-				} else {
-					table.neededValueColsByIdx.Remove(colIdx)
-				}
+			neededIndexCols++
+			// A composite column might also have a value encoding which must be
+			// decoded. Others can be removed from neededValueColsByIdx.
+			if compositeColumnIDs.Contains(int(id)) {
+				table.compositeIndexColOrdinals.Add(colIdx)
+			} else {
+				table.neededValueColsByIdx.Remove(colIdx)
 			}
 		} else {
 			table.indexColOrdinals[i] = -1
@@ -346,77 +363,81 @@ func (rf *cFetcher) Init(
 				return errors.AssertionFailedf("needed column %d not in colIdxMap", id)
 			}
 		}
+	}
 
-		// - If there are interleaves, we need to read the index key in order to
-		//   determine whether this row is actually part of the index we're scanning.
-		// - If there are needed columns from the index key, we need to read it.
-		//
-		// Otherwise, we can completely avoid decoding the index key.
-		if neededIndexCols > 0 || len(table.index.InterleavedBy) > 0 || len(table.index.Interleave.Ancestors) > 0 {
-			rf.mustDecodeIndexKey = true
-		}
+	// - If there are interleaves, we need to read the index key in order to
+	//   determine whether this row is actually part of the index we're scanning.
+	// - If there are needed columns from the index key, we need to read it.
+	//
+	// Otherwise, we can completely avoid decoding the index key.
+	if neededIndexCols > 0 || len(table.index.InterleavedBy) > 0 || len(table.index.Interleave.Ancestors) > 0 {
+		rf.mustDecodeIndexKey = true
+	}
 
-		if table.isSecondaryIndex {
-			for i := range table.cols {
-				if neededCols.Contains(int(table.cols[i].ID)) && !table.index.ContainsColumnID(table.cols[i].ID) {
-					return fmt.Errorf("requested column %s not in index", table.cols[i].Name)
-				}
+	if table.isSecondaryIndex {
+		for i := range table.cols {
+			if neededCols.Contains(int(table.cols[i].ID)) && !table.index.ContainsColumnID(table.cols[i].ID) {
+				return errors.Errorf("requested column %s not in index", table.cols[i].Name)
 			}
 		}
+	}
 
-		// Prepare our index key vals slice.
-		table.keyValTypes, err = sqlbase.GetColumnTypes(table.desc.TableDesc(), indexColumnIDs)
+	// Prepare our index key vals slice.
+	table.keyValTypes, err = sqlbase.GetColumnTypes(table.desc.TableDesc(), indexColumnIDs)
+	if err != nil {
+		return err
+	}
+	if cHasExtraCols(&table) {
+		// Unique secondary indexes have a value that is the
+		// primary index key.
+		// Primary indexes only contain ascendingly-encoded
+		// values. If this ever changes, we'll probably have to
+		// figure out the directions here too.
+		table.extraTypes, err = sqlbase.GetColumnTypes(table.desc.TableDesc(), table.index.ExtraColumnIDs)
+		nExtraColumns := len(table.index.ExtraColumnIDs)
+		if cap(table.extraValColOrdinals) >= nExtraColumns {
+			table.extraValColOrdinals = table.extraValColOrdinals[:nExtraColumns]
+		} else {
+			table.extraValColOrdinals = make([]int, nExtraColumns)
+		}
+
+		if cap(table.allExtraValColOrdinals) >= nExtraColumns {
+			table.allExtraValColOrdinals = table.allExtraValColOrdinals[:nExtraColumns]
+		} else {
+			table.allExtraValColOrdinals = make([]int, nExtraColumns)
+		}
+
+		for i, id := range table.index.ExtraColumnIDs {
+			table.allExtraValColOrdinals[i] = tableArgs.ColIdxMap[id]
+			if neededCols.Contains(int(id)) {
+				table.extraValColOrdinals[i] = tableArgs.ColIdxMap[id]
+			} else {
+				table.extraValColOrdinals[i] = -1
+			}
+		}
 		if err != nil {
 			return err
 		}
-		if cHasExtraCols(&table) {
-			// Unique secondary indexes have a value that is the
-			// primary index key.
-			// Primary indexes only contain ascendingly-encoded
-			// values. If this ever changes, we'll probably have to
-			// figure out the directions here too.
-			table.extraTypes, err = sqlbase.GetColumnTypes(table.desc.TableDesc(), table.index.ExtraColumnIDs)
-			nExtraColumns := len(table.index.ExtraColumnIDs)
-			if cap(table.extraValColOrdinals) >= nExtraColumns {
-				table.extraValColOrdinals = table.extraValColOrdinals[:nExtraColumns]
-			} else {
-				table.extraValColOrdinals = make([]int, nExtraColumns)
-			}
-
-			if cap(table.allExtraValColOrdinals) >= nExtraColumns {
-				table.allExtraValColOrdinals = table.allExtraValColOrdinals[:nExtraColumns]
-			} else {
-				table.allExtraValColOrdinals = make([]int, nExtraColumns)
-			}
-
-			for i, id := range table.index.ExtraColumnIDs {
-				table.allExtraValColOrdinals[i] = tableArgs.ColIdxMap[id]
-				if neededCols.Contains(int(id)) {
-					table.extraValColOrdinals[i] = tableArgs.ColIdxMap[id]
-				} else {
-					table.extraValColOrdinals[i] = -1
-				}
-			}
-			if err != nil {
-				return err
-			}
-		}
-
-		// Keep track of the maximum keys per row to accommodate a
-		// limitHint when StartScan is invoked.
-		if keysPerRow := table.desc.KeysPerRow(table.index.ID); keysPerRow > rf.maxKeysPerRow {
-			rf.maxKeysPerRow = keysPerRow
-		}
-
-		for i := range table.desc.Families {
-			id := table.desc.Families[i].ID
-			if id > table.maxColumnFamilyID {
-				table.maxColumnFamilyID = id
-			}
-		}
-
-		rf.table = table
 	}
+
+	// Keep track of the maximum keys per row to accommodate a
+	// limitHint when StartScan is invoked.
+	keysPerRow, err := table.desc.KeysPerRow(table.index.ID)
+	if err != nil {
+		return err
+	}
+	if keysPerRow > rf.maxKeysPerRow {
+		rf.maxKeysPerRow = keysPerRow
+	}
+
+	for i := range table.desc.Families {
+		id := table.desc.Families[i].ID
+		if id > table.maxColumnFamilyID {
+			table.maxColumnFamilyID = id
+		}
+	}
+
+	rf.table = table
 
 	return nil
 }
@@ -452,7 +473,7 @@ func (rf *cFetcher) StartScan(
 	}
 
 	f, err := row.NewKVFetcher(
-		txn, spans, rf.reverse, limitBatches, firstBatchLimit, rf.returnRangeInfo,
+		txn, spans, rf.reverse, limitBatches, firstBatchLimit, rf.lockStr, rf.returnRangeInfo,
 	)
 	if err != nil {
 		return err
@@ -550,7 +571,7 @@ const debugState = false
 // NextBatch is nextBatch with the addition of memory accounting.
 func (rf *cFetcher) NextBatch(ctx context.Context) (coldata.Batch, error) {
 	rf.adapter.ctx = ctx
-	rf.adapter.allocator.performOperation(
+	rf.adapter.allocator.PerformOperation(
 		rf.machine.colvecs,
 		rf.nextAdapter,
 	)
@@ -611,22 +632,32 @@ func (rf *cFetcher) nextBatch(ctx context.Context) (coldata.Batch, error) {
 			rf.machine.state[0] = stateDecodeFirstKVOfRow
 
 		case stateResetBatch:
-			for i := range rf.machine.colvecs {
-				rf.machine.colvecs[i].Nulls().UnsetNulls()
-			}
 			rf.machine.batch.ResetInternalBatch()
 			rf.shiftState()
 		case stateDecodeFirstKVOfRow:
+			// foundNull is set when decoding a new index key for a row finds a NULL value
+			// in the index key. This is used when decoding unique secondary indexes in order
+			// to tell whether they have extra columns appended to the key.
+			var foundNull bool
 			if rf.mustDecodeIndexKey || rf.traceKV {
 				if debugState {
 					log.Infof(ctx, "Decoding first key %s", rf.machine.nextKV.Key)
 				}
-				key, matches, err := colencoding.DecodeIndexKeyToCols(
+				var (
+					key     []byte
+					matches bool
+					err     error
+				)
+				indexOrds := rf.table.indexColOrdinals
+				if rf.traceKV {
+					indexOrds = rf.table.allIndexColOrdinals
+				}
+				key, matches, foundNull, err = colencoding.DecodeIndexKeyToCols(
 					rf.machine.colvecs,
 					rf.machine.rowIdx,
 					rf.table.desc,
 					rf.table.index,
-					rf.table.indexColOrdinals,
+					indexOrds,
 					rf.table.keyValTypes,
 					rf.table.indexColumnDirs,
 					rf.machine.nextKV.Key[rf.table.knownPrefixLength:],
@@ -657,6 +688,52 @@ func (rf *cFetcher) nextBatch(ctx context.Context) (coldata.Batch, error) {
 				}
 				rf.machine.lastRowPrefix = rf.machine.nextKV.Key[:prefixLen]
 			}
+
+			// For unique secondary indexes, the index-key does not distinguish one row
+			// from the next if both rows contain identical values along with a NULL.
+			// Consider the keys:
+			//
+			//   /test/unique_idx/NULL/0
+			//   /test/unique_idx/NULL/1
+			//
+			// The index-key extracted from the above keys is /test/unique_idx/NULL. The
+			// trailing /0 and /1 are the primary key used to unique-ify the keys when a
+			// NULL is present. When a null is present in the index key, we cut off more
+			// of the index key so that the prefix includes the primary key columns.
+			//
+			// Note that we do not need to do this for non-unique secondary indexes because
+			// the extra columns in the primary key will _always_ be there, so we can decode
+			// them when processing the index. The difference with unique secondary indexes
+			// is that the extra columns are not always there, and are used to unique-ify
+			// the index key, rather than provide the primary key column values.
+			if foundNull && rf.table.isSecondaryIndex && rf.table.index.Unique && len(rf.table.desc.Families) != 1 {
+				// We get the remaining bytes after the computed prefix, and then
+				// slice off the extra encoded columns from those bytes. We calculate
+				// how many bytes were sliced away, and then extend lastRowPrefix
+				// by that amount.
+				prefixLen := len(rf.machine.lastRowPrefix)
+				remainingBytes := rf.machine.nextKV.Key[prefixLen:]
+				origRemainingBytesLen := len(remainingBytes)
+				for _, colID := range rf.table.index.ExtraColumnIDs {
+					colIdx, ok := rf.table.colIdxMap.get(colID)
+					if !ok {
+						return nil, errors.Errorf("column id %d was in index.ExtraColumnIDs but not in colIdxMap", colID)
+					}
+					var err error
+					// Slice off an extra encoded column from remainingBytes.
+					remainingBytes, err = sqlbase.SkipTableKey(
+						&rf.table.cols[colIdx].Type,
+						remainingBytes,
+						// Extra columns are always stored in ascending order.
+						sqlbase.IndexDescriptor_ASC,
+					)
+					if err != nil {
+						return nil, err
+					}
+				}
+				rf.machine.lastRowPrefix = rf.machine.nextKV.Key[:prefixLen+(origRemainingBytesLen-len(remainingBytes))]
+			}
+
 			familyID, err := rf.getCurrentColumnFamilyID()
 			if err != nil {
 				return nil, err
@@ -670,7 +747,7 @@ func (rf *cFetcher) nextBatch(ctx context.Context) (coldata.Batch, error) {
 			if rf.traceKV {
 				log.VEventf(ctx, 2, "fetched: %s -> %s", prettyKey, prettyVal)
 			}
-			if rf.table.isSecondaryIndex || len(rf.table.desc.Families) == 1 {
+			if len(rf.table.desc.Families) == 1 {
 				rf.machine.state[0] = stateFinalizeRow
 				rf.machine.state[1] = stateInitFetch
 				continue
@@ -784,8 +861,7 @@ func (rf *cFetcher) nextBatch(ctx context.Context) (coldata.Batch, error) {
 			return rf.machine.batch, nil
 
 		case stateFinished:
-			rf.machine.batch.SetLength(0)
-			return rf.machine.batch, nil
+			return coldata.ZeroBatch, nil
 		}
 	}
 }
@@ -824,7 +900,7 @@ func (rf *cFetcher) processValue(
 		buf.WriteString(rf.table.desc.Name)
 		buf.WriteByte('/')
 		buf.WriteString(rf.table.index.Name)
-		for _, idx := range rf.table.indexColOrdinals {
+		for _, idx := range rf.table.allIndexColOrdinals {
 			buf.WriteByte('/')
 			if idx != -1 {
 				buf.WriteString(rf.getDatumAt(idx, rf.machine.rowIdx, rf.table.cols[idx].Type).String())
@@ -844,7 +920,7 @@ func (rf *cFetcher) processValue(
 	}
 
 	val := rf.machine.nextKV.Value
-	if !table.isSecondaryIndex {
+	if !table.isSecondaryIndex || table.index.EncodingType == sqlbase.PrimaryIndexEncoding {
 		// If familyID is 0, kv.Value contains values for composite key columns.
 		// These columns already have a table.row value assigned above, but that value
 		// (obtained from the key encoding) might not be correct (e.g. for decimals,
@@ -884,47 +960,52 @@ func (rf *cFetcher) processValue(
 			return "", "", scrub.WrapError(scrub.IndexValueDecodingError, err)
 		}
 	} else {
-		valueBytes, err := val.GetBytes()
-		if err != nil {
-			return "", "", scrub.WrapError(scrub.IndexValueDecodingError, err)
-		}
-
-		if cHasExtraCols(table) {
-			// This is a unique secondary index; decode the extra
-			// column values from the value.
-			var err error
-			if rf.traceKV {
-				valueBytes, err = colencoding.DecodeKeyValsToCols(
-					rf.machine.colvecs,
-					rf.machine.rowIdx,
-					table.allExtraValColOrdinals,
-					table.extraTypes,
-					nil,
-					&rf.machine.remainingValueColsByIdx,
-					valueBytes,
-				)
-			} else {
-				valueBytes, err = colencoding.DecodeKeyValsToCols(
-					rf.machine.colvecs,
-					rf.machine.rowIdx,
-					table.extraValColOrdinals,
-					table.extraTypes,
-					nil,
-					&rf.machine.remainingValueColsByIdx,
-					valueBytes,
-				)
-			}
+		tag := val.GetTag()
+		var valueBytes []byte
+		switch tag {
+		case roachpb.ValueType_BYTES:
+			// If we have the ValueType_BYTES on a secondary index, then we know we
+			// are looking at column family 0. Column family 0 stores the extra primary
+			// key columns if they are present, so we decode them here.
+			valueBytes, err = val.GetBytes()
 			if err != nil {
-				return "", "", scrub.WrapError(scrub.SecondaryIndexKeyExtraValueDecodingError, err)
+				return "", "", scrub.WrapError(scrub.IndexValueDecodingError, err)
 			}
-			if rf.traceKV {
-				var buf strings.Builder
-				for j := range table.extraTypes {
-					idx := table.allExtraValColOrdinals[j]
-					buf.WriteByte('/')
-					buf.WriteString(rf.getDatumAt(idx, rf.machine.rowIdx, rf.table.cols[idx].Type).String())
+
+			if cHasExtraCols(table) {
+				// This is a unique secondary index; decode the extra
+				// column values from the value.
+				var err error
+				extraColOrds := table.extraValColOrdinals
+				if rf.traceKV {
+					extraColOrds = table.allExtraValColOrdinals
 				}
-				prettyValue = buf.String()
+				valueBytes, _, err = colencoding.DecodeKeyValsToCols(
+					rf.machine.colvecs,
+					rf.machine.rowIdx,
+					extraColOrds,
+					table.extraTypes,
+					nil,
+					&rf.machine.remainingValueColsByIdx,
+					valueBytes,
+				)
+				if err != nil {
+					return "", "", scrub.WrapError(scrub.SecondaryIndexKeyExtraValueDecodingError, err)
+				}
+				if rf.traceKV {
+					var buf strings.Builder
+					for j := range table.extraTypes {
+						idx := table.allExtraValColOrdinals[j]
+						buf.WriteByte('/')
+						buf.WriteString(rf.getDatumAt(idx, rf.machine.rowIdx, rf.table.cols[idx].Type).String())
+					}
+					prettyValue = buf.String()
+				}
+			}
+		case roachpb.ValueType_TUPLE:
+			valueBytes, err = val.GetTuple()
+			if err != nil {
+				return "", "", scrub.WrapError(scrub.IndexValueDecodingError, err)
 			}
 		}
 

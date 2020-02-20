@@ -184,7 +184,7 @@ project
       │         ├── columns: v:6(int!null)
       │         ├── outer: (1,2)
       │         ├── prune: (6)
-      │         └── inner-join (hash)
+      │         └── inner-join (cross)
       │              ├── columns: v:6(int!null) m:8(int!null)
       │              ├── outer: (1,2)
       │              ├── fd: ()-->(8)
@@ -358,6 +358,7 @@ project
  └── inner-join (lookup xysd)
       ├── columns: x:1(int!null) y:2(int) s:3(string) d:4(decimal!null) u:5(int!null)
       ├── key columns: [5] = [1]
+      ├── lookup columns are key
       ├── key: (5)
       ├── fd: (1)-->(2-4), (3,4)~~>(1,2), (1)==(5), (5)==(1)
       ├── distinct-on
@@ -419,7 +420,7 @@ semi-join-apply
  │    ├── fd: (1)-->(2-4), (3,4)~~>(1,2)
  │    ├── prune: (1-4)
  │    └── interesting orderings: (+1) (-3,+4,+1)
- ├── semi-join (hash)
+ ├── semi-join (cross)
  │    ├── columns: v:6(int!null)
  │    ├── outer: (1)
  │    ├── fd: ()-->(6)
@@ -507,7 +508,7 @@ project
  ├── fd: (1)-->(2-4), (3,4)~~>(1,2)
  ├── prune: (1-6)
  ├── interesting orderings: (+1) (-3,+4,+1)
- └── inner-join (hash)
+ └── inner-join (cross)
       ├── columns: x:1(int!null) y:2(int) s:3(string) d:4(decimal!null) u:5(int) v:6(int!null) rowid:7(int!null)
       ├── key: (1,7)
       ├── fd: (1)-->(2-4), (3,4)~~>(1,2), (7)-->(5,6)
@@ -531,7 +532,7 @@ project
 build
 SELECT * FROM xysd, xysd AS xysd
 ----
-inner-join (hash)
+inner-join (cross)
  ├── columns: x:1(int!null) y:2(int) s:3(string) d:4(decimal!null) x:5(int!null) y:6(int) s:7(string) d:8(decimal!null)
  ├── key: (1,5)
  ├── fd: (1)-->(2-4), (3,4)~~>(1,2), (5)-->(6-8), (7,8)~~>(5,6)
@@ -569,7 +570,7 @@ select
  │    └── interesting orderings: (+1) (-3,+4,+1)
  └── filters
       └── exists [type=bool, outer=(1-3), correlated-subquery]
-           └── inner-join (hash)
+           └── inner-join (cross)
                 ├── columns: x:5(int) y:6(int)
                 ├── outer: (1-3)
                 ├── cardinality: [0 - 1]
@@ -617,7 +618,7 @@ project
  ├── cardinality: [0 - 1]
  ├── key: ()
  ├── fd: ()-->(5)
- └── inner-join (hash)
+ └── inner-join (cross)
       ├── columns: count_rows:5(int!null)
       ├── cardinality: [0 - 1]
       ├── key: ()
@@ -675,7 +676,7 @@ semi-join-apply
  │    │    ├── limit hint: 5.00
  │    │    ├── scan uv
  │    │    │    ├── columns: u:5(int)
- │    │    │    ├── limit hint: 5.00
+ │    │    │    ├── limit hint: 5.05
  │    │    │    └── prune: (5)
  │    │    └── filters
  │    │         └── eq [type=bool, outer=(1,5), constraints=(/1: (/NULL - ]; /5: (/NULL - ]), fd=(1)==(5), (5)==(1)]
@@ -737,7 +738,7 @@ anti-join-apply
  │    │    ├── limit hint: 5.00
  │    │    ├── scan uv
  │    │    │    ├── columns: u:5(int)
- │    │    │    ├── limit hint: 5.00
+ │    │    │    ├── limit hint: 5.05
  │    │    │    └── prune: (5)
  │    │    └── filters
  │    │         └── eq [type=bool, outer=(1,5), constraints=(/1: (/NULL - ]; /5: (/NULL - ]), fd=(1)==(5), (5)==(1)]
@@ -750,7 +751,7 @@ anti-join-apply
 build
 SELECT * FROM (VALUES (1), (2)) INNER JOIN (SELECT * FROM uv LIMIT 2) ON True
 ----
-inner-join (hash)
+inner-join (cross)
  ├── columns: column1:1(int!null) u:2(int) v:3(int!null)
  ├── cardinality: [0 - 4]
  ├── prune: (1-3)
@@ -785,7 +786,7 @@ inner-join (hash)
 build
 SELECT * FROM (VALUES (1), (2), (3)) LEFT JOIN (SELECT * FROM uv LIMIT 2) ON True
 ----
-left-join (hash)
+left-join (cross)
  ├── columns: column1:1(int!null) u:2(int) v:3(int)
  ├── cardinality: [3 - 6]
  ├── prune: (1-3)
@@ -823,7 +824,7 @@ left-join (hash)
 build
 SELECT * FROM (SELECT * FROM uv LIMIT 2) RIGHT JOIN (VALUES (1), (2), (3)) ON True
 ----
-right-join (hash)
+right-join (cross)
  ├── columns: u:1(int) v:2(int) column1:4(int!null)
  ├── cardinality: [3 - 6]
  ├── prune: (1,2,4)
@@ -861,7 +862,7 @@ right-join (hash)
 build
 SELECT * FROM (VALUES (NULL), (NULL)) a FULL JOIN (VALUES (NULL), (NULL)) b ON True
 ----
-full-join (hash)
+full-join (cross)
  ├── columns: column1:1(unknown) column1:2(unknown)
  ├── cardinality: [2 - 4]
  ├── prune: (1,2)
@@ -885,11 +886,43 @@ full-join (hash)
  └── filters
       └── true [type=bool]
 
+# Calculate full-join cardinality when both sides have an empty key (#44029).
+build
+SELECT * FROM (VALUES (1, 2)) a(a1,a2) FULL JOIN (VALUES (3, 4)) b(b1,b2) ON a1=b1
+----
+full-join (hash)
+ ├── columns: a1:1(int) a2:2(int) b1:3(int) b2:4(int)
+ ├── cardinality: [1 - 2]
+ ├── prune: (2,4)
+ ├── reject-nulls: (1-4)
+ ├── values
+ │    ├── columns: column1:1(int!null) column2:2(int!null)
+ │    ├── cardinality: [1 - 1]
+ │    ├── key: ()
+ │    ├── fd: ()-->(1,2)
+ │    ├── prune: (1,2)
+ │    └── tuple [type=tuple{int, int}]
+ │         ├── const: 1 [type=int]
+ │         └── const: 2 [type=int]
+ ├── values
+ │    ├── columns: column1:3(int!null) column2:4(int!null)
+ │    ├── cardinality: [1 - 1]
+ │    ├── key: ()
+ │    ├── fd: ()-->(3,4)
+ │    ├── prune: (3,4)
+ │    └── tuple [type=tuple{int, int}]
+ │         ├── const: 3 [type=int]
+ │         └── const: 4 [type=int]
+ └── filters
+      └── eq [type=bool, outer=(1,3), constraints=(/1: (/NULL - ]; /3: (/NULL - ]), fd=(1)==(3), (3)==(1)]
+           ├── variable: column1 [type=int]
+           └── variable: column1 [type=int]
+
 # Calculate full-join cardinality with false filter.
 build
 SELECT * FROM (VALUES (NULL), (NULL)) a FULL JOIN (VALUES (NULL), (NULL)) b ON a.column1=b.column1
 ----
-full-join (hash)
+full-join (cross)
  ├── columns: column1:1(unknown) column1:2(unknown)
  ├── cardinality: [2 - 4]
  ├── prune: (1,2)
@@ -918,7 +951,7 @@ full-join (hash)
 build
 SELECT * FROM xysd FULL JOIN (SELECT * FROM (VALUES (1), (2))) ON True
 ----
-full-join (hash)
+full-join (cross)
  ├── columns: x:1(int) y:2(int) s:3(string) d:4(decimal) column1:5(int)
  ├── cardinality: [2 - ]
  ├── fd: (1)-->(2-4), (3,4)~~>(1,2)
@@ -946,11 +979,9 @@ full-join (hash)
 build
 SELECT * FROM (SELECT * FROM xysd LIMIT 1) FULL JOIN (SELECT * FROM xysd LIMIT 1) ON True
 ----
-full-join (hash)
+full-join (cross)
  ├── columns: x:1(int) y:2(int) s:3(string) d:4(decimal) x:5(int) y:6(int) s:7(string) d:8(decimal)
- ├── cardinality: [0 - 1]
- ├── key: ()
- ├── fd: ()-->(1-8)
+ ├── cardinality: [0 - 2]
  ├── prune: (1-8)
  ├── reject-nulls: (1-8)
  ├── interesting orderings: (+1) (-3,+4,+1) (+5) (-7,+8,+5)
@@ -991,7 +1022,7 @@ full-join (hash)
 build
 SELECT * FROM xysd LEFT JOIN (SELECT u, sum(v) FROM uv GROUP BY u) ON u IS NOT NULL
 ----
-left-join (hash)
+left-join (cross)
  ├── columns: x:1(int!null) y:2(int) s:3(string) d:4(decimal!null) u:5(int) sum:8(decimal)
  ├── key: (1,5)
  ├── fd: (1)-->(2-4), (3,4)~~>(1,2), (5)~~>(8), (1,5)-->(8)
@@ -1031,7 +1062,7 @@ left-join (hash)
 build
 SELECT * FROM xysd LEFT JOIN (SELECT u, sum(v) FROM uv WHERE u IS NOT NULL GROUP BY u) ON True
 ----
-left-join (hash)
+left-join (cross)
  ├── columns: x:1(int!null) y:2(int) s:3(string) d:4(decimal!null) u:5(int) sum:8(decimal)
  ├── key: (1,5)
  ├── fd: (1)-->(2-4), (3,4)~~>(1,2), (5)-->(8)
@@ -1079,7 +1110,7 @@ left-join (hash)
 build
 SELECT * FROM (SELECT u, sum(v) FROM uv GROUP BY u) RIGHT JOIN xysd ON u IS NOT NULL
 ----
-right-join (hash)
+right-join (cross)
  ├── columns: u:1(int) sum:4(decimal) x:5(int!null) y:6(int) s:7(string) d:8(decimal!null)
  ├── key: (1,5)
  ├── fd: (5)-->(6-8), (7,8)~~>(5,6), (1)~~>(4), (1,5)-->(4)
@@ -1119,7 +1150,7 @@ right-join (hash)
 build
 SELECT * FROM (SELECT u, sum(v) FROM uv WHERE u IS NOT NULL GROUP BY u) RIGHT JOIN xysd ON True
 ----
-right-join (hash)
+right-join (cross)
  ├── columns: u:1(int) sum:4(decimal) x:5(int!null) y:6(int) s:7(string) d:8(decimal!null)
  ├── key: (1,5)
  ├── fd: (1)-->(4), (5)-->(6-8), (7,8)~~>(5,6)
@@ -1167,7 +1198,7 @@ right-join (hash)
 build
 SELECT * FROM xysd FULL JOIN (SELECT u, sum(v) FROM uv GROUP BY u) ON u IS NOT NULL
 ----
-full-join (hash)
+full-join (cross)
  ├── columns: x:1(int) y:2(int) s:3(string) d:4(decimal) u:5(int) sum:8(decimal)
  ├── key: (1,5)
  ├── fd: (1)-->(2-4), (3,4)~~>(1,2), (5)~~>(8), (1,5)-->(8)
@@ -1207,7 +1238,7 @@ full-join (hash)
 build
 SELECT * FROM (SELECT u, sum(v) FROM uv GROUP BY u) FULL JOIN xysd ON u IS NOT NULL
 ----
-full-join (hash)
+full-join (cross)
  ├── columns: u:1(int) sum:4(decimal) x:5(int) y:6(int) s:7(string) d:8(decimal)
  ├── key: (1,5)
  ├── fd: (5)-->(6-8), (7,8)~~>(5,6), (1)~~>(4), (1,5)-->(4)
@@ -1429,3 +1460,105 @@ values
  ├── key: ()
  ├── fd: ()-->(5)
  └── prune: (5)
+
+# Regression test #43651: outer join with empty key.
+opt
+SELECT a FROM
+    (VALUES (NULL)) AS t1(a)
+  FULL JOIN
+    (VALUES ('23:59:59.999999':::TIME)) AS t2(b)
+  ON false
+----
+full-join (cross)
+ ├── columns: a:1(unknown)
+ ├── cardinality: [2 - 2]
+ ├── prune: (1)
+ ├── reject-nulls: (1)
+ ├── values
+ │    ├── columns: column1:1(unknown)
+ │    ├── cardinality: [1 - 1]
+ │    ├── key: ()
+ │    ├── fd: ()-->(1)
+ │    ├── prune: (1)
+ │    └── tuple [type=tuple{unknown}]
+ │         └── null [type=unknown]
+ ├── values
+ │    ├── cardinality: [1 - 1]
+ │    ├── key: ()
+ │    └── tuple [type=tuple]
+ └── filters
+      └── false [type=bool]
+
+exec-ddl
+CREATE TABLE t1 (x INT, y INT)
+----
+
+exec-ddl
+CREATE TABLE t2 (x INT, y INT)
+----
+
+# Outer join when both sides have a key. Because x can still have NULL values,
+# we cannot say that the outer join has a strict key. For example, this is a
+# possible valid result for this query:
+#   t1.x | t1.y | t2.x | t2.y
+#   -----+------+------+------
+#      1 |    1 |    1 |    2
+#   NULL |    1 | NULL | NULL
+#   NULL | NULL | NULL |    2
+# Here (t1.x, t2.x) is a lax key but not a strict key.
+opt
+SELECT * FROM
+  (SELECT * FROM (SELECT DISTINCT ON (x) x, y FROM t1) WHERE y IS NOT NULL) AS t1
+FULL JOIN
+  (SELECT * FROM (SELECT DISTINCT ON (x) x, y FROM t2) WHERE y IS NOT NULL) AS t2
+ON t1.x = t2.x
+----
+full-join (hash)
+ ├── columns: x:1(int) y:2(int) x:4(int) y:5(int)
+ ├── lax-key: (1,4)
+ ├── fd: (1)~~>(2), (4)~~>(5), (1,4)~~>(2,5)
+ ├── reject-nulls: (1,2,4,5)
+ ├── select
+ │    ├── columns: t1.x:1(int) t1.y:2(int!null)
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2)
+ │    ├── distinct-on
+ │    │    ├── columns: t1.x:1(int) t1.y:2(int)
+ │    │    ├── grouping columns: t1.x:1(int)
+ │    │    ├── key: (1)
+ │    │    ├── fd: (1)-->(2)
+ │    │    ├── prune: (2)
+ │    │    ├── scan t1
+ │    │    │    ├── columns: t1.x:1(int) t1.y:2(int)
+ │    │    │    └── prune: (1,2)
+ │    │    └── aggregations
+ │    │         └── first-agg [type=int, outer=(2)]
+ │    │              └── variable: t1.y [type=int]
+ │    └── filters
+ │         └── is-not [type=bool, outer=(2), constraints=(/2: (/NULL - ]; tight)]
+ │              ├── variable: t1.y [type=int]
+ │              └── null [type=unknown]
+ ├── select
+ │    ├── columns: t2.x:4(int) t2.y:5(int!null)
+ │    ├── key: (4)
+ │    ├── fd: (4)-->(5)
+ │    ├── distinct-on
+ │    │    ├── columns: t2.x:4(int) t2.y:5(int)
+ │    │    ├── grouping columns: t2.x:4(int)
+ │    │    ├── key: (4)
+ │    │    ├── fd: (4)-->(5)
+ │    │    ├── prune: (5)
+ │    │    ├── scan t2
+ │    │    │    ├── columns: t2.x:4(int) t2.y:5(int)
+ │    │    │    └── prune: (4,5)
+ │    │    └── aggregations
+ │    │         └── first-agg [type=int, outer=(5)]
+ │    │              └── variable: t2.y [type=int]
+ │    └── filters
+ │         └── is-not [type=bool, outer=(5), constraints=(/5: (/NULL - ]; tight)]
+ │              ├── variable: t2.y [type=int]
+ │              └── null [type=unknown]
+ └── filters
+      └── eq [type=bool, outer=(1,4), constraints=(/1: (/NULL - ]; /4: (/NULL - ]), fd=(1)==(4), (4)==(1)]
+           ├── variable: t1.x [type=int]
+           └── variable: t2.x [type=int]

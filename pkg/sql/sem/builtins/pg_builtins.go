@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -404,7 +405,7 @@ func getNameForArg(ctx *tree.EvalContext, arg tree.Datum, pgTable, pgCol string)
 func getTableNameForArg(ctx *tree.EvalContext, arg tree.Datum) (*tree.TableName, error) {
 	switch t := arg.(type) {
 	case *tree.DString:
-		tn, err := ctx.Planner.ParseQualifiedTableName(ctx.Ctx(), string(*t))
+		tn, err := parser.ParseQualifiedTableName(string(*t))
 		if err != nil {
 			return nil, err
 		}
@@ -569,6 +570,23 @@ var pgBuiltins = map[string]builtinDefinition{
 				return tree.DNull, nil
 			},
 			Info: notUsableInfo,
+		},
+	),
+
+	// Here getdatabaseencoding just returns UTF8 because,
+	// CockroachDB supports just UTF8 for now.
+	"getdatabaseencoding": makeBuiltin(
+		tree.FunctionProperties{Category: categorySystemInfo},
+		tree.Overload{
+			Types:      tree.ArgTypes{},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(ctx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				// We only support UTF-8 right now.
+				// If we allow more encodings, we must also change the virtual schema
+				// entry for pg_catalog.pg_database.
+				return datEncodingUTF8ShortName, nil
+			},
+			Info: "Returns the current encoding name used by the database.",
 		},
 	),
 

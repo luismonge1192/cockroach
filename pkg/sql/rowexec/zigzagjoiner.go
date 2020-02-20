@@ -12,6 +12,7 @@ package rowexec
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -20,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/scrub"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/span"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -220,7 +222,7 @@ import (
 // - Implicit columns (a)
 // - Index columns: (d, b, a)
 type zigzagJoiner struct {
-	execinfra.JoinerBase
+	joinerBase
 
 	evalCtx       *tree.EvalContext
 	cancelChecker *sqlbase.CancelChecker
@@ -258,6 +260,7 @@ const zigzagJoinerBatchSize = 5
 var _ execinfra.Processor = &zigzagJoiner{}
 var _ execinfra.RowSource = &zigzagJoiner{}
 var _ execinfrapb.MetadataSource = &zigzagJoiner{}
+var _ execinfra.OpNode = &zigzagJoiner{}
 
 const zigzagJoinerProcName = "zigzagJoiner"
 
@@ -277,7 +280,7 @@ func newZigzagJoiner(
 	rightColumnTypes := spec.Tables[1].ColumnTypes()
 	leftEqCols := make([]uint32, 0, len(spec.EqColumns[0].Columns))
 	rightEqCols := make([]uint32, 0, len(spec.EqColumns[1].Columns))
-	err := z.JoinerBase.Init(
+	err := z.joinerBase.init(
 		z, /* self */
 		flowCtx,
 		processorID,
@@ -379,6 +382,8 @@ type zigzagJoinerInfo struct {
 	// endKey marks where this side should stop fetching, taking into account the
 	// fixedValues.
 	endKey roachpb.Key
+
+	spanBuilder *span.Builder
 }
 
 // Setup the curInfo struct for the current z.side, which specifies the side
@@ -433,8 +438,10 @@ func (z *zigzagJoiner) setupInfo(
 	// Setup the RowContainers.
 	info.container.Reset()
 
+	info.spanBuilder = span.MakeBuilder(info.table, info.index)
+
 	// Setup the Fetcher.
-	_, _, err := execinfra.InitRowFetcher(
+	_, _, err := initRowFetcher(
 		&(info.fetcher),
 		info.table,
 		int(indexOrdinal),
@@ -444,6 +451,9 @@ func (z *zigzagJoiner) setupInfo(
 		false, /* check */
 		info.alloc,
 		execinfrapb.ScanVisibility_PUBLIC,
+		// NB: zigzag joins are disabled when a row-level locking clause is
+		// supplied, so there is no locking strength on *ZigzagJoinerSpec.
+		sqlbase.ScanLockingStrength_FOR_NONE,
 	)
 	if err != nil {
 		return err
@@ -611,15 +621,8 @@ func (z *zigzagJoiner) produceSpanFromBaseRow() (roachpb.Span, error) {
 		return z.produceInvertedIndexKey(info, neededDatums)
 	}
 
-	return sqlbase.MakeSpanFromEncDatums(
-		info.prefix,
-		neededDatums,
-		info.indexTypes[:len(neededDatums)],
-		info.indexDirs,
-		info.table,
-		info.index,
-		info.alloc,
-	)
+	s, _, err := info.spanBuilder.SpanFromEncDatums(neededDatums, len(neededDatums))
+	return s, err
 }
 
 // Returns the column types of the equality columns.
@@ -698,10 +701,10 @@ func (z *zigzagJoiner) emitFromContainers() (sqlbase.EncDatumRow, error) {
 		rightRow := z.infos[right].container.Peek()
 
 		// TODO(pbardea): Extend this logic to support multi-way joins.
-		if left == int(execinfra.RightSide) {
+		if left == int(rightSide) {
 			leftRow, rightRow = rightRow, leftRow
 		}
-		renderedRow, err := z.Render(leftRow, rightRow)
+		renderedRow, err := z.render(leftRow, rightRow)
 		if err != nil {
 			return nil, err
 		}
@@ -965,4 +968,14 @@ func (z *zigzagJoiner) ConsumerClosed() {
 // DrainMeta is part of the MetadataSource interface.
 func (z *zigzagJoiner) DrainMeta(_ context.Context) []execinfrapb.ProducerMetadata {
 	return z.returnedMeta
+}
+
+// ChildCount is part of the execinfra.OpNode interface.
+func (z *zigzagJoiner) ChildCount(verbose bool) int {
+	return 0
+}
+
+// Child is part of the execinfra.OpNode interface.
+func (z *zigzagJoiner) Child(nth int, verbose bool) execinfra.OpNode {
+	panic(fmt.Sprintf("invalid index %d", nth))
 }

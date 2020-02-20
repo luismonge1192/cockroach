@@ -240,8 +240,8 @@ func checkForcedErr(
 	if leaseMismatch {
 		log.VEventf(
 			ctx, 1,
-			"command proposed from replica %+v with lease #%d incompatible to %v",
-			raftCmd.ProposerReplica, raftCmd.ProposerLeaseSequence, *replicaState.Lease,
+			"command with lease #%d incompatible to %v",
+			raftCmd.ProposerLeaseSequence, *replicaState.Lease,
 		)
 		if isLeaseRequest {
 			// For lease requests we return a special error that
@@ -254,8 +254,9 @@ func checkForcedErr(
 			})
 		}
 		// We return a NotLeaseHolderError so that the DistSender retries.
-		nlhe := newNotLeaseHolderError(
-			replicaState.Lease, raftCmd.ProposerReplica.StoreID, replicaState.Desc)
+		// NB: we set proposerStoreID to 0 because we don't know who proposed the
+		// Raft command. This is ok, as this is only used for debug information.
+		nlhe := newNotLeaseHolderError(replicaState.Lease, 0 /* proposerStoreID */, replicaState.Desc)
 		nlhe.CustomMsg = fmt.Sprintf(
 			"stale proposal: command was proposed under lease #%d but is being applied "+
 				"under lease: %s", raftCmd.ProposerLeaseSequence, replicaState.Lease)
@@ -314,7 +315,7 @@ func checkForcedErr(
 	// so we must perform this check upstream and downstream of raft.
 	// See #14833.
 	ts := raftCmd.ReplicatedEvalResult.Timestamp
-	if !replicaState.GCThreshold.Less(ts) {
+	if ts.LessEq(*replicaState.GCThreshold) {
 		return leaseIndex, proposalNoReevaluation, roachpb.NewError(&roachpb.BatchTimestampBeforeGCError{
 			Timestamp: ts,
 			Threshold: *replicaState.GCThreshold,
@@ -981,11 +982,6 @@ func (sm *replicaStateMachine) ApplySideEffects(
 	if unlock := cmd.splitMergeUnlock; unlock != nil {
 		defer unlock()
 	}
-	if cmd.replicatedResult().BlockReads {
-		cmd.replicatedResult().BlockReads = false
-		sm.r.readOnlyCmdMu.Lock()
-		defer sm.r.readOnlyCmdMu.Unlock()
-	}
 
 	// Set up the local result prior to handling the ReplicatedEvalResult to
 	// give testing knobs an opportunity to inspect it. An injected corruption
@@ -1026,7 +1022,7 @@ func (sm *replicaStateMachine) ApplySideEffects(
 		sm.r.handleNoRaftLogDeltaResult(ctx)
 	}
 	if cmd.localResult != nil {
-		sm.r.handleLocalEvalResult(ctx, *cmd.localResult)
+		sm.r.handleReadWriteLocalEvalResult(ctx, *cmd.localResult)
 	}
 	if err := sm.maybeApplyConfChange(ctx, cmd); err != nil {
 		return nil, wrapWithNonDeterministicFailure(err, "unable to apply conf change")

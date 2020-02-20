@@ -126,7 +126,7 @@ func newApplyJoinNode(
 		rightProps:      rightProps,
 		rightCols:       rightCols,
 		right:           right,
-		columns:         pred.info.SourceColumns,
+		columns:         pred.cols,
 	}, nil
 }
 
@@ -244,7 +244,7 @@ func (a *applyJoinNode) Next(params runParams) (bool, error) {
 		// type of join we've been instructed to do (inner, left outer, semi, or
 		// anti).
 
-		a.optimizer.Init(params.p.EvalContext())
+		a.optimizer.Init(params.p.EvalContext(), &params.p.optPlanningCtx.catalog)
 
 		bindings := make(map[opt.ColumnID]tree.Datum, a.leftBoundColMap.Len())
 		a.leftBoundColMap.ForEach(func(k, v int) {
@@ -270,7 +270,7 @@ func (a *applyJoinNode) Next(params runParams) (bool, error) {
 				// Enhance the error with the EXPLAIN (OPT, VERBOSE) of the inner
 				// expression.
 				fmtFlags := memo.ExprFmtHideQualifications | memo.ExprFmtHideScalars | memo.ExprFmtHideTypes
-				explainOpt := memo.FormatExpr(newRightSide, fmtFlags, nil /* catalog */)
+				explainOpt := a.optimizer.FormatExpr(newRightSide, fmtFlags)
 				err = errors.WithDetailf(err, "newRightSide:\n%s", explainOpt)
 			}
 			return false, err

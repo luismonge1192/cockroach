@@ -70,7 +70,7 @@ func BenchmarkColBatchScan(b *testing.B) {
 			flowCtx := execinfra.FlowCtx{
 				EvalCtx: &evalCtx,
 				Cfg:     &execinfra.ServerConfig{Settings: s.ClusterSettings()},
-				Txn:     client.NewTxn(ctx, s.DB(), s.NodeID(), client.RootTxn),
+				Txn:     client.NewTxn(ctx, s.DB(), s.NodeID()),
 				NodeID:  s.NodeID(),
 			}
 
@@ -78,10 +78,12 @@ func BenchmarkColBatchScan(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				b.StopTimer()
-				res, err := colexec.NewColOperator(
-					ctx, &flowCtx, &spec, nil /* inputs */, testMemAcc,
-					true, /* useStreamingMemAccountForBuffering */
-				)
+				args := colexec.NewColOperatorArgs{
+					Spec:                &spec,
+					StreamingMemAccount: testMemAcc,
+				}
+				args.TestingKnobs.UseStreamingMemAccountForBuffering = true
+				res, err := colexec.NewColOperator(ctx, &flowCtx, args)
 				if err != nil {
 					b.Fatal(err)
 				}

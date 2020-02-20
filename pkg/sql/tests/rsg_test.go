@@ -34,7 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -56,7 +55,7 @@ func verifyFormat(sql string) error {
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		// Cannot serialize a statement list without parsing it.
-		return nil
+		return nil //nolint:returnerrcheck
 	}
 	formattedSQL := stmts.StringWithFlags(tree.FmtShowPasswords)
 	formattedStmts, err := parser.Parse(formattedSQL)
@@ -213,6 +212,9 @@ func TestRandomSyntaxGeneration(t *testing.T) {
 		}
 		if strings.Contains(s, "REVOKE") || strings.Contains(s, "GRANT") {
 			return errors.New("REVOKE and GRANT are unsupported")
+		}
+		if strings.Contains(s, "EXPERIMENTAL SCRUB DATABASE SYSTEM") {
+			return errors.New("See #43693")
 		}
 		// Recreate the database on every run in case it was dropped or renamed in
 		// a previous run. Should always succeed.
@@ -397,6 +399,12 @@ var ignoredErrorPatterns = []string{
 	"column reference .* not allowed in this context",
 	"cannot write directly to computed column",
 	"index .* in the middle of being added",
+	"could not mark job .* as succeeded",
+	"failed to read backup descriptor",
+	"AS OF SYSTEM TIME: cannot specify timestamp in the future",
+	"AS OF SYSTEM TIME: timestamp before 1970-01-01T00:00:00Z is invalid",
+	"BACKUP for requested time  needs option 'revision_history'",
+	"RESTORE timestamp: supplied backups do not cover requested time",
 
 	// Numeric conditions
 	"exponent out of range",
@@ -480,6 +488,8 @@ var ignoredErrorPatterns = []string{
 	"invalid IP format",
 	"invalid format code",
 	`.*val\(\): syntax error`,
+	`.*val\(\): syntax error at or near`,
+	`.*val\(\): help token in input`,
 	"invalid source encoding name",
 	"strconv.Atoi: parsing .*: invalid syntax",
 	"field position .* must be greater than zero",
@@ -496,26 +506,21 @@ var ignoredRegex = regexp.MustCompile(strings.Join(ignoredErrorPatterns, "|"))
 
 func TestRandomSyntaxSQLSmith(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer utilccl.TestingEnableEnterprise()()
 
 	var smither *sqlsmith.Smither
 
-	tableStmts := make([]string, 2)
+	tableStmts := make([]string, 0)
 	testRandomSyntax(t, true, "defaultdb", func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
-		// Create some random tables for the smither's column references and INSERT.
-		for i := 0; i < len(tableStmts); i++ {
-			create := sqlbase.RandCreateTable(r.Rnd, "table", i)
-			stmt := create.String()
-			if err := db.exec(ctx, stmt); err != nil {
+		setups := []string{"rand-tables", "seed"}
+		for _, s := range setups {
+			randTables := sqlsmith.Setups[s](r.Rnd)
+			if err := db.exec(ctx, randTables); err != nil {
 				return err
 			}
-			fmt.Printf("%s;\n", stmt)
-			tableStmts[i] = stmt
+			tableStmts = append(tableStmts, randTables)
+			fmt.Printf("%s;\n", randTables)
 		}
-		seed := sqlsmith.Setups["seed"](r.Rnd)
-		if err := db.exec(ctx, seed); err != nil {
-			return err
-		}
-		fmt.Printf("%s;\n", seed)
 		var err error
 		smither, err = sqlsmith.NewSmither(db.db, r.Rnd, sqlsmith.DisableMutations())
 		return err
@@ -542,6 +547,9 @@ func TestRandomSyntaxSQLSmith(t *testing.T) {
 		}
 		return err
 	})
+	if smither != nil {
+		smither.Close()
+	}
 
 	fmt.Printf("To reproduce, use schema:\n\n")
 	for _, stmt := range tableStmts {
@@ -596,29 +604,29 @@ func TestRandomDatumRoundtrip(t *testing.T) {
 		// looking for datums that don't match.
 		parsed1, err := parser.ParseExpr(serializedGen)
 		if err != nil {
-			return nil
+			return nil //nolint:returnerrcheck
 		}
 		typed1, err := parsed1.TypeCheck(&sema, typ)
 		if err != nil {
-			return nil
+			return nil //nolint:returnerrcheck
 		}
 		datum1, err := typed1.Eval(&eval)
 		if err != nil {
-			return nil
+			return nil //nolint:returnerrcheck
 		}
 		serialized1 := tree.Serialize(datum1)
 
 		parsed2, err := parser.ParseExpr(serialized1)
 		if err != nil {
-			return nil
+			return nil //nolint:returnerrcheck
 		}
 		typed2, err := parsed2.TypeCheck(&sema, typ)
 		if err != nil {
-			return nil
+			return nil //nolint:returnerrcheck
 		}
 		datum2, err := typed2.Eval(&eval)
 		if err != nil {
-			return nil
+			return nil //nolint:returnerrcheck
 		}
 		serialized2 := tree.Serialize(datum2)
 
@@ -708,7 +716,7 @@ func testRandomSyntax(
 		}
 	}(ctx)
 	ctx, timeoutCancel := context.WithTimeout(ctx, *flagRSGTime)
-	err = ctxgroup.GroupWorkers(ctx, *flagRSGGoRoutines, func(ctx context.Context) error {
+	err = ctxgroup.GroupWorkers(ctx, *flagRSGGoRoutines, func(ctx context.Context, _ int) error {
 		for {
 			select {
 			case <-ctx.Done():

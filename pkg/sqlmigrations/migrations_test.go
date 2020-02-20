@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sqlmigrations/leasemanager"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -63,19 +64,19 @@ type fakeLeaseManager struct {
 
 func (f *fakeLeaseManager) AcquireLease(
 	ctx context.Context, key roachpb.Key,
-) (*client.Lease, error) {
-	return &client.Lease{}, nil
+) (*leasemanager.Lease, error) {
+	return &leasemanager.Lease{}, nil
 }
 
-func (f *fakeLeaseManager) ExtendLease(ctx context.Context, l *client.Lease) error {
+func (f *fakeLeaseManager) ExtendLease(ctx context.Context, l *leasemanager.Lease) error {
 	return f.extendErr
 }
 
-func (f *fakeLeaseManager) ReleaseLease(ctx context.Context, l *client.Lease) error {
+func (f *fakeLeaseManager) ReleaseLease(ctx context.Context, l *leasemanager.Lease) error {
 	return f.releaseErr
 }
 
-func (f *fakeLeaseManager) TimeRemaining(l *client.Lease) time.Duration {
+func (f *fakeLeaseManager) TimeRemaining(l *leasemanager.Lease) time.Duration {
 	// Default to a reasonable amount of time left if the field wasn't set.
 	if f.leaseTimeRemaining == 0 {
 		return leaseRefreshInterval * 2
@@ -467,6 +468,7 @@ func (mt *migrationTest) runMigration(ctx context.Context, m migrationDescriptor
 		return nil
 	}
 	return m.workFn(ctx, runner{
+		settings:    mt.server.ClusterSettings(),
 		db:          mt.kvDB,
 		sqlExecutor: mt.server.InternalExecutor().(*sql.InternalExecutor),
 	})
@@ -499,7 +501,7 @@ func TestCreateSystemTable(t *testing.T) {
 	sqlbase.SystemAllowedPrivileges[table.ID] = sqlbase.SystemAllowedPrivileges[keys.NamespaceTableID]
 
 	table.Name = "dummy"
-	nameKey := sqlbase.NewTableKey(table.ParentID, table.Name).Key()
+	nameKey := sqlbase.NewPublicTableKey(table.ParentID, table.Name).Key()
 	descKey := sqlbase.MakeDescMetadataKey(table.ID)
 	descVal := sqlbase.WrapDescriptor(&table)
 
@@ -704,4 +706,54 @@ func TestUpdateSystemLocationData(t *testing.T) {
 	if count != len(roachpb.DefaultLocationInformation) {
 		t.Fatalf("Exected to find 0 rows in system.locations. Found  %d instead", count)
 	}
+}
+
+func TestMigrateNamespaceTableDescriptors(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+
+	mt := makeMigrationTest(ctx, t)
+	defer mt.close(ctx)
+
+	migration := mt.pop(t, "create new system.namespace table")
+	mt.start(t, base.TestServerArgs{})
+
+	// Since we're already on 20.1, mimic the beginning state by deleting the
+	// new namespace descriptor and changing the old one's name to "namespace".
+	key := sqlbase.MakeDescMetadataKey(keys.NamespaceTableID)
+	require.NoError(t, mt.kvDB.Del(ctx, key))
+
+	deprecatedKey := sqlbase.MakeDescMetadataKey(keys.DeprecatedNamespaceTableID)
+	desc := &sqlbase.Descriptor{}
+	require.NoError(t, mt.kvDB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+		ts, err := txn.GetProtoTs(ctx, deprecatedKey, desc)
+		require.NoError(t, err)
+		desc.Table(ts).Name = sqlbase.NamespaceTable.Name
+		return txn.Put(ctx, deprecatedKey, desc)
+	}))
+
+	// Run the migration.
+	require.NoError(t, mt.runMigration(ctx, migration))
+
+	require.NoError(t, mt.kvDB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+		// Check that the persisted descriptors now match our in-memory versions,
+		// ignoring create and modification times.
+		{
+			ts, err := txn.GetProtoTs(ctx, key, desc)
+			require.NoError(t, err)
+			table := desc.Table(ts)
+			table.CreateAsOfTime = sqlbase.NamespaceTable.CreateAsOfTime
+			table.ModificationTime = sqlbase.NamespaceTable.ModificationTime
+			require.True(t, table.Equal(sqlbase.NamespaceTable))
+		}
+		{
+			ts, err := txn.GetProtoTs(ctx, deprecatedKey, desc)
+			require.NoError(t, err)
+			table := desc.Table(ts)
+			table.CreateAsOfTime = sqlbase.DeprecatedNamespaceTable.CreateAsOfTime
+			table.ModificationTime = sqlbase.DeprecatedNamespaceTable.ModificationTime
+			require.True(t, table.Equal(sqlbase.DeprecatedNamespaceTable))
+		}
+		return nil
+	}))
 }

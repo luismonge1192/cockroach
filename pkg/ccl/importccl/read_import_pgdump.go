@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -239,9 +240,11 @@ func readPostgresCreateTable(
 					name,
 					seq.Options,
 					parentID,
+					keys.PublicSchemaID,
 					id,
 					hlc.Timestamp{WallTime: walltime},
 					sqlbase.NewDefaultPrivilegeDescriptor(),
+					false, /* temporary */
 					&params,
 				)
 				if err != nil {
@@ -377,7 +380,8 @@ func readPostgresCreateTable(
 
 func getTableName(tn *tree.TableName) (string, error) {
 	if sc := tn.Schema(); sc != "" && sc != "public" {
-		return "", unimplemented.Newf(
+		return "", unimplemented.NewWithIssueDetailf(
+			26443,
 			"import non-public schema",
 			"non-public schemas unsupported: %s", sc,
 		)
@@ -388,7 +392,8 @@ func getTableName(tn *tree.TableName) (string, error) {
 // getTableName variant for UnresolvedObjectName.
 func getTableName2(u *tree.UnresolvedObjectName) (string, error) {
 	if u.NumParts >= 2 && u.Parts[1] != "public" {
-		return "", unimplemented.Newf(
+		return "", unimplemented.NewWithIssueDetailf(
+			26443,
 			"import non-public schema",
 			"non-public schemas unsupported: %s", u.Parts[1],
 		)
@@ -407,6 +412,7 @@ var _ inputConverter = &pgDumpReader{}
 
 // newPgDumpReader creates a new inputConverter for pg_dump files.
 func newPgDumpReader(
+	ctx context.Context,
 	kvCh chan row.KVBatch,
 	opts roachpb.PgDumpOptions,
 	descs map[string]*execinfrapb.ReadImportDataSpec_ImportTable,
@@ -415,7 +421,7 @@ func newPgDumpReader(
 	converters := make(map[string]*row.DatumRowConverter, len(descs))
 	for name, table := range descs {
 		if table.Desc.IsTable() {
-			conv, err := row.NewDatumRowConverter(table.Desc, nil /* targetColNames */, evalCtx, kvCh)
+			conv, err := row.NewDatumRowConverter(ctx, table.Desc, nil /* targetColNames */, evalCtx, kvCh)
 			if err != nil {
 				return nil, err
 			}
@@ -457,6 +463,9 @@ func (m *pgDumpReader) readFile(
 	for _, conv := range m.tables {
 		conv.KvBatch.Source = inputIdx
 		conv.FractionFn = input.ReadFraction
+		conv.CompletedRowFn = func() int64 {
+			return count
+		}
 	}
 
 	for {
@@ -493,6 +502,9 @@ func (m *pgDumpReader) readFile(
 			startingCount := count
 			for _, tuple := range values.Rows {
 				count++
+				if count <= resumePos {
+					continue
+				}
 				if expected, got := len(conv.VisibleCols), len(tuple); expected != got {
 					return errors.Errorf("expected %d values, got %d: %v", expected, got, tuple)
 				}
@@ -552,6 +564,9 @@ func (m *pgDumpReader) readFile(
 				if !importing {
 					continue
 				}
+				if count <= resumePos {
+					continue
+				}
 				switch row := row.(type) {
 				case copyData:
 					if expected, got := len(conv.VisibleCols), len(row); expected != got {
@@ -562,7 +577,7 @@ func (m *pgDumpReader) readFile(
 						if s == nil {
 							conv.Datums[i] = tree.DNull
 						} else {
-							conv.Datums[i], err = tree.ParseDatumStringAs(conv.VisibleColTypes[i], *s, conv.EvalCtx)
+							conv.Datums[i], err = sqlbase.ParseDatumStringAs(conv.VisibleColTypes[i], *s, conv.EvalCtx)
 							if err != nil {
 								col := conv.VisibleCols[i]
 								return wrapRowErr(err, inputName, count, pgcode.Syntax,

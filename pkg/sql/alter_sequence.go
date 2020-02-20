@@ -13,9 +13,11 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 )
 
 type alterSequenceNode struct {
@@ -42,7 +44,13 @@ func (p *planner) AlterSequence(ctx context.Context, n *tree.AlterSequence) (pla
 	return &alterSequenceNode{n: n, seqDesc: seqDesc}, nil
 }
 
+// ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
+// This is because ALTER SEQUENCE performs multiple KV operations on descriptors
+// and expects to see its own writes.
+func (n *alterSequenceNode) ReadingOwnWrites() {}
+
 func (n *alterSequenceNode) startExec(params runParams) error {
+	telemetry.Inc(sqltelemetry.SchemaChangeAlter("sequence"))
 	desc := n.seqDesc
 
 	err := assignSequenceOptions(desc.SequenceOpts, n.n.Options, false /* setDefaults */, &params, desc.GetID())

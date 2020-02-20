@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/schema"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -54,13 +55,14 @@ func (p *planner) ResolveUncachedDatabaseByName(
 	ctx context.Context, dbName string, required bool,
 ) (res *UncachedDatabaseDescriptor, err error) {
 	p.runWithOptions(resolveFlags{skipCache: true}, func() {
-		res, err = p.LogicalSchemaAccessor().GetDatabaseDesc(ctx, p.txn, dbName,
-			p.CommonLookupFlags(required))
+		res, err = p.LogicalSchemaAccessor().GetDatabaseDesc(ctx, p.txn, dbName, p.CommonLookupFlags(required))
 	})
 	return res, err
 }
 
-// GetObjectNames retrieves the names of all objects in the target database/schema.
+// GetObjectNames retrieves the names of all objects in the target database/
+// schema. If explicitPrefix is set, the returned table names will have an
+// explicit schema and catalog name.
 func GetObjectNames(
 	ctx context.Context,
 	txn *client.Txn,
@@ -71,7 +73,7 @@ func GetObjectNames(
 ) (res TableNames, err error) {
 	return sc.LogicalSchemaAccessor().GetObjectNames(ctx, txn, dbDesc, scName,
 		tree.DatabaseListFlags{
-			CommonLookupFlags: sc.CommonLookupFlags(true /*required*/),
+			CommonLookupFlags: sc.CommonLookupFlags(true /* required */),
 			ExplicitPrefix:    explicitPrefix,
 		})
 }
@@ -271,7 +273,11 @@ func (p *planner) LookupSchema(
 	if err != nil || dbDesc == nil {
 		return false, nil, err
 	}
-	return sc.IsValidSchema(dbDesc, scName), dbDesc, nil
+	found, _, err = sc.IsValidSchema(ctx, p.txn, dbDesc.ID, scName)
+	if err != nil {
+		return false, nil, err
+	}
+	return found, dbDesc, nil
 }
 
 // LookupObject implements the tree.TableNameExistingResolver interface.
@@ -281,7 +287,7 @@ func (p *planner) LookupObject(
 	sc := p.LogicalSchemaAccessor()
 	p.tableName = tree.MakeTableNameWithSchema(tree.Name(dbName), tree.Name(scName), tree.Name(tbName))
 	lookupFlags.CommonLookupFlags = p.CommonLookupFlags(false /* required */)
-	objDesc, err := sc.GetObjectDesc(ctx, p.txn, &p.tableName, lookupFlags)
+	objDesc, err := sc.GetObjectDesc(ctx, p.txn, p.ExecCfg().Settings, &p.tableName, lookupFlags)
 	return objDesc != nil, objDesc, err
 }
 
@@ -358,7 +364,16 @@ func (p *planner) getQualifiedTableName(
 	if err != nil {
 		return "", err
 	}
-	tbName := tree.MakeTableName(tree.Name(dbDesc.Name), tree.Name(desc.Name))
+	schemaID := desc.GetParentSchemaID()
+	schemaName, err := schema.ResolveNameByID(ctx, p.txn, desc.ParentID, schemaID)
+	if err != nil {
+		return "", err
+	}
+	tbName := tree.MakeTableNameWithSchema(
+		tree.Name(dbDesc.Name),
+		tree.Name(schemaName),
+		tree.Name(desc.Name),
+	)
 	return tbName.String(), nil
 }
 

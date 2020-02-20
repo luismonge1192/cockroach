@@ -165,7 +165,7 @@ func (ex *connExecutor) prepare(
 	// TODO(andrei): Needing a transaction for preparing seems non-sensical, as
 	// the prepared statement outlives the txn. I hope that it's not used for
 	// anything other than getting a timestamp.
-	txn := client.NewTxn(ctx, ex.server.cfg.DB, ex.server.cfg.NodeID.Get(), client.RootTxn)
+	txn := client.NewTxn(ctx, ex.server.cfg.DB, ex.server.cfg.NodeID.Get())
 
 	ex.statsCollector.reset(&ex.server.sqlStats, ex.appStats, &ex.phaseTimes)
 	p := &ex.planner
@@ -304,8 +304,7 @@ func (ex *connExecutor) execBind(
 					"expected %d arguments, got %d", numQArgs, len(bindCmd.Args)))
 		}
 
-		ptCtx := tree.NewParseTimeContext(ex.sessionData.DurationAdditionMode,
-			ex.state.sqlTimestamp.In(ex.sessionData.DataConversion.Location))
+		ptCtx := tree.NewParseTimeContext(ex.state.sqlTimestamp.In(ex.sessionData.DataConversion.Location))
 
 		for i, arg := range bindCmd.Args {
 			k := tree.PlaceholderIdx(i)

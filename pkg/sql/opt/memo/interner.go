@@ -311,17 +311,24 @@ func (h *hasher) HashFloat64(val float64) {
 	h.hash *= prime64
 }
 
+func (h *hasher) HashRune(val rune) {
+	h.hash ^= internHash(val)
+	h.hash *= prime64
+}
+
 func (h *hasher) HashString(val string) {
 	for _, c := range val {
-		h.hash ^= internHash(c)
-		h.hash *= prime64
+		h.HashRune(c)
 	}
+}
+
+func (h *hasher) HashByte(val byte) {
+	h.HashRune(rune(val))
 }
 
 func (h *hasher) HashBytes(val []byte) {
 	for _, c := range val {
-		h.hash ^= internHash(c)
-		h.hash *= prime64
+		h.HashByte(c)
 	}
 }
 
@@ -463,7 +470,7 @@ func (h *hasher) HashSequenceID(val opt.SequenceID) {
 	h.HashUint64(uint64(val))
 }
 
-func (h *hasher) HashValuesID(val opt.ValuesID) {
+func (h *hasher) HashUniqueID(val opt.UniqueID) {
 	h.HashUint64(uint64(val))
 }
 
@@ -478,13 +485,12 @@ func (h *hasher) HashScanLimit(val ScanLimit) {
 func (h *hasher) HashScanFlags(val ScanFlags) {
 	h.HashBool(val.NoIndexJoin)
 	h.HashBool(val.ForceIndex)
+	h.HashInt(int(val.Direction))
 	h.HashUint64(uint64(val.Index))
 }
 
 func (h *hasher) HashJoinFlags(val JoinFlags) {
-	h.HashBool(val.DisallowHashJoin)
-	h.HashBool(val.DisallowMergeJoin)
-	h.HashBool(val.DisallowLookupJoin)
+	h.HashUint64(uint64(val))
 }
 
 func (h *hasher) HashExplainOptions(val tree.ExplainOptions) {
@@ -541,6 +547,13 @@ func (h *hasher) HashPhysProps(val *physical.Required) {
 	h.HashFloat64(val.LimitHint)
 }
 
+func (h *hasher) HashLockingItem(val *tree.LockingItem) {
+	if val != nil {
+		h.HashByte(byte(val.Strength))
+		h.HashByte(byte(val.WaitPolicy))
+	}
+}
+
 func (h *hasher) HashRelExpr(val RelExpr) {
 	h.HashUint64(uint64(reflect.ValueOf(val).Pointer()))
 }
@@ -590,7 +603,7 @@ func (h *hasher) HashZipExpr(val ZipExpr) {
 	for i := range val {
 		item := &val[i]
 		h.HashColList(item.Cols)
-		h.HashScalarExpr(item.Func)
+		h.HashScalarExpr(item.Fn)
 	}
 }
 
@@ -643,11 +656,20 @@ func (h *hasher) IsIntEqual(l, r int) bool {
 }
 
 func (h *hasher) IsFloat64Equal(l, r float64) bool {
+	// Compare bit representations so that NaN == NaN and 0 != -0.
 	return math.Float64bits(l) == math.Float64bits(r)
 }
 
+func (h *hasher) IsRuneEqual(l, r rune) bool {
+	return l == r
+}
+
 func (h *hasher) IsStringEqual(l, r string) bool {
-	return bytes.Equal([]byte(l), []byte(r))
+	return l == r
+}
+
+func (h *hasher) IsByteEqual(l, r byte) bool {
+	return l == r
 }
 
 func (h *hasher) IsBytesEqual(l, r []byte) bool {
@@ -792,7 +814,7 @@ func (h *hasher) IsSequenceIDEqual(l, r opt.SequenceID) bool {
 	return l == r
 }
 
-func (h *hasher) IsValuesIDEqual(l, r opt.ValuesID) bool {
+func (h *hasher) IsUniqueIDEqual(l, r opt.UniqueID) bool {
 	return l == r
 }
 
@@ -852,6 +874,13 @@ func (h *hasher) IsTupleOrdinalEqual(l, r TupleOrdinal) bool {
 
 func (h *hasher) IsPhysPropsEqual(l, r *physical.Required) bool {
 	return l.Equals(r)
+}
+
+func (h *hasher) IsLockingItemEqual(l, r *tree.LockingItem) bool {
+	if l == nil || r == nil {
+		return l == r
+	}
+	return l.Strength == r.Strength && l.WaitPolicy == r.WaitPolicy
 }
 
 func (h *hasher) IsPointerEqual(l, r unsafe.Pointer) bool {
@@ -933,7 +962,7 @@ func (h *hasher) IsZipExprEqual(l, r ZipExpr) bool {
 		return false
 	}
 	for i := range l {
-		if !l[i].Cols.Equals(r[i].Cols) || l[i].Func != r[i].Func {
+		if !l[i].Cols.Equals(r[i].Cols) || l[i].Fn != r[i].Fn {
 			return false
 		}
 	}

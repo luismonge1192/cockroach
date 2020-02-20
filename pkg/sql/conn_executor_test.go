@@ -22,19 +22,24 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/lib/pq"
+	"github.com/stretchr/testify/require"
 )
 
 func TestAnonymizeStatementsForReporting(t *testing.T) {
@@ -91,7 +96,7 @@ func TestSessionFinishRollsBackTxn(t *testing.T) {
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs.SQLExecutor = aborter.executorKnobs()
 	s, mainDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 	{
 		pgURL, cleanup := sqlutils.PGUrl(
 			t, s.ServingSQLAddr(), "TestSessionFinishRollsBackTxn", url.User(security.RootUser))
@@ -281,7 +286,7 @@ func TestErrorOnRollback(t *testing.T) {
 	const targetKeyString string = "/Table/53/1/1/0"
 	var injectedErr int64
 
-	// We're going to inject an error into our EndTransaction.
+	// We're going to inject an error into our EndTxn.
 	params := base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &storage.StoreTestingKnobs{
@@ -290,13 +295,13 @@ func TestErrorOnRollback(t *testing.T) {
 						return nil
 					}
 					req := fArgs.Req.Requests[0]
-					etReq, ok := req.GetInner().(*roachpb.EndTransactionRequest)
-					// We only inject the error once. Turns out that during the life of
-					// the test there's two EndTransactions being sent - one is the direct
-					// result of the test's call to tx.Rollback(), the second is sent by
-					// the TxnCoordSender - indirectly triggered by the fact that, on the
-					// server side, the transaction's context gets canceled at the SQL
-					// layer.
+					etReq, ok := req.GetInner().(*roachpb.EndTxnRequest)
+					// We only inject the error once. Turns out that during the
+					// life of the test there's two EndTxns being sent - one is
+					// the direct result of the test's call to tx.Rollback(),
+					// the second is sent by the TxnCoordSender - indirectly
+					// triggered by the fact that, on the server side, the
+					// transaction's context gets canceled at the SQL layer.
 					if ok &&
 						etReq.Header().Key.String() == targetKeyString &&
 						atomic.LoadInt64(&injectedErr) == 0 {
@@ -325,8 +330,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
 		t.Fatal(err)
 	}
 
-	// Perform a write so that the EndTransaction we're going to send doesn't get
-	// elided.
+	// Perform a write so that the EndTxn we're going to send doesn't get elided.
 	if _, err := tx.ExecContext(ctx, "INSERT INTO t.test(k, v) VALUES (1, 'abc')"); err != nil {
 		t.Fatal(err)
 	}
@@ -345,7 +349,76 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
 
 	if atomic.LoadInt64(&injectedErr) == 0 {
 		t.Fatal("test didn't inject the error; it must have failed to find " +
-			"the EndTransaction with the expected key")
+			"the EndTxn with the expected key")
+	}
+}
+
+func TestHalloweenProblemAvoidance(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	// Populate a sufficiently large number of rows. We want at least as
+	// many rows as an insert can batch in its output buffer (to force a
+	// buffer flush), plus as many rows as a fetcher can fetch at once
+	// (to force a read buffer update), plus some more.
+	//
+	// Instead of customizing the working set size of the test up to the
+	// default settings for the SQL package, we scale down the config
+	// of the SQL package to the test. The reason for this is that
+	// race-enable builds are very slow and the default batch sizes
+	// would cause the test duration to exceed the timeout.
+	//
+	// We are also careful to override these defaults before starting
+	// the server, so as to not risk updating them concurrently with
+	// some background SQL activity.
+	const smallerKvBatchSize = 10
+	defer row.TestingSetKVBatchSize(smallerKvBatchSize)()
+	const smallerInsertBatchSize = 5
+	defer sql.TestingSetInsertBatchSize(smallerInsertBatchSize)()
+	numRows := smallerKvBatchSize + smallerInsertBatchSize + 10
+
+	params, _ := tests.CreateTestServerParams()
+	params.Insecure = true
+	s, db, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.TODO())
+
+	if _, err := db.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test (x FLOAT);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.Exec(
+		`INSERT INTO t.test(x) SELECT generate_series(1, $1)::FLOAT`,
+		numRows); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now slightly modify the values in duplicate rows.
+	// We choose a float +0.1 to ensure that none of the derived
+	// values become duplicate of already-present values.
+	if _, err := db.Exec(`
+INSERT INTO t.test(x)
+    -- the if ensures that no row is processed two times.
+SELECT IF(x::INT::FLOAT = x,
+          x,
+          crdb_internal.force_error(
+             'NOOPE', 'insert saw its own writes: ' || x::STRING || ' (it is halloween today)')::FLOAT)
+       + 0.1
+  FROM t.test
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Finally verify that no rows has been operated on more than once.
+	row := db.QueryRow(`SELECT count(DISTINCT x) FROM t.test`)
+	var cnt int
+	if err := row.Scan(&cnt); err != nil {
+		t.Fatal(err)
+	}
+
+	if cnt != 2*numRows {
+		t.Fatalf("expected %d rows in final table, got %d", 2*numRows, cnt)
 	}
 }
 
@@ -389,4 +462,99 @@ func TestAppNameStatisticsInitialization(t *testing.T) {
 	if counts["mytest:SELECT version()"] == 0 {
 		t.Fatalf("query was not counted properly: %+v", counts)
 	}
+}
+
+func TestQueryProgress(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	const rows, kvBatchSize = 1000, 50
+
+	defer rowexec.TestingSetScannedRowProgressFrequency(rows / 60)()
+	defer row.TestingSetKVBatchSize(kvBatchSize)()
+
+	const expectedScans = (rows / 2) /* WHERE restricts scan to 1/2 */ / kvBatchSize
+	const stallAfterScans = expectedScans/2 + 1
+
+	var queryRunningAtomic, scannedBatchesAtomic int64
+	stalled, unblock := make(chan struct{}), make(chan struct{})
+
+	tableKey := roachpb.Key(keys.MakeTablePrefix(keys.MinNonPredefinedUserDescID + 1))
+	tableSpan := roachpb.Span{Key: tableKey, EndKey: tableKey.PrefixEnd()}
+
+	// Install a store filter which, if queryRunningAtomic is 1, will count scan
+	// requests issued to the test table and then, on the `stallAfterScans` one,
+	// will stall the scan and in turn the query, so the test has a chance to
+	// inspect the query progress. The filter signals the test that it has reached
+	// the stall-point by closing the `stalled` ch and then waits for the test to
+	// run its check(s) by receiving on the `unblock` channel (which the test can
+	// then close once it has checked the progress).
+	params := base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			Store: &storage.StoreTestingKnobs{
+				TestingRequestFilter: func(_ context.Context, req roachpb.BatchRequest) *roachpb.Error {
+					if req.IsSingleRequest() {
+						scan, ok := req.Requests[0].GetInner().(*roachpb.ScanRequest)
+						if ok && tableSpan.ContainsKey(scan.Key) && atomic.LoadInt64(&queryRunningAtomic) == 1 {
+							i := atomic.AddInt64(&scannedBatchesAtomic, 1)
+							if i == stallAfterScans {
+								close(stalled)
+								t.Logf("stalling on scan %d at %s and waiting for test to unblock...", i, scan.Key)
+								<-unblock
+							}
+						}
+					}
+					return nil
+				},
+			},
+		},
+	}
+	s, rawDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.TODO())
+
+	db := sqlutils.MakeSQLRunner(rawDB)
+
+	db.Exec(t, `SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false`)
+	db.Exec(t, `CREATE DATABASE t; CREATE TABLE t.test (x INT PRIMARY KEY);`)
+	db.Exec(t, `INSERT INTO t.test SELECT generate_series(1, $1)::INT`, rows)
+	db.Exec(t, `CREATE STATISTICS __auto__ FROM t.test`)
+	const query = `SELECT count(*) FROM t.test WHERE x > $1 and x % 2 = 0`
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	g := ctxgroup.WithContext(ctx)
+	g.GoCtx(func(ctx context.Context) error {
+		// Ensure that after query execution, we've actually hit and closed the
+		// stalled ch as expected.
+		defer func() {
+			select {
+			case <-stalled: //stalled was closed as expected.
+			default:
+				panic("expected stalled to have been closed during execution")
+			}
+		}()
+		atomic.StoreInt64(&queryRunningAtomic, 1)
+		_, err := rawDB.ExecContext(ctx, query, rows/2)
+		return err
+	})
+
+	t.Log("waiting for query to make progress...")
+	<-stalled
+	t.Log("query is now stalled. checking progress...")
+
+	var progress string
+	err := rawDB.QueryRow(`SELECT phase FROM [SHOW QUERIES] WHERE query LIKE 'SELECT count(*) FROM t.test%'`).Scan(&progress)
+
+	// Unblock the KV requests first, regardless of what we found in the progress.
+	close(unblock)
+	require.NoError(t, g.Wait())
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Although we know we've scanned ~50% of what we'll scan, exactly when the
+	// meta makes its way back to the receiver vs when the progress is checked is
+	// non-deterministic so we could see 47% done or 53% done, etc. To avoid being
+	// flaky, we just make sure we see one of 4x% or 5x%
+	require.Regexp(t, `executing \([45]\d\.`, progress)
 }

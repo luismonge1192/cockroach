@@ -15,8 +15,8 @@ import moment from "moment";
 import React from "react";
 import { Helmet } from "react-helmet";
 import { connect } from "react-redux";
-import { RouterState } from "react-router";
-import { bindActionCreators, Dispatch } from "redux";
+import { withRouter, RouteComponentProps } from "react-router-dom";
+
 import * as protos from "src/js/protos";
 import { refreshLiveness, refreshNodes } from "src/redux/apiReducers";
 import { nodesSummarySelector, NodesSummary } from "src/redux/nodes";
@@ -38,15 +38,15 @@ interface NodesTableRowParams {
   cellTitle?: (ns: protos.cockroach.server.status.statuspb.INodeStatus) => string;
 }
 
-type NodesProps = NodesOwnProps & RouterState;
+type NodesProps = NodesOwnProps & RouteComponentProps;
 
 const dateFormat = "Y-MM-DD HH:mm:ss";
 const detailTimeFormat = "Y/MM/DD HH:mm:ss";
 
 const loading = (
   <div className="section">
-    <h1>Node Diagnostics</h1>
-    <h2>Loading cluster status...</h2>
+    <h1 className="base-heading page-title">Node Diagnostics</h1>
+    <h2 className="base-heading">Loading cluster status...</h2>
   </div>
 );
 
@@ -247,7 +247,7 @@ const nodesTableRows: NodesTableRowParams[] = [
 /**
  * Renders the Nodes Diagnostics Report page.
  */
-class Nodes extends React.Component<NodesProps, {}> {
+export class Nodes extends React.Component<NodesProps, {}> {
   refresh(props = this.props) {
     props.refreshLiveness();
     props.refreshNodes();
@@ -334,21 +334,19 @@ class Nodes extends React.Component<NodesProps, {}> {
     if (_.isEmpty(orderedNodeIDs)) {
       return (
         <section className="section">
-          <h1>Node Diagnostics</h1>
+          <h1 className="base-heading page-title">Node Diagnostics</h1>
           <NodeFilterList nodeIDs={filters.nodeIDs} localityRegex={filters.localityRegex} />
-          <h2>No nodes match the filters</h2>
+          <h2 className="base-heading">No nodes match the filters</h2>
         </section>
       );
     }
 
     return (
       <section className="section">
-        <Helmet>
-          <title>Node Diagnostics | Debug</title>
-        </Helmet>
-        <h1>Node Diagnostics</h1>
+        <Helmet title="Node Diagnostics | Debug" />
+        <h1 className="base-heading page-title">Node Diagnostics</h1>
         <NodeFilterList nodeIDs={filters.nodeIDs} localityRegex={filters.localityRegex} />
-        <h2>Nodes</h2>
+        <h2 className="base-heading">Nodes</h2>
         <table className="nodes-table">
           <tbody>
             {
@@ -374,13 +372,9 @@ const mapStateToProps = (state: AdminUIState) => ({
   nodesSummary: nodesSummarySelector(state),
 });
 
-const mapDispatchToProps = (dispatch: Dispatch<AdminUIState>) =>
-  bindActionCreators(
-    {
-      refreshNodes,
-      refreshLiveness,
-    },
-    dispatch,
-  );
+const mapDispatchToProps = {
+  refreshNodes,
+  refreshLiveness,
+};
 
-export default connect(mapStateToProps, mapDispatchToProps)(Nodes);
+export default withRouter(connect(mapStateToProps, mapDispatchToProps)(Nodes));

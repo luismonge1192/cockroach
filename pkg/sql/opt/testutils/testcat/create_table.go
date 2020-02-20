@@ -14,7 +14,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -81,7 +81,7 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 		for _, def := range stmt.Defs {
 			switch def := def.(type) {
 			case *tree.ColumnTableDef:
-				if def.PrimaryKey {
+				if def.PrimaryKey.IsPrimaryKey {
 					hasPrimaryIndex = true
 				}
 
@@ -119,7 +119,7 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 		for _, def := range stmt.Defs {
 			switch def := def.(type) {
 			case *tree.ColumnTableDef:
-				if def.PrimaryKey {
+				if def.PrimaryKey.IsPrimaryKey {
 					// Add the primary index over the single column.
 					tab.addPrimaryColumnIndex(string(def.Name))
 				}
@@ -348,7 +348,7 @@ func (tc *Catalog) resolveFK(tab *Table, d *tree.ForeignKeyConstraintTableDef) {
 }
 
 func (tt *Table) addColumn(def *tree.ColumnTableDef) {
-	nullable := !def.PrimaryKey && def.Nullable.Nullability != tree.NotNull
+	nullable := !def.PrimaryKey.IsPrimaryKey && def.Nullable.Nullability != tree.NotNull
 	col := &Column{
 		Ordinal:  tt.ColumnCount(),
 		Name:     string(def.Name),
@@ -384,7 +384,7 @@ func (tt *Table) addIndex(def *tree.IndexTableDef, typ indexType) *Index {
 		IdxName:     tt.makeIndexName(def.Name, typ),
 		Unique:      typ != nonUniqueIndex,
 		Inverted:    def.Inverted,
-		IdxZone:     &config.ZoneConfig{},
+		IdxZone:     &zonepb.ZoneConfig{},
 		table:       tt,
 		partitionBy: def.PartitionBy,
 	}

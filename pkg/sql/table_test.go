@@ -15,11 +15,32 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/stretchr/testify/assert"
 )
+
+func TestIsSupportedSchemaName(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	testCases := []struct {
+		name  string
+		valid bool
+	}{
+		{"db_name", false},
+		{"public", true},
+		{"pg_temp", true},
+		{"pg_temp_1234_1", true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.valid, isSupportedSchemaName(tree.Name(tc.name)))
+		})
+	}
+}
 
 func TestMakeTableDescColumns(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -200,6 +221,7 @@ func TestMakeTableDescIndexes(t *testing.T) {
 				ColumnNames:      []string{"a"},
 				ColumnIDs:        []sqlbase.ColumnID{1},
 				ColumnDirections: []sqlbase.IndexDescriptor_Direction{sqlbase.IndexDescriptor_ASC},
+				Version:          sqlbase.SecondaryIndexFamilyFormatVersion,
 			},
 			[]sqlbase.IndexDescriptor{},
 		},
@@ -212,6 +234,7 @@ func TestMakeTableDescIndexes(t *testing.T) {
 				ColumnNames:      []string{"b"},
 				ColumnIDs:        []sqlbase.ColumnID{2},
 				ColumnDirections: []sqlbase.IndexDescriptor_Direction{sqlbase.IndexDescriptor_ASC},
+				Version:          sqlbase.SecondaryIndexFamilyFormatVersion,
 			},
 			[]sqlbase.IndexDescriptor{
 				{
@@ -222,6 +245,7 @@ func TestMakeTableDescIndexes(t *testing.T) {
 					ColumnIDs:        []sqlbase.ColumnID{1},
 					ExtraColumnIDs:   []sqlbase.ColumnID{2},
 					ColumnDirections: []sqlbase.IndexDescriptor_Direction{sqlbase.IndexDescriptor_ASC},
+					Version:          sqlbase.SecondaryIndexFamilyFormatVersion,
 				},
 			},
 		},
@@ -234,6 +258,7 @@ func TestMakeTableDescIndexes(t *testing.T) {
 				ColumnNames:      []string{"a", "b"},
 				ColumnIDs:        []sqlbase.ColumnID{1, 2},
 				ColumnDirections: []sqlbase.IndexDescriptor_Direction{sqlbase.IndexDescriptor_ASC, sqlbase.IndexDescriptor_ASC},
+				Version:          sqlbase.SecondaryIndexFamilyFormatVersion,
 			},
 			[]sqlbase.IndexDescriptor{},
 		},
@@ -246,6 +271,7 @@ func TestMakeTableDescIndexes(t *testing.T) {
 				ColumnNames:      []string{"a", "b"},
 				ColumnIDs:        []sqlbase.ColumnID{1, 2},
 				ColumnDirections: []sqlbase.IndexDescriptor_Direction{sqlbase.IndexDescriptor_ASC, sqlbase.IndexDescriptor_ASC},
+				Version:          sqlbase.SecondaryIndexFamilyFormatVersion,
 			},
 			[]sqlbase.IndexDescriptor{
 				{
@@ -256,6 +282,7 @@ func TestMakeTableDescIndexes(t *testing.T) {
 					ColumnIDs:        []sqlbase.ColumnID{2},
 					ExtraColumnIDs:   []sqlbase.ColumnID{1},
 					ColumnDirections: []sqlbase.IndexDescriptor_Direction{sqlbase.IndexDescriptor_ASC},
+					Version:          sqlbase.SecondaryIndexFamilyFormatVersion,
 				},
 			},
 		},
@@ -268,6 +295,7 @@ func TestMakeTableDescIndexes(t *testing.T) {
 				ColumnNames:      []string{"a", "b"},
 				ColumnIDs:        []sqlbase.ColumnID{1, 2},
 				ColumnDirections: []sqlbase.IndexDescriptor_Direction{sqlbase.IndexDescriptor_ASC, sqlbase.IndexDescriptor_ASC},
+				Version:          sqlbase.SecondaryIndexFamilyFormatVersion,
 			},
 			[]sqlbase.IndexDescriptor{},
 		},

@@ -3,13 +3,17 @@
 statement ok
 SET experimental_optimizer_foreign_keys = true
 
+# We will test the fast path later.
+statement ok
+SET enable_insert_fast_path = false
+
 # -- Tests with INSERT --
 
 statement ok
-CREATE TABLE parent (p INT PRIMARY KEY, other INT UNIQUE)
+CREATE TABLE parent (p INT PRIMARY KEY, other INT UNIQUE, FAMILY (p, other))
 
 statement ok
-CREATE TABLE child (c INT PRIMARY KEY, p INT NOT NULL REFERENCES parent(p))
+CREATE TABLE child (c INT PRIMARY KEY, p INT NOT NULL REFERENCES parent(p), FAMILY (c, p))
 
 query TTT
 EXPLAIN INSERT INTO child VALUES (1,1), (2,2)
@@ -400,6 +404,7 @@ root                                                      ·                   �
  │              └── hash-join                             ·                   ·
  │                   │                                    type                inner
  │                   │                                    equality            (p) = (p)
+ │                   │                                    left cols are key   ·
  │                   │                                    right cols are key  ·
  │                   ├── render                           ·                   ·
  │                   │    └── union                       ·                   ·
@@ -421,6 +426,7 @@ root                                                      ·                   �
                 └── hash-join                             ·                   ·
                      │                                    type                inner
                      │                                    equality            (p) = (p)
+                     │                                    left cols are key   ·
                      │                                    right cols are key  ·
                      ├── render                           ·                   ·
                      │    └── union                       ·                   ·
@@ -509,6 +515,7 @@ root                                                      ·                   �
                 └── hash-join                             ·                   ·
                      │                                    type                inner
                      │                                    equality            (c) = (c)
+                     │                                    left cols are key   ·
                      │                                    right cols are key  ·
                      ├── render                           ·                   ·
                      │    └── union                       ·                   ·
@@ -621,6 +628,7 @@ root                                                      ·                   �
                 └── hash-join                             ·                   ·
                      │                                    type                inner
                      │                                    equality            (c) = (c)
+                     │                                    left cols are key   ·
                      │                                    right cols are key  ·
                      ├── render                           ·                   ·
                      │    └── union                       ·                   ·
@@ -727,6 +735,7 @@ root                                                      ·                   �
                 └── hash-join                             ·                   ·
                      │                                    type                inner
                      │                                    equality            (x) = (y)
+                     │                                    left cols are key   ·
                      │                                    right cols are key  ·
                      ├── render                           ·                   ·
                      │    └── union                       ·                   ·
@@ -742,3 +751,101 @@ root                                                      ·                   �
                           └── scan                        ·                   ·
 ·                                                         table               self@self_auto_index_fk_y_ref_self
 ·                                                         spans               ALL
+
+# Tests for the insert fast path.
+statement ok
+SET enable_insert_fast_path = true
+
+# Simple insert with VALUES should use the fast path.
+query TTTTT
+EXPLAIN (VERBOSE) INSERT INTO child VALUES (1,1), (2,2)
+----
+·                      distributed    false              ·   ·
+·                      vectorized     false              ·   ·
+count                  ·              ·                  ()  ·
+ └── insert-fast-path  ·              ·                  ()  ·
+·                      into           child(c, p)        ·   ·
+·                      strategy       inserter           ·   ·
+·                      auto commit    ·                  ·   ·
+·                      FK check       parent@primary     ·   ·
+·                      size           2 columns, 2 rows  ·   ·
+·                      row 0, expr 0  1                  ·   ·
+·                      row 0, expr 1  1                  ·   ·
+·                      row 1, expr 0  2                  ·   ·
+·                      row 1, expr 1  2                  ·   ·
+
+# We shouldn't use the fast path if the VALUES columns are not in order.
+query B 
+SELECT count(*) > 0 FROM [
+  EXPLAIN INSERT INTO child (SELECT b, a FROM (VALUES (1,2)) AS v(a,b))
+] WHERE tree LIKE '%insert-fast-path'
+----
+false
+
+# Multiple mutations shouldn't use the fast-path.
+query B
+SELECT count(*) > 0 FROM [
+  EXPLAIN WITH cte AS (INSERT INTO child VALUES (1, 1) RETURNING p)
+  INSERT INTO parent VALUES (2, 3)
+] WHERE tree LIKE '%insert-fast-path'
+----
+false
+
+# Self-referencing FKs should not use the fast-path.
+query B
+SELECT count(*) > 0 FROM [
+  EXPLAIN INSERT INTO self VALUES (1, 1)
+] WHERE tree LIKE '%insert-fast-path'
+----
+false
+
+# We should not use the fast path If the best FK check plan is not a lookup
+# join. We do this by adding statistics that make a hash join more desirable.
+statement ok
+ALTER TABLE parent INJECT STATISTICS '[
+  {
+    "columns": ["p"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 1,
+    "distinct_count": 1
+  }
+]'
+
+query B
+SELECT count(*) > 0 FROM [
+  EXPLAIN (VERBOSE) INSERT INTO child VALUES (1,1), (2,2), (3,3), (4,4)
+] WHERE tree LIKE '%insert-fast-path'
+----
+false
+
+# Test FK check that is using a non-unique index (#43969). In this case the
+# index on k2 is preferred because it doesn't contain unnecessary column v.
+statement ok
+CREATE TABLE nonunique_idx_parent (
+  k1 INT,
+  k2 INT,
+  v INT,
+  CONSTRAINT "primary" PRIMARY KEY (k1, k2),
+  INDEX (k2)
+)
+
+statement ok
+CREATE TABLE nonunique_idx_child (
+  k INT PRIMARY KEY,
+  ref1 INT,
+  ref2 INT,
+  CONSTRAINT "fk" FOREIGN KEY (ref1, ref2) REFERENCES nonunique_idx_parent (k1, k2)
+)
+
+query TTT
+EXPLAIN INSERT INTO nonunique_idx_child VALUES (0, 1, 10)
+----
+·                      distributed  false
+·                      vectorized   false
+count                  ·            ·
+ └── insert-fast-path  ·            ·
+·                      into         nonunique_idx_child(k, ref1, ref2)
+·                      strategy     inserter
+·                      auto commit  ·
+·                      FK check     nonunique_idx_parent@nonunique_idx_parent_k2_idx
+·                      size         3 columns, 1 row

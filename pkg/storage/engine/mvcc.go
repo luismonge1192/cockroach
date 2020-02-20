@@ -619,14 +619,14 @@ func updateStatsOnGC(
 // See the documentation for MVCCGet for the semantics of the MVCCGetOptions.
 func MVCCGetProto(
 	ctx context.Context,
-	engine Reader,
+	reader Reader,
 	key roachpb.Key,
 	timestamp hlc.Timestamp,
 	msg protoutil.Message,
 	opts MVCCGetOptions,
 ) (bool, error) {
 	// TODO(tschottdorf): Consider returning skipped intents to the caller.
-	value, _, mvccGetErr := MVCCGet(ctx, engine, key, timestamp, opts)
+	value, _, mvccGetErr := MVCCGet(ctx, reader, key, timestamp, opts)
 	found := value != nil
 	// If we found a result, parse it regardless of the error returned by MVCCGet.
 	if found && msg != nil {
@@ -644,7 +644,7 @@ func MVCCGetProto(
 // string of msg and the provided timestamp.
 func MVCCPutProto(
 	ctx context.Context,
-	engine ReadWriter,
+	rw ReadWriter,
 	ms *enginepb.MVCCStats,
 	key roachpb.Key,
 	timestamp hlc.Timestamp,
@@ -656,7 +656,7 @@ func MVCCPutProto(
 		return err
 	}
 	value.InitChecksum(key)
-	return MVCCPut(ctx, engine, ms, key, timestamp, value, txn)
+	return MVCCPut(ctx, rw, ms, key, timestamp, value, txn)
 }
 
 // MVCCBlindPutProto sets the given key to the protobuf-serialized byte string
@@ -664,7 +664,7 @@ func MVCCPutProto(
 // fast-path and when it is appropriate to use.
 func MVCCBlindPutProto(
 	ctx context.Context,
-	engine Writer,
+	writer Writer,
 	ms *enginepb.MVCCStats,
 	key roachpb.Key,
 	timestamp hlc.Timestamp,
@@ -676,7 +676,7 @@ func MVCCBlindPutProto(
 		return err
 	}
 	value.InitChecksum(key)
-	return MVCCBlindPut(ctx, engine, ms, key, timestamp, value, txn)
+	return MVCCBlindPut(ctx, writer, ms, key, timestamp, value, txn)
 }
 
 type getBuffer struct {
@@ -707,9 +707,20 @@ func (b *getBuffer) release() {
 // MVCCGetOptions bundles options for the MVCCGet family of functions.
 type MVCCGetOptions struct {
 	// See the documentation for MVCCGet for information on these parameters.
-	Inconsistent bool
-	Tombstones   bool
-	Txn          *roachpb.Transaction
+	Inconsistent     bool
+	Tombstones       bool
+	FailOnMoreRecent bool
+	Txn              *roachpb.Transaction
+}
+
+func (opts *MVCCGetOptions) validate() error {
+	if opts.Inconsistent && opts.Txn != nil {
+		return errors.Errorf("cannot allow inconsistent reads within a transaction")
+	}
+	if opts.Inconsistent && opts.FailOnMoreRecent {
+		return errors.Errorf("cannot allow inconsistent reads with fail on more recent option")
+	}
+	return nil
 }
 
 // MVCCGet returns the most recent value for the specified key whose timestamp
@@ -727,10 +738,16 @@ type MVCCGetOptions struct {
 //
 // Note that transactional gets must be consistent. Put another way, only
 // non-transactional gets may be inconsistent.
+//
+// When reading in "fail on more recent" mode, a WriteTooOldError will be
+// returned if the read observes a version with a timestamp above the read
+// timestamp. Similarly, a WriteIntentError will be returned if the read
+// observes another transaction's intent, even if it has a timestamp above
+// the read timestamp.
 func MVCCGet(
-	ctx context.Context, eng Reader, key roachpb.Key, timestamp hlc.Timestamp, opts MVCCGetOptions,
+	ctx context.Context, reader Reader, key roachpb.Key, timestamp hlc.Timestamp, opts MVCCGetOptions,
 ) (*roachpb.Value, *roachpb.Intent, error) {
-	iter := eng.NewIterator(IterOptions{Prefix: true})
+	iter := reader.NewIterator(IterOptions{Prefix: true})
 	defer iter.Close()
 	return mvccGet(ctx, iter, key, timestamp, opts)
 }
@@ -738,14 +755,14 @@ func MVCCGet(
 func mvccGet(
 	ctx context.Context, iter Iterator, key roachpb.Key, timestamp hlc.Timestamp, opts MVCCGetOptions,
 ) (value *roachpb.Value, intent *roachpb.Intent, err error) {
+	if len(key) == 0 {
+		return nil, nil, emptyKeyError()
+	}
 	if timestamp.WallTime < 0 {
 		return nil, nil, errors.Errorf("cannot write to %q at timestamp %s", key, timestamp)
 	}
-	if opts.Inconsistent && opts.Txn != nil {
-		return nil, nil, errors.Errorf("cannot allow inconsistent reads within a transaction")
-	}
-	if len(key) == 0 {
-		return nil, nil, emptyKeyError()
+	if err := opts.validate(); err != nil {
+		return nil, nil, err
 	}
 
 	// If the iterator has a specialized implementation, defer to that.
@@ -760,12 +777,13 @@ func mvccGet(
 	// specify an empty key for the end key which will ensure we don't retrieve a
 	// key different than the start key. This is a bit of a hack.
 	*mvccScanner = pebbleMVCCScanner{
-		parent:       iter,
-		start:        key,
-		ts:           timestamp,
-		maxKeys:      1,
-		inconsistent: opts.Inconsistent,
-		tombstones:   opts.Tombstones,
+		parent:           iter,
+		start:            key,
+		ts:               timestamp,
+		maxKeys:          1,
+		inconsistent:     opts.Inconsistent,
+		tombstones:       opts.Tombstones,
+		failOnMoreRecent: opts.FailOnMoreRecent,
 	}
 
 	mvccScanner.init(opts.Txn)
@@ -812,12 +830,12 @@ func mvccGet(
 // The read is carried out without the chance of uncertainty restarts.
 func MVCCGetAsTxn(
 	ctx context.Context,
-	engine Reader,
+	reader Reader,
 	key roachpb.Key,
 	timestamp hlc.Timestamp,
 	txnMeta enginepb.TxnMeta,
 ) (*roachpb.Value, *roachpb.Intent, error) {
-	return MVCCGet(ctx, engine, key, timestamp, MVCCGetOptions{
+	return MVCCGet(ctx, reader, key, timestamp, MVCCGetOptions{
 		Txn: &roachpb.Transaction{
 			TxnMeta:       txnMeta,
 			Status:        roachpb.PENDING,
@@ -930,16 +948,13 @@ func mvccGetInternal(
 	}
 	var ignoredIntent *roachpb.Intent
 	metaTimestamp := hlc.Timestamp(meta.Timestamp)
-	if !consistent && meta.Txn != nil && !timestamp.Less(metaTimestamp) {
+	if !consistent && meta.Txn != nil && metaTimestamp.LessEq(timestamp) {
 		// If we're doing inconsistent reads and there's an intent, we
 		// ignore the intent by insisting that the timestamp we're reading
 		// at is a historical timestamp < the intent timestamp. However, we
 		// return the intent separately; the caller may want to resolve it.
-		ignoredIntent = &roachpb.Intent{
-			Span:   roachpb.Span{Key: metaKey.Key},
-			Status: roachpb.PENDING,
-			Txn:    *meta.Txn,
-		}
+		intent := roachpb.MakePendingIntent(meta.Txn, roachpb.Span{Key: metaKey.Key})
+		ignoredIntent = &intent
 		timestamp = metaTimestamp.Prev()
 	}
 
@@ -955,18 +970,18 @@ func mvccGetInternal(
 		if checkUncertainty {
 			maxVisibleTimestamp = txn.MaxTimestamp
 		}
-		if !maxVisibleTimestamp.Less(metaTimestamp) {
+		if metaTimestamp.LessEq(maxVisibleTimestamp) {
 			return nil, nil, safeValue, &roachpb.WriteIntentError{
-				Intents: []roachpb.Intent{{
-					Span: roachpb.Span{Key: metaKey.Key}, Status: roachpb.PENDING, Txn: *meta.Txn,
-				}},
+				Intents: []roachpb.Intent{
+					roachpb.MakePendingIntent(meta.Txn, roachpb.Span{Key: metaKey.Key}),
+				},
 			}
 		}
 	}
 
 	seekKey := metaKey
 	checkValueTimestamp := false
-	if !timestamp.Less(metaTimestamp) || ownIntent {
+	if metaTimestamp.LessEq(timestamp) || ownIntent {
 		// We are reading the latest value, which is either an intent written
 		// by this transaction or not an intent at all (so there's no
 		// conflict). Note that when reading the own intent, the timestamp
@@ -999,7 +1014,7 @@ func mvccGetInternal(
 		// "old" value in a transactional context at time (timestamp, MaxTimestamp]
 		// occurs, leading to a clock uncertainty error if a version exists in
 		// that time interval.
-		if !txn.MaxTimestamp.Less(metaTimestamp) {
+		if metaTimestamp.LessEq(txn.MaxTimestamp) {
 			// Second case: Our read timestamp is behind the latest write, but the
 			// latest write could possibly have happened before our read in
 			// absolute time if the writer had a fast clock.
@@ -1110,13 +1125,13 @@ func (b *putBuffer) marshalMeta(meta *enginepb.MVCCMetadata) (_ []byte, err erro
 }
 
 func (b *putBuffer) putMeta(
-	engine Writer, key MVCCKey, meta *enginepb.MVCCMetadata,
+	writer Writer, key MVCCKey, meta *enginepb.MVCCMetadata,
 ) (keyBytes, valBytes int64, err error) {
 	bytes, err := b.marshalMeta(meta)
 	if err != nil {
 		return 0, 0, err
 	}
-	if err := engine.Put(key, bytes); err != nil {
+	if err := writer.Put(key, bytes); err != nil {
 		return 0, 0, err
 	}
 	return int64(key.EncodedSize()), int64(len(bytes)), nil
@@ -1140,7 +1155,7 @@ func (b *putBuffer) putMeta(
 // the value. In addition, zero timestamp values may be merged.
 func MVCCPut(
 	ctx context.Context,
-	eng ReadWriter,
+	rw ReadWriter,
 	ms *enginepb.MVCCStats,
 	key roachpb.Key,
 	timestamp hlc.Timestamp,
@@ -1152,10 +1167,10 @@ func MVCCPut(
 	var iter Iterator
 	blind := ms == nil && timestamp == (hlc.Timestamp{})
 	if !blind {
-		iter = eng.NewIterator(IterOptions{Prefix: true})
+		iter = rw.NewIterator(IterOptions{Prefix: true})
 		defer iter.Close()
 	}
-	return mvccPutUsingIter(ctx, eng, iter, ms, key, timestamp, value, txn, nil /* valueFn */)
+	return mvccPutUsingIter(ctx, rw, iter, ms, key, timestamp, value, txn, nil /* valueFn */)
 }
 
 // MVCCBlindPut is a fast-path of MVCCPut. See the MVCCPut comments for details
@@ -1170,14 +1185,14 @@ func MVCCPut(
 // confusing and redundant. See the comment on mvccPutInternal for details.
 func MVCCBlindPut(
 	ctx context.Context,
-	engine Writer,
+	writer Writer,
 	ms *enginepb.MVCCStats,
 	key roachpb.Key,
 	timestamp hlc.Timestamp,
 	value roachpb.Value,
 	txn *roachpb.Transaction,
 ) error {
-	return mvccPutUsingIter(ctx, engine, nil, ms, key, timestamp, value, txn, nil /* valueFn */)
+	return mvccPutUsingIter(ctx, writer, nil, ms, key, timestamp, value, txn, nil /* valueFn */)
 }
 
 // MVCCDelete marks the key deleted so that it will not be returned in
@@ -1188,16 +1203,16 @@ func MVCCBlindPut(
 // confusing and redundant. See the comment on mvccPutInternal for details.
 func MVCCDelete(
 	ctx context.Context,
-	engine ReadWriter,
+	rw ReadWriter,
 	ms *enginepb.MVCCStats,
 	key roachpb.Key,
 	timestamp hlc.Timestamp,
 	txn *roachpb.Transaction,
 ) error {
-	iter := engine.NewIterator(IterOptions{Prefix: true})
+	iter := rw.NewIterator(IterOptions{Prefix: true})
 	defer iter.Close()
 
-	return mvccPutUsingIter(ctx, engine, iter, ms, key, timestamp, noValue, txn, nil /* valueFn */)
+	return mvccPutUsingIter(ctx, rw, iter, ms, key, timestamp, noValue, txn, nil /* valueFn */)
 }
 
 var noValue = roachpb.Value{}
@@ -1208,7 +1223,7 @@ var noValue = roachpb.Value{}
 // for the key, else the bytes provided by the valueFn will be used.
 func mvccPutUsingIter(
 	ctx context.Context,
-	engine Writer,
+	writer Writer,
 	iter Iterator,
 	ms *enginepb.MVCCStats,
 	key roachpb.Key,
@@ -1227,7 +1242,7 @@ func mvccPutUsingIter(
 
 	buf := newPutBuffer()
 
-	err := mvccPutInternal(ctx, engine, iter, ms, key, timestamp, rawBytes,
+	err := mvccPutInternal(ctx, writer, iter, ms, key, timestamp, rawBytes,
 		txn, buf, valueFn)
 
 	// Using defer would be more convenient, but it is measurably slower.
@@ -1283,7 +1298,7 @@ func maybeGetValue(
 // transactional idempotency.
 func replayTransactionalWrite(
 	ctx context.Context,
-	engine Writer,
+	writer Writer,
 	iter Iterator,
 	meta *enginepb.MVCCMetadata,
 	ms *enginepb.MVCCStats,
@@ -1323,35 +1338,38 @@ func replayTransactionalWrite(
 
 	// If the valueFn is specified, we must apply it to the would-be value at the key.
 	if valueFn != nil {
-		prevSeq, prevValueWritten := meta.GetPrevIntentSeq(txn.Sequence)
+		var exVal *roachpb.Value
+
+		// If there's an intent history, use that.
+		prevIntent, prevValueWritten := meta.GetPrevIntentSeq(txn.Sequence, txn.IgnoredSeqNums)
 		if prevValueWritten {
 			// If the previous value was found in the IntentHistory,
 			// simply apply the value function to the historic value
 			// to get the would-be value.
-			prevVal, _ := meta.GetIntentValue(prevSeq)
-			value, err = valueFn(&roachpb.Value{RawBytes: prevVal})
-			if err != nil {
-				return err
-			}
-		} else {
-			// If the previous value at the key wasn't written by this transaction,
-			// we must apply the value function to the last committed value on the key.
+			prevVal := prevIntent.Value
+
+			exVal = &roachpb.Value{RawBytes: prevVal}
+		}
+		if exVal == nil {
+			// If the previous value at the key wasn't written by this
+			// transaction, or it was hidden by a rolled back seqnum, we
+			// look at last committed value on the key.
 			getBuf := newGetBuffer()
 			defer getBuf.release()
 			getBuf.meta = buf.meta
-			var exVal *roachpb.Value
-			var err error
 
 			// Since we want the last committed value on the key, we must make
 			// an inconsistent read so we ignore our previous intents here.
-			if exVal, _, _, err = mvccGetInternal(
-				ctx, iter, metaKey, timestamp, false /* consistent */, unsafeValue, nil /* txn */, getBuf); err != nil {
-				return err
-			}
-			value, err = valueFn(exVal)
+			exVal, _, _, err = mvccGetInternal(
+				ctx, iter, metaKey, timestamp, false /* consistent */, unsafeValue, nil /* txn */, getBuf)
 			if err != nil {
 				return err
 			}
+		}
+
+		value, err = valueFn(exVal)
+		if err != nil {
+			return err
 		}
 	}
 
@@ -1391,7 +1409,7 @@ func replayTransactionalWrite(
 // hlc.Timestamp{} is already used as a sentinel for inline puts.)
 func mvccPutInternal(
 	ctx context.Context,
-	engine Writer,
+	writer Writer,
 	iter Iterator,
 	ms *enginepb.MVCCStats,
 	key roachpb.Key,
@@ -1433,16 +1451,16 @@ func mvccPutInternal(
 			return err
 		}
 		if value == nil {
-			metaKeySize, metaValSize, err = 0, 0, engine.Clear(metaKey)
+			metaKeySize, metaValSize, err = 0, 0, writer.Clear(metaKey)
 		} else {
 			buf.meta = enginepb.MVCCMetadata{RawBytes: value}
-			metaKeySize, metaValSize, err = buf.putMeta(engine, metaKey, &buf.meta)
+			metaKeySize, metaValSize, err = buf.putMeta(writer, metaKey, &buf.meta)
 		}
 		if ms != nil {
 			updateStatsForInline(ms, key, origMetaKeySize, origMetaValSize, metaKeySize, metaValSize)
 		}
 		if err == nil {
-			engine.LogLogicalOp(MVCCWriteValueOpType, MVCCLogicalOpDetails{
+			writer.LogLogicalOp(MVCCWriteValueOpType, MVCCLogicalOpDetails{
 				Key:  key,
 				Safe: true,
 			})
@@ -1459,9 +1477,6 @@ func mvccPutInternal(
 	writeTimestamp := timestamp
 	if txn != nil {
 		readTimestamp = txn.ReadTimestamp
-		// For compatibility with 19.2 nodes which might not have set
-		// ReadTimestamp, fallback to DeprecatedOrigTimestamp.
-		readTimestamp.Forward(txn.DeprecatedOrigTimestamp)
 		if readTimestamp != timestamp {
 			return errors.AssertionFailedf(
 				"mvccPutInternal: txn's read timestamp %s does not match timestamp %s",
@@ -1496,7 +1511,9 @@ func mvccPutInternal(
 			if txn == nil || meta.Txn.ID != txn.ID {
 				// The current Put operation does not come from the same
 				// transaction.
-				return &roachpb.WriteIntentError{Intents: []roachpb.Intent{{Span: roachpb.Span{Key: key}, Status: roachpb.PENDING, Txn: *meta.Txn}}}
+				return &roachpb.WriteIntentError{Intents: []roachpb.Intent{
+					roachpb.MakePendingIntent(meta.Txn, roachpb.Span{Key: key}),
+				}}
 			} else if txn.Epoch < meta.Txn.Epoch {
 				return errors.Errorf("put with epoch %d came after put with epoch %d in txn %s",
 					txn.Epoch, meta.Txn.Epoch, txn.ID)
@@ -1504,33 +1521,77 @@ func mvccPutInternal(
 				// The transaction has executed at this sequence before. This is merely a
 				// replay of the transactional write. Assert that all is in order and return
 				// early.
-				return replayTransactionalWrite(ctx, engine, iter, meta, ms, key, readTimestamp, value, txn, buf, valueFn)
+				return replayTransactionalWrite(ctx, writer, iter, meta, ms, key, readTimestamp, value, txn, buf, valueFn)
 			}
 
 			// We're overwriting the intent that was present at this key, before we do
-			// that though - we must record the older intent in the IntentHistory.
-			var prevIntentValBytes []byte
-			getBuf := newGetBuffer()
-			// Release the buffer after using the existing value.
-			defer getBuf.release()
-			getBuf.meta = buf.meta // initialize get metadata from what we've already read
+			// that though - we must record the older value in the IntentHistory.
 
-			existingVal, _, _, err := mvccGetInternal(
-				ctx, iter, metaKey, readTimestamp, true /* consistent */, safeValue, txn, getBuf)
-			if err != nil {
-				return err
+			// But where to find the older value? There are 4 cases:
+			// - last write inside txn, same epoch, seqnum of last write is not
+			//   ignored: value at key.
+			//   => read the value associated with the intent with consistent
+			//   mvccGetInternal(). (This is the common case.)
+			// - last write inside txn, same epoch, seqnum of last write is ignored:
+			//   cannot use value at key.
+			//   => try reading from intent history.
+			//   => if all intent history entries are rolled back, fall back to last
+			//      case below.
+			// - last write outside txn or at different epoch: use inconsistent
+			//   mvccGetInternal, which will find it outside.
+			//
+			// (Note that _some_ value is guaranteed to be found, as indicated by
+			// ok == true above. The one notable exception is when there are no past
+			// committed values, and all past writes by this transaction have been
+			// rolled back, either due to transaction retries or transaction savepoint
+			// rollbacks.)
+			var existingVal *roachpb.Value
+			// Set to true when the current provisional value is not ignored due to
+			// a txn restart or a savepoint rollback.
+			var curProvNotIgnored bool
+			if txn.Epoch == meta.Txn.Epoch /* last write inside txn */ {
+				if !enginepb.TxnSeqIsIgnored(meta.Txn.Sequence, txn.IgnoredSeqNums) {
+					// Seqnum of last write is not ignored. Retrieve the value
+					// using a consistent read.
+					getBuf := newGetBuffer()
+					// Release the buffer after using the existing value.
+					defer getBuf.release()
+					getBuf.meta = buf.meta // initialize get metadata from what we've already read
+
+					existingVal, _, _, err = mvccGetInternal(
+						ctx, iter, metaKey, readTimestamp, true /* consistent */, safeValue, txn, getBuf)
+					if err != nil {
+						return err
+					}
+					curProvNotIgnored = true
+				} else {
+					// Seqnum of last write was ignored. Try retrieving the value from the history.
+					prevIntent, prevValueWritten := meta.GetPrevIntentSeq(txn.Sequence, txn.IgnoredSeqNums)
+					if prevValueWritten {
+						existingVal = &roachpb.Value{RawBytes: prevIntent.Value}
+					}
+				}
 			}
-			// It's possible that the existing value is nil if the intent on the key
-			// has a lower epoch. We don't have to deal with this as a special case
-			// because in this case, the value isn't written to the intent history.
-			// Instead, the intent history is blown away completely.
-			if existingVal != nil {
-				prevIntentValBytes = existingVal.RawBytes
+			if existingVal == nil {
+				// "last write inside txn && seqnum of all writes are ignored"
+				// OR
+				// "last write outside txn"
+				// => use inconsistent mvccGetInternal to retrieve the last committed value at key.
+				getBuf := newGetBuffer()
+				defer getBuf.release()
+				getBuf.meta = buf.meta
+
+				// Since we want the last committed value on the key, we must make
+				// an inconsistent read so we ignore our previous intents here.
+				existingVal, _, _, err = mvccGetInternal(
+					ctx, iter, metaKey, readTimestamp, false /* consistent */, unsafeValue, nil /* txn */, getBuf)
+				if err != nil {
+					return err
+				}
 			}
-			prevIntentSequence := meta.Txn.Sequence
 
 			// Make sure we process valueFn before clearing any earlier
-			// version.  For example, a conditional put within same
+			// version. For example, a conditional put within same
 			// transaction should read previous write.
 			if valueFn != nil {
 				value, err = valueFn(existingVal)
@@ -1563,7 +1624,7 @@ func mvccPutInternal(
 
 				versionKey := metaKey
 				versionKey.Timestamp = metaTimestamp
-				if err := engine.Clear(versionKey); err != nil {
+				if err := writer.Clear(versionKey); err != nil {
 					return err
 				}
 			} else if writeTimestamp.Less(metaTimestamp) {
@@ -1576,24 +1637,32 @@ func mvccPutInternal(
 			}
 			// Since an intent with a smaller sequence number exists for the
 			// same transaction, we must add the previous value and sequence
-			// to the intent history.
+			// to the intent history, if that previous value does not belong to an
+			// ignored sequence number.
 			//
 			// If the epoch of the transaction doesn't match the epoch of the
-			// intent, blow away the intent history.
-			if txn.Epoch == meta.Txn.Epoch {
-				// This case shouldn't pop up, but it is worth asserting
-				// that it doesn't. We shouldn't write invalid intents
-				// to the history
-				if existingVal == nil {
-					return errors.Errorf(
-						"previous intent of the transaction with the same epoch not found for %s (%+v)",
-						metaKey, txn)
+			// intent, or if the existing value is nil due to all past writes being
+			// ignored and there are no other committed values, blow away the intent
+			// history.
+			//
+			// Note that the only case where txn.Epoch == meta.Txn.Epoch &&
+			// existingVal == nil will be true is when all past writes by this
+			// transaction are ignored, and there are no past committed values at this
+			// key. In that case, we can also blow up the intent history.
+			if txn.Epoch == meta.Txn.Epoch && existingVal != nil {
+				// Only add the current provisional value to the intent
+				// history if the current sequence number is not ignored. There's no
+				// reason to add past committed values or a value already in the intent
+				// history back into it.
+				if curProvNotIgnored {
+					prevIntentValBytes := existingVal.RawBytes
+					prevIntentSequence := meta.Txn.Sequence
+					buf.newMeta.AddToIntentHistory(prevIntentSequence, prevIntentValBytes)
 				}
-				buf.newMeta.AddToIntentHistory(prevIntentSequence, prevIntentValBytes)
 			} else {
 				buf.newMeta.IntentHistory = nil
 			}
-		} else if !metaTimestamp.Less(readTimestamp) {
+		} else if readTimestamp.LessEq(metaTimestamp) {
 			// This is the case where we're trying to write under a committed
 			// value. Obviously we can't do that, but we can increment our
 			// timestamp to one logical tick past the existing value and go on
@@ -1616,9 +1685,7 @@ func mvccPutInternal(
 			// instead of allowing their transactions to continue and be retried
 			// before committing.
 			writeTimestamp.Forward(metaTimestamp.Next())
-			maybeTooOldErr = &roachpb.WriteTooOldError{
-				Timestamp: readTimestamp, ActualTimestamp: writeTimestamp,
-			}
+			maybeTooOldErr = roachpb.NewWriteTooOldError(readTimestamp, writeTimestamp)
 			// If we're in a transaction, always get the value at the orig
 			// timestamp.
 			if txn != nil {
@@ -1654,6 +1721,7 @@ func mvccPutInternal(
 			}
 		}
 	}
+
 	{
 		var txnMeta *enginepb.TxnMeta
 		if txn != nil {
@@ -1674,7 +1742,7 @@ func mvccPutInternal(
 
 	var metaKeySize, metaValSize int64
 	if newMeta.Txn != nil {
-		metaKeySize, metaValSize, err = buf.putMeta(engine, metaKey, newMeta)
+		metaKeySize, metaValSize, err = buf.putMeta(writer, metaKey, newMeta)
 		if err != nil {
 			return err
 		}
@@ -1695,7 +1763,7 @@ func mvccPutInternal(
 	// sequential insertion patterns.
 	versionKey := metaKey
 	versionKey.Timestamp = writeTimestamp
-	if err := engine.Put(versionKey, value); err != nil {
+	if err := writer.Put(versionKey, value); err != nil {
 		return err
 	}
 
@@ -1714,7 +1782,7 @@ func mvccPutInternal(
 	if txn := buf.newMeta.Txn; txn != nil {
 		logicalOpDetails.Txn = *txn
 	}
-	engine.LogLogicalOp(logicalOp, logicalOpDetails)
+	writer.LogLogicalOp(logicalOp, logicalOpDetails)
 
 	return maybeTooOldErr
 }
@@ -1731,19 +1799,19 @@ func mvccPutInternal(
 // confusing and redundant. See the comment on mvccPutInternal for details.
 func MVCCIncrement(
 	ctx context.Context,
-	engine ReadWriter,
+	rw ReadWriter,
 	ms *enginepb.MVCCStats,
 	key roachpb.Key,
 	timestamp hlc.Timestamp,
 	txn *roachpb.Transaction,
 	inc int64,
 ) (int64, error) {
-	iter := engine.NewIterator(IterOptions{Prefix: true})
+	iter := rw.NewIterator(IterOptions{Prefix: true})
 	defer iter.Close()
 
 	var int64Val int64
 	var newInt64Val int64
-	err := mvccPutUsingIter(ctx, engine, iter, ms, key, timestamp, noValue, txn, func(value *roachpb.Value) ([]byte, error) {
+	err := mvccPutUsingIter(ctx, rw, iter, ms, key, timestamp, noValue, txn, func(value *roachpb.Value) ([]byte, error) {
 		if value.IsPresent() {
 			var err error
 			if int64Val, err = value.GetInt(); err != nil {
@@ -1796,7 +1864,7 @@ const (
 // confusing and redundant. See the comment on mvccPutInternal for details.
 func MVCCConditionalPut(
 	ctx context.Context,
-	engine ReadWriter,
+	rw ReadWriter,
 	ms *enginepb.MVCCStats,
 	key roachpb.Key,
 	timestamp hlc.Timestamp,
@@ -1805,10 +1873,10 @@ func MVCCConditionalPut(
 	allowIfDoesNotExist CPutMissingBehavior,
 	txn *roachpb.Transaction,
 ) error {
-	iter := engine.NewIterator(IterOptions{Prefix: true})
+	iter := rw.NewIterator(IterOptions{Prefix: true})
 	defer iter.Close()
 
-	return mvccConditionalPutUsingIter(ctx, engine, iter, ms, key, timestamp, value, expVal, allowIfDoesNotExist, txn)
+	return mvccConditionalPutUsingIter(ctx, rw, iter, ms, key, timestamp, value, expVal, allowIfDoesNotExist, txn)
 }
 
 // MVCCBlindConditionalPut is a fast-path of MVCCConditionalPut. See the
@@ -1822,7 +1890,7 @@ func MVCCConditionalPut(
 // confusing and redundant. See the comment on mvccPutInternal for details.
 func MVCCBlindConditionalPut(
 	ctx context.Context,
-	engine Writer,
+	writer Writer,
 	ms *enginepb.MVCCStats,
 	key roachpb.Key,
 	timestamp hlc.Timestamp,
@@ -1831,12 +1899,12 @@ func MVCCBlindConditionalPut(
 	allowIfDoesNotExist CPutMissingBehavior,
 	txn *roachpb.Transaction,
 ) error {
-	return mvccConditionalPutUsingIter(ctx, engine, nil, ms, key, timestamp, value, expVal, allowIfDoesNotExist, txn)
+	return mvccConditionalPutUsingIter(ctx, writer, nil, ms, key, timestamp, value, expVal, allowIfDoesNotExist, txn)
 }
 
 func mvccConditionalPutUsingIter(
 	ctx context.Context,
-	engine Writer,
+	writer Writer,
 	iter Iterator,
 	ms *enginepb.MVCCStats,
 	key roachpb.Key,
@@ -1847,7 +1915,7 @@ func mvccConditionalPutUsingIter(
 	txn *roachpb.Transaction,
 ) error {
 	return mvccPutUsingIter(
-		ctx, engine, iter, ms, key, timestamp, noValue, txn,
+		ctx, writer, iter, ms, key, timestamp, noValue, txn,
 		func(existVal *roachpb.Value) ([]byte, error) {
 			if expValPresent, existValPresent := expVal != nil, existVal.IsPresent(); expValPresent && existValPresent {
 				// Every type flows through here, so we can't use the typed getters.
@@ -1876,7 +1944,7 @@ func mvccConditionalPutUsingIter(
 // confusing and redundant. See the comment on mvccPutInternal for details.
 func MVCCInitPut(
 	ctx context.Context,
-	engine ReadWriter,
+	rw ReadWriter,
 	ms *enginepb.MVCCStats,
 	key roachpb.Key,
 	timestamp hlc.Timestamp,
@@ -1884,9 +1952,9 @@ func MVCCInitPut(
 	failOnTombstones bool,
 	txn *roachpb.Transaction,
 ) error {
-	iter := engine.NewIterator(IterOptions{Prefix: true})
+	iter := rw.NewIterator(IterOptions{Prefix: true})
 	defer iter.Close()
-	return mvccInitPutUsingIter(ctx, engine, iter, ms, key, timestamp, value, failOnTombstones, txn)
+	return mvccInitPutUsingIter(ctx, rw, iter, ms, key, timestamp, value, failOnTombstones, txn)
 }
 
 // MVCCBlindInitPut is a fast-path of MVCCInitPut. See the MVCCInitPut
@@ -1895,11 +1963,11 @@ func MVCCInitPut(
 // to guarantee no version for the key currently exist.
 //
 // Note that, when writing transactionally, the txn's timestamps
-// dictate the timestamp of the operation, and the timestamp paramater is
+// dictate the timestamp of the operation, and the timestamp parameter is
 // confusing and redundant. See the comment on mvccPutInternal for details.
 func MVCCBlindInitPut(
 	ctx context.Context,
-	engine ReadWriter,
+	rw ReadWriter,
 	ms *enginepb.MVCCStats,
 	key roachpb.Key,
 	timestamp hlc.Timestamp,
@@ -1907,12 +1975,12 @@ func MVCCBlindInitPut(
 	failOnTombstones bool,
 	txn *roachpb.Transaction,
 ) error {
-	return mvccInitPutUsingIter(ctx, engine, nil, ms, key, timestamp, value, failOnTombstones, txn)
+	return mvccInitPutUsingIter(ctx, rw, nil, ms, key, timestamp, value, failOnTombstones, txn)
 }
 
 func mvccInitPutUsingIter(
 	ctx context.Context,
-	engine ReadWriter,
+	rw ReadWriter,
 	iter Iterator,
 	ms *enginepb.MVCCStats,
 	key roachpb.Key,
@@ -1922,7 +1990,7 @@ func mvccInitPutUsingIter(
 	txn *roachpb.Transaction,
 ) error {
 	return mvccPutUsingIter(
-		ctx, engine, iter, ms, key, timestamp, noValue, txn,
+		ctx, rw, iter, ms, key, timestamp, noValue, txn,
 		func(existVal *roachpb.Value) ([]byte, error) {
 			if failOnTombstones && existVal != nil && len(existVal.RawBytes) == 0 {
 				// We found a tombstone and failOnTombstones is true: fail.
@@ -1960,8 +2028,8 @@ func (m mvccKeyFormatter) Format(f fmt.State, c rune) {
 // combines time series observations if the roachpb.Value tag value
 // indicates the value byte slice is of type TIMESERIES.
 func MVCCMerge(
-	ctx context.Context,
-	engine ReadWriter,
+	_ context.Context,
+	rw ReadWriter,
 	ms *enginepb.MVCCStats,
 	key roachpb.Key,
 	timestamp hlc.Timestamp,
@@ -1987,7 +2055,7 @@ func MVCCMerge(
 	}
 	data, err := buf.marshalMeta(meta)
 	if err == nil {
-		if err = engine.Merge(metaKey, data); err == nil && ms != nil {
+		if err = rw.Merge(metaKey, data); err == nil && ms != nil {
 			ms.Add(updateStatsOnMerge(
 				key, int64(len(rawBytes))+MVCCVersionTimestampSize, timestamp.WallTime))
 		}
@@ -2013,8 +2081,8 @@ func MVCCMerge(
 // does or not not change the live and gc keys) so the caller is responsible for
 // recomputing stats over the resulting span if needed.
 func MVCCClearTimeRange(
-	ctx context.Context,
-	batch ReadWriter,
+	_ context.Context,
+	rw ReadWriter,
 	ms *enginepb.MVCCStats,
 	key, endKey roachpb.Key,
 	startTime, endTime hlc.Timestamp,
@@ -2058,14 +2126,14 @@ func MVCCClearTimeRange(
 
 	flushClearedKeys := func(nonMatch MVCCKey) error {
 		if len(clearRangeStart.Key) != 0 {
-			if err := batch.ClearRange(clearRangeStart, nonMatch); err != nil {
+			if err := rw.ClearRange(clearRangeStart, nonMatch); err != nil {
 				return err
 			}
 			batchSize++
 			clearRangeStart = MVCCKey{}
 		} else if bufSize > 0 {
 			for i := 0; i < bufSize; i++ {
-				if err := batch.Clear(buf[i]); err != nil {
+				if err := rw.Clear(buf[i]); err != nil {
 					return err
 				}
 			}
@@ -2086,7 +2154,7 @@ func MVCCClearTimeRange(
 	// for deletion, allowing us to quickly skip over swaths of uninteresting
 	// keys, but then use a normal iteration to actually do the delete including
 	// updating the live key stats correctly.
-	it := batch.NewIterator(IterOptions{LowerBound: key, UpperBound: endKey})
+	it := rw.NewIterator(IterOptions{LowerBound: key, UpperBound: endKey})
 	defer it.Close()
 
 	var clearedMetaKey MVCCKey
@@ -2137,16 +2205,16 @@ func MVCCClearTimeRange(
 				return nil, err
 			}
 			ts := hlc.Timestamp(meta.Timestamp)
-			if meta.Txn != nil && startTime.Less(ts) && !endTime.Less(ts) {
+			if meta.Txn != nil && startTime.Less(ts) && ts.LessEq(endTime) {
 				err := &roachpb.WriteIntentError{
-					Intents: []roachpb.Intent{{Span: roachpb.Span{Key: append([]byte{}, k.Key...)},
-						Status: roachpb.PENDING, Txn: *meta.Txn,
-					}}}
+					Intents: []roachpb.Intent{
+						roachpb.MakePendingIntent(meta.Txn, roachpb.Span{Key: append([]byte{}, k.Key...)}),
+					}}
 				return nil, err
 			}
 		}
 
-		if startTime.Less(k.Timestamp) && !endTime.Less(k.Timestamp) {
+		if startTime.Less(k.Timestamp) && k.Timestamp.LessEq(endTime) {
 			if batchSize >= maxBatchSize {
 				resume = &roachpb.Span{Key: append([]byte{}, k.Key...), EndKey: endKey}
 				break
@@ -2183,7 +2251,7 @@ func MVCCClearTimeRange(
 // The returned resume span is nil if max keys aren't processed.
 func MVCCDeleteRange(
 	ctx context.Context,
-	engine ReadWriter,
+	rw ReadWriter,
 	ms *enginepb.MVCCStats,
 	key, endKey roachpb.Key,
 	max int64,
@@ -2204,18 +2272,18 @@ func MVCCDeleteRange(
 		prevSeqTxn.Sequence--
 		scanTxn = prevSeqTxn
 	}
-	kvs, resumeSpan, _, err := MVCCScan(
-		ctx, engine, key, endKey, max, scanTs, MVCCScanOptions{Txn: scanTxn})
+	res, err := MVCCScan(
+		ctx, rw, key, endKey, max, scanTs, MVCCScanOptions{Txn: scanTxn})
 	if err != nil {
 		return nil, nil, 0, err
 	}
 
 	buf := newPutBuffer()
-	iter := engine.NewIterator(IterOptions{Prefix: true})
+	iter := rw.NewIterator(IterOptions{Prefix: true})
 
-	for i := range kvs {
+	for i := range res.KVs {
 		err = mvccPutInternal(
-			ctx, engine, iter, ms, kvs[i].Key, timestamp, nil, txn, buf, nil)
+			ctx, rw, iter, ms, res.KVs[i].Key, timestamp, nil, txn, buf, nil)
 		if err != nil {
 			break
 		}
@@ -2225,14 +2293,14 @@ func MVCCDeleteRange(
 	buf.release()
 
 	var keys []roachpb.Key
-	if returnKeys && err == nil && len(kvs) > 0 {
-		keys = make([]roachpb.Key, len(kvs))
-		for i := range kvs {
-			keys[i] = kvs[i].Key
+	if returnKeys && err == nil && len(res.KVs) > 0 {
+		keys = make([]roachpb.Key, len(res.KVs))
+		for i := range res.KVs {
+			keys[i] = res.KVs[i].Key
 		}
 	}
 
-	return keys, resumeSpan, int64(len(kvs)), err
+	return keys, res.ResumeSpan, res.NumKeys, err
 }
 
 func mvccScanToBytes(
@@ -2242,16 +2310,16 @@ func mvccScanToBytes(
 	max int64,
 	timestamp hlc.Timestamp,
 	opts MVCCScanOptions,
-) (kvData [][]byte, numKVs int64, resumeSpan *roachpb.Span, intents []roachpb.Intent, err error) {
-	if opts.Inconsistent && opts.Txn != nil {
-		return nil, 0, nil, nil, errors.Errorf("cannot allow inconsistent reads within a transaction")
-	}
+) (MVCCScanResult, error) {
 	if len(endKey) == 0 {
-		return nil, 0, nil, nil, emptyKeyError()
+		return MVCCScanResult{}, emptyKeyError()
+	}
+	if err := opts.validate(); err != nil {
+		return MVCCScanResult{}, err
 	}
 	if max == 0 {
-		resumeSpan = &roachpb.Span{Key: key, EndKey: endKey}
-		return nil, 0, resumeSpan, nil, nil
+		resumeSpan := &roachpb.Span{Key: key, EndKey: endKey}
+		return MVCCScanResult{ResumeSpan: resumeSpan}, nil
 	}
 
 	// If the iterator has a specialized implementation, defer to that.
@@ -2263,35 +2331,41 @@ func mvccScanToBytes(
 	defer pebbleMVCCScannerPool.Put(mvccScanner)
 
 	*mvccScanner = pebbleMVCCScanner{
-		parent:       iter,
-		reverse:      opts.Reverse,
-		start:        key,
-		end:          endKey,
-		ts:           timestamp,
-		maxKeys:      max,
-		inconsistent: opts.Inconsistent,
-		tombstones:   opts.Tombstones,
+		parent:           iter,
+		reverse:          opts.Reverse,
+		start:            key,
+		end:              endKey,
+		ts:               timestamp,
+		maxKeys:          max,
+		targetBytes:      opts.TargetBytes,
+		inconsistent:     opts.Inconsistent,
+		tombstones:       opts.Tombstones,
+		failOnMoreRecent: opts.FailOnMoreRecent,
 	}
 
 	mvccScanner.init(opts.Txn)
-	resumeSpan, err = mvccScanner.scan()
+
+	var res MVCCScanResult
+	var err error
+	res.ResumeSpan, err = mvccScanner.scan()
 
 	if err != nil {
-		return nil, 0, nil, nil, err
+		return MVCCScanResult{}, err
 	}
 
-	kvData = mvccScanner.results.finish()
-	numKVs = mvccScanner.results.count
+	res.KVData = mvccScanner.results.finish()
+	res.NumKeys = mvccScanner.results.count
+	res.NumBytes = mvccScanner.results.bytes
 
-	intents, err = buildScanIntents(mvccScanner.intents.Repr())
+	res.Intents, err = buildScanIntents(mvccScanner.intents.Repr())
 	if err != nil {
-		return nil, 0, nil, nil, err
+		return MVCCScanResult{}, err
 	}
 
-	if !opts.Inconsistent && len(intents) > 0 {
-		return nil, 0, resumeSpan, nil, &roachpb.WriteIntentError{Intents: intents}
+	if !opts.Inconsistent && len(res.Intents) > 0 {
+		return MVCCScanResult{}, &roachpb.WriteIntentError{Intents: res.Intents}
 	}
-	return
+	return res, nil
 }
 
 // mvccScanToKvs converts the raw key/value pairs returned by Iterator.MVCCScan
@@ -2303,12 +2377,15 @@ func mvccScanToKvs(
 	max int64,
 	timestamp hlc.Timestamp,
 	opts MVCCScanOptions,
-) ([]roachpb.KeyValue, *roachpb.Span, []roachpb.Intent, error) {
-	kvData, numKVs, resumeSpan, intents, err := mvccScanToBytes(ctx, iter, key, endKey, max, timestamp, opts)
+) (MVCCScanResult, error) {
+	res, err := mvccScanToBytes(ctx, iter, key, endKey, max, timestamp, opts)
 	if err != nil {
-		return nil, nil, nil, err
+		return MVCCScanResult{}, err
 	}
-	kvs := make([]roachpb.KeyValue, numKVs)
+	res.KVs = make([]roachpb.KeyValue, res.NumKeys)
+	kvData := res.KVData
+	res.KVData = nil
+
 	var k MVCCKey
 	var rawBytes []byte
 	var i int
@@ -2316,15 +2393,15 @@ func mvccScanToKvs(
 		for len(data) > 0 {
 			k, rawBytes, data, err = MVCCScanDecodeKeyValue(data)
 			if err != nil {
-				return nil, nil, nil, err
+				return MVCCScanResult{}, err
 			}
-			kvs[i].Key = k.Key
-			kvs[i].Value.RawBytes = rawBytes
-			kvs[i].Value.Timestamp = k.Timestamp
+			res.KVs[i].Key = k.Key
+			res.KVs[i].Value.RawBytes = rawBytes
+			res.KVs[i].Value.Timestamp = k.Timestamp
 			i++
 		}
 	}
-	return kvs, resumeSpan, intents, err
+	return res, err
 }
 
 func buildScanIntents(data []byte) ([]roachpb.Intent, error) {
@@ -2347,11 +2424,7 @@ func buildScanIntents(data []byte) ([]roachpb.Intent, error) {
 		if err := protoutil.Unmarshal(reader.Value(), &meta); err != nil {
 			return nil, err
 		}
-		intents = append(intents, roachpb.Intent{
-			Span:   roachpb.Span{Key: key.Key},
-			Status: roachpb.PENDING,
-			Txn:    *meta.Txn,
-		})
+		intents = append(intents, roachpb.MakePendingIntent(meta.Txn, roachpb.Span{Key: key.Key}))
 	}
 
 	if err := reader.Error(); err != nil {
@@ -2368,13 +2441,51 @@ type MVCCScanOptions struct {
 	// to return no results.
 
 	// See the documentation for MVCCScan for information on these parameters.
-	Inconsistent bool
-	Tombstones   bool
-	Reverse      bool
-	Txn          *roachpb.Transaction
+	Inconsistent     bool
+	Tombstones       bool
+	Reverse          bool
+	FailOnMoreRecent bool
+	Txn              *roachpb.Transaction
+	// TargetBytes is a byte threshold to limit the amount of data pulled into
+	// memory during a Scan operation. Once the target is satisfied (i.e. met or
+	// exceeded) by the emitted emitted KV pairs, iteration stops (with a
+	// ResumeSpan as appropriate). In particular, at least one kv pair is
+	// returned (when one exists).
+	//
+	// The number of bytes a particular kv pair accrues depends on internal data
+	// structures, but it is guaranteed to exceed that of the bytes stored in
+	// the key and value itself.
+	//
+	// The zero value indicates no limit.
+	TargetBytes int64
 }
 
-// MVCCScan scans the key range [key, endKey) in the provided engine up to some
+func (opts *MVCCScanOptions) validate() error {
+	if opts.Inconsistent && opts.Txn != nil {
+		return errors.Errorf("cannot allow inconsistent reads within a transaction")
+	}
+	if opts.Inconsistent && opts.FailOnMoreRecent {
+		return errors.Errorf("cannot allow inconsistent reads with fail on more recent option")
+	}
+	return nil
+}
+
+// MVCCScanResult groups the values returned from an MVCCScan operation. Depending
+// on the operation invoked, KVData or KVs is populated, but never both.
+type MVCCScanResult struct {
+	KVData  [][]byte
+	KVs     []roachpb.KeyValue
+	NumKeys int64
+	// NumBytes is the number of bytes this scan result accrued in terms of the
+	// MVCCScanOptions.TargetBytes parameter. This roughly measures the bytes
+	// used for encoding the uncompressed kv pairs contained in the result.
+	NumBytes int64
+
+	ResumeSpan *roachpb.Span
+	Intents    []roachpb.Intent
+}
+
+// MVCCScan scans the key range [key, endKey) in the provided reader up to some
 // maximum number of results in ascending order. If it hits max, it returns a
 // "resume span" to be used in the next call to this function. If the limit is
 // not hit, the resume span will be nil. Otherwise, it will be the sub-span of
@@ -2399,21 +2510,25 @@ type MVCCScanOptions struct {
 // When scanning inconsistently, any encountered intents will be placed in the
 // dedicated result parameter. By contrast, when scanning consistently, any
 // encountered intents will cause the scan to return a WriteIntentError with the
-// intents embedded within, and the intents result parameter will be nil. In
-// this case a resume span will be returned; this is the only case in which a
-// resume span is returned alongside a non-nil error.
+// intents embedded within.
 //
 // Note that transactional scans must be consistent. Put another way, only
 // non-transactional scans may be inconsistent.
+//
+// When scanning in "fail on more recent" mode, a WriteTooOldError will be
+// returned if the scan observes a version with a timestamp above the read
+// timestamp. Similarly, a WriteIntentError will be returned if the scan
+// observes another transaction's intent, even if it has a timestamp above
+// the read timestamp.
 func MVCCScan(
 	ctx context.Context,
-	engine Reader,
+	reader Reader,
 	key, endKey roachpb.Key,
 	max int64,
 	timestamp hlc.Timestamp,
 	opts MVCCScanOptions,
-) ([]roachpb.KeyValue, *roachpb.Span, []roachpb.Intent, error) {
-	iter := engine.NewIterator(IterOptions{LowerBound: key, UpperBound: endKey})
+) (MVCCScanResult, error) {
+	iter := reader.NewIterator(IterOptions{LowerBound: key, UpperBound: endKey})
 	defer iter.Close()
 	return mvccScanToKvs(ctx, iter, key, endKey, max, timestamp, opts)
 }
@@ -2421,13 +2536,13 @@ func MVCCScan(
 // MVCCScanToBytes is like MVCCScan, but it returns the results in a byte array.
 func MVCCScanToBytes(
 	ctx context.Context,
-	engine Reader,
+	reader Reader,
 	key, endKey roachpb.Key,
 	max int64,
 	timestamp hlc.Timestamp,
 	opts MVCCScanOptions,
-) ([][]byte, int64, *roachpb.Span, []roachpb.Intent, error) {
-	iter := engine.NewIterator(IterOptions{LowerBound: key, UpperBound: endKey})
+) (MVCCScanResult, error) {
+	iter := reader.NewIterator(IterOptions{LowerBound: key, UpperBound: endKey})
 	defer iter.Close()
 	return mvccScanToBytes(ctx, iter, key, endKey, max, timestamp, opts)
 }
@@ -2436,77 +2551,64 @@ func MVCCScanToBytes(
 // iteration, f() is invoked with the current key/value pair. If f returns
 // true (done) or an error, the iteration stops and the error is propagated.
 // If the reverse is flag set the iterator will be moved in reverse order.
+// If the scan options specify an inconsistent scan, all "ignored" intents
+// will be returned. In consistent mode, intents are only ever returned as
+// part of a WriteIntentError.
 func MVCCIterate(
 	ctx context.Context,
-	engine Reader,
+	reader Reader,
 	key, endKey roachpb.Key,
 	timestamp hlc.Timestamp,
 	opts MVCCScanOptions,
 	f func(roachpb.KeyValue) (bool, error),
 ) ([]roachpb.Intent, error) {
-	iter := engine.NewIterator(IterOptions{LowerBound: key, UpperBound: endKey})
+	iter := reader.NewIterator(IterOptions{LowerBound: key, UpperBound: endKey})
 	defer iter.Close()
 
 	var intents []roachpb.Intent
-	var wiErr error
-
 	for {
 		const maxKeysPerScan = 1000
-		kvs, resume, newIntents, err := mvccScanToKvs(
+		res, err := mvccScanToKvs(
 			ctx, iter, key, endKey, maxKeysPerScan, timestamp, opts)
 		if err != nil {
-			switch tErr := err.(type) {
-			case *roachpb.WriteIntentError:
-				// In the case of WriteIntentErrors, accumulate affected keys but continue scan.
-				if wiErr == nil {
-					wiErr = tErr
-				} else {
-					wiErr.(*roachpb.WriteIntentError).Intents = append(
-						wiErr.(*roachpb.WriteIntentError).Intents, tErr.Intents...)
-				}
-			default:
-				return nil, err
-			}
+			return nil, err
 		}
 
-		if len(newIntents) > 0 {
+		if len(res.Intents) > 0 {
 			if intents == nil {
-				intents = newIntents
+				intents = res.Intents
 			} else {
-				intents = append(intents, newIntents...)
+				intents = append(intents, res.Intents...)
 			}
 		}
 
-		for i := range kvs {
-			done, err := f(kvs[i])
+		for i := range res.KVs {
+			done, err := f(res.KVs[i])
 			if err != nil {
 				return nil, err
 			}
 			if done {
-				// TODO(peter): This isn't quite the same semantics as mvccIterateOld
-				// as we can return intents for keys that are "past" what we've invoked
-				// the callback on. That's fine as none of the callers use the returned
-				// intents.
-				return intents, wiErr
+				return intents, nil
 			}
 		}
 
-		if resume == nil {
+		if res.ResumeSpan == nil {
 			break
 		}
 		if opts.Reverse {
-			endKey = resume.EndKey
+			endKey = res.ResumeSpan.EndKey
 		} else {
-			key = resume.Key
+			key = res.ResumeSpan.Key
 		}
 	}
 
-	return intents, wiErr
+	return intents, nil
 }
 
 // MVCCResolveWriteIntent either commits or aborts (rolls back) an
 // extant write intent for a given txn according to commit parameter.
-// ResolveWriteIntent will skip write intents of other txns.
+// ResolveWriteIntent will skip write intents of other txns. It returns
+// whether or not an intent was found to resolve.
 //
 // Transaction epochs deserve a bit of explanation. The epoch for a
 // transaction is incremented on transaction retries. A transaction
@@ -2529,34 +2631,33 @@ func MVCCIterate(
 // Doesn't look like this code here caught that. Shouldn't resolve intents
 // when they're not at the timestamp the Txn mandates them to be.
 func MVCCResolveWriteIntent(
-	ctx context.Context, engine ReadWriter, ms *enginepb.MVCCStats, intent roachpb.Intent,
-) error {
-	iterAndBuf := GetBufUsingIter(engine.NewIterator(IterOptions{Prefix: true}))
-	err := MVCCResolveWriteIntentUsingIter(ctx, engine, iterAndBuf, ms, intent)
+	ctx context.Context, rw ReadWriter, ms *enginepb.MVCCStats, intent roachpb.Intent,
+) (bool, error) {
+	iterAndBuf := GetBufUsingIter(rw.NewIterator(IterOptions{Prefix: true}))
+	ok, err := MVCCResolveWriteIntentUsingIter(ctx, rw, iterAndBuf, ms, intent)
 	// Using defer would be more convenient, but it is measurably slower.
 	iterAndBuf.Cleanup()
-	return err
+	return ok, err
 }
 
 // MVCCResolveWriteIntentUsingIter is a variant of MVCCResolveWriteIntent that
 // uses iterator and buffer passed as parameters (e.g. when used in a loop).
 func MVCCResolveWriteIntentUsingIter(
 	ctx context.Context,
-	engine ReadWriter,
+	rw ReadWriter,
 	iterAndBuf IterAndBuf,
 	ms *enginepb.MVCCStats,
 	intent roachpb.Intent,
-) error {
+) (bool, error) {
 	if len(intent.Key) == 0 {
-		return emptyKeyError()
+		return false, emptyKeyError()
 	}
 	if len(intent.EndKey) > 0 {
-		return errors.Errorf("can't resolve range intent as point intent")
+		return false, errors.Errorf("can't resolve range intent as point intent")
 	}
-	_, err := mvccResolveWriteIntent(
-		ctx, engine, iterAndBuf.iter, ms, intent, iterAndBuf.buf, false, /* forRange */
+	return mvccResolveWriteIntent(
+		ctx, rw, iterAndBuf.iter, ms, intent, iterAndBuf.buf, false, /* forRange */
 	)
-	return err
 }
 
 // unsafeNextVersion positions the iterator at the successor to latestKey. If this value
@@ -2584,7 +2685,7 @@ func unsafeNextVersion(iter Iterator, latestKey MVCCKey) (MVCCKey, []byte, bool,
 // Returns whether an intent was found and resolved, false otherwise.
 func mvccResolveWriteIntent(
 	ctx context.Context,
-	engine ReadWriter,
+	rw ReadWriter,
 	iter Iterator,
 	ms *enginepb.MVCCStats,
 	intent roachpb.Intent,
@@ -2670,12 +2771,12 @@ func mvccResolveWriteIntent(
 	//
 	// A commit with an older timestamp than the intent should not happen under
 	// normal circumstances because a client should never bump its timestamp
-	// after issuing an EndTransaction request. Replays of intent writes that
-	// are pushed forward due to WriteTooOld errors without client action
-	// combined with replays of intent resolution make this configuration a
-	// possibility. We treat such intents as uncommitted.
+	// after issuing an EndTxn request. Replays of intent writes that are pushed
+	// forward due to WriteTooOld errors without client action combined with
+	// replays of intent resolution make this configuration a possibility. We
+	// treat such intents as uncommitted.
 	epochsMatch := meta.Txn.Epoch == intent.Txn.Epoch
-	timestampsValid := !intent.Txn.WriteTimestamp.Less(hlc.Timestamp(meta.Timestamp))
+	timestampsValid := hlc.Timestamp(meta.Timestamp).LessEq(intent.Txn.WriteTimestamp)
 	commit := intent.Status == roachpb.COMMITTED && epochsMatch && timestampsValid
 
 	// Note the small difference to commit epoch handling here: We allow
@@ -2705,11 +2806,38 @@ func mvccResolveWriteIntent(
 	// testing.
 	inProgress := !intent.Status.IsFinalized() && meta.Txn.Epoch >= intent.Txn.Epoch
 	pushed := inProgress && hlc.Timestamp(meta.Timestamp).Less(intent.Txn.WriteTimestamp)
+	latestKey := MVCCKey{Key: intent.Key, Timestamp: hlc.Timestamp(meta.Timestamp)}
+
+	// Handle partial txn rollbacks. If the current txn sequence
+	// is part of a rolled back (ignored) seqnum range, we're going
+	// to erase that MVCC write and reveal the previous value.
+	// If _all_ the writes get removed in this way, the intent
+	// can be considered empty and marked for removal (removeIntent = true).
+	// If only part of the intent history was rolled back, but the intent still
+	// remains, the rolledBackVal is set to a non-nil value.
+	var rolledBackVal []byte
+	if len(intent.IgnoredSeqNums) > 0 {
+		var removeIntent bool
+		removeIntent, rolledBackVal, err = mvccMaybeRewriteIntentHistory(ctx, rw, intent.IgnoredSeqNums, meta, latestKey)
+		if err != nil {
+			return false, err
+		}
+
+		if removeIntent {
+			// This intent should be cleared. Set commit, pushed, and inProgress to
+			// false so that this intent isn't updated, gets cleared, and committed
+			// values are left untouched.
+			commit = false
+			pushed = false
+			inProgress = false
+		}
+	}
 
 	// There's nothing to do if meta's epoch is greater than or equal txn's
 	// epoch and the state is still in progress but the intent was not pushed
-	// to a larger timestamp.
-	if inProgress && !pushed {
+	// to a larger timestamp, and if the rollback code did not modify or mark
+	// the intent for removal.
+	if inProgress && !pushed && rolledBackVal == nil {
 		return false, nil
 	}
 
@@ -2717,29 +2845,35 @@ func mvccResolveWriteIntent(
 	// the proposed epoch matches the existing epoch: update the meta.Txn. For commit, it's set to
 	// nil; otherwise, we update its value. We may have to update the actual version value (remove old
 	// and create new with proper timestamp-encoded key) if timestamp changed.
-	if commit || pushed {
+	//
+	// If the intent has disappeared in mvccMaybeRewriteIntentHistory, we skip
+	// this block and fall down to the intent/value deletion code path. This
+	// is because removeIntent implies rolledBackVal == nil, pushed == false, and
+	// commit == false.
+	if commit || pushed || rolledBackVal != nil {
 		buf.newMeta = *meta
 		// Set the timestamp for upcoming write (or at least the stats update).
 		buf.newMeta.Timestamp = hlc.LegacyTimestamp(intent.Txn.WriteTimestamp)
 
 		// Update or remove the metadata key.
 		var metaKeySize, metaValSize int64
-		if pushed {
-			// Keep existing intent if we're pushing timestamp. We keep the
+		if !commit {
+			// Keep existing intent if we're updating it. We keep the
 			// existing metadata instead of using the supplied intent meta
 			// to avoid overwriting a newer epoch (see comments above). The
 			// pusher's job isn't to do anything to update the intent but
 			// to move the timestamp forward, even if it can.
-			metaKeySize, metaValSize, err = buf.putMeta(engine, metaKey, &buf.newMeta)
+			metaKeySize, metaValSize, err = buf.putMeta(rw, metaKey, &buf.newMeta)
 		} else {
 			metaKeySize = int64(metaKey.EncodedSize())
-			err = engine.Clear(metaKey)
+			err = rw.Clear(metaKey)
 		}
 		if err != nil {
 			return false, err
 		}
 
-		// If we're moving the intent's timestamp, adjust stats and rewrite it.
+		// If we're moving the intent's timestamp, adjust stats and
+		// rewrite it.
 		var prevValSize int64
 		if buf.newMeta.Timestamp != meta.Timestamp {
 			oldKey := MVCCKey{Key: intent.Key, Timestamp: hlc.Timestamp(meta.Timestamp)}
@@ -2752,10 +2886,19 @@ func mvccResolveWriteIntent(
 			} else if !valid || !iter.UnsafeKey().Equal(oldKey) {
 				return false, errors.Errorf("existing intent value missing: %s", oldKey)
 			}
-			if err = engine.Put(newKey, iter.UnsafeValue()); err != nil {
+			value := iter.UnsafeValue()
+			// Special case: If mvccMaybeRewriteIntentHistory rolled back to a value
+			// in the intent history and wrote that at oldKey, iter would not be able
+			// to "see" the value since it was created before that value was written
+			// to the engine. In this case, reuse the value returned by
+			// mvccMaybeRewriteIntentHistory.
+			if rolledBackVal != nil {
+				value = rolledBackVal
+			}
+			if err = rw.Put(newKey, value); err != nil {
 				return false, err
 			}
-			if err = engine.Clear(oldKey); err != nil {
+			if err = rw.Clear(oldKey); err != nil {
 				return false, err
 			}
 
@@ -2786,7 +2929,7 @@ func mvccResolveWriteIntent(
 		if pushed {
 			logicalOp = MVCCUpdateIntentOpType
 		}
-		engine.LogLogicalOp(logicalOp, MVCCLogicalOpDetails{
+		rw.LogLogicalOp(logicalOp, MVCCLogicalOpDetails{
 			Txn:       intent.Txn,
 			Key:       intent.Key,
 			Timestamp: intent.Txn.WriteTimestamp,
@@ -2808,13 +2951,12 @@ func mvccResolveWriteIntent(
 	// - ResolveIntent with epoch 0 aborts intent from epoch 1.
 
 	// First clear the intent value.
-	latestKey := MVCCKey{Key: intent.Key, Timestamp: hlc.Timestamp(meta.Timestamp)}
-	if err := engine.Clear(latestKey); err != nil {
+	if err := rw.Clear(latestKey); err != nil {
 		return false, err
 	}
 
 	// Log the logical MVCC operation.
-	engine.LogLogicalOp(MVCCAbortIntentOpType, MVCCLogicalOpDetails{
+	rw.LogLogicalOp(MVCCAbortIntentOpType, MVCCLogicalOpDetails{
 		Txn: intent.Txn,
 		Key: intent.Key,
 	})
@@ -2827,7 +2969,7 @@ func mvccResolveWriteIntent(
 
 	if !ok {
 		// If there is no other version, we should just clean up the key entirely.
-		if err = engine.Clear(metaKey); err != nil {
+		if err = rw.Clear(metaKey); err != nil {
 			return false, err
 		}
 		// Clear stat counters attributable to the intent we're aborting.
@@ -2845,7 +2987,7 @@ func mvccResolveWriteIntent(
 		KeyBytes: MVCCVersionTimestampSize,
 		ValBytes: valueSize,
 	}
-	if err := engine.Clear(metaKey); err != nil {
+	if err := rw.Clear(metaKey); err != nil {
 		return false, err
 	}
 	metaKeySize := int64(metaKey.EncodedSize())
@@ -2860,6 +3002,55 @@ func mvccResolveWriteIntent(
 	return true, nil
 }
 
+// mvccMaybeRewriteIntentHistory rewrites the intent to reveal the latest
+// stored value, ignoring all values from the history that have an
+// ignored seqnum.
+// The remove return value, when true, indicates that
+// all the writes in the intent are ignored and the intent should
+// be marked for removal as it does not exist any more.
+// The updatedVal, when non-nil, indicates that the intent was updated
+// and should be overwritten in engine.
+func mvccMaybeRewriteIntentHistory(
+	ctx context.Context,
+	engine ReadWriter,
+	ignoredSeqNums []enginepb.IgnoredSeqNumRange,
+	meta *enginepb.MVCCMetadata,
+	latestKey MVCCKey,
+) (remove bool, updatedVal []byte, err error) {
+	if !enginepb.TxnSeqIsIgnored(meta.Txn.Sequence, ignoredSeqNums) {
+		// The latest write was not ignored. Nothing to do here.  We'll
+		// proceed with the intent as usual.
+		return false, nil, nil
+	}
+	// Find the latest historical write before that that was not
+	// ignored.
+	var i int
+	for i = len(meta.IntentHistory) - 1; i >= 0; i-- {
+		e := &meta.IntentHistory[i]
+		if !enginepb.TxnSeqIsIgnored(e.Sequence, ignoredSeqNums) {
+			break
+		}
+	}
+
+	// If i < 0, we don't have an intent any more: everything
+	// has been rolled back.
+	if i < 0 {
+		return true, nil, nil
+	}
+
+	// Otherwise, we place back the write at that history entry
+	// back into the intent.
+	restoredVal := meta.IntentHistory[i].Value
+	meta.Txn.Sequence = meta.IntentHistory[i].Sequence
+	meta.IntentHistory = meta.IntentHistory[:i]
+	meta.Deleted = len(restoredVal) == 0
+	meta.ValBytes = int64(len(restoredVal))
+	// And also overwrite whatever was there in storage.
+	err = engine.Put(latestKey, restoredVal)
+
+	return false, restoredVal, err
+}
+
 // IterAndBuf used to pass iterators and buffers between MVCC* calls, allowing
 // reuse without the callers needing to know the particulars.
 type IterAndBuf struct {
@@ -2868,8 +3059,8 @@ type IterAndBuf struct {
 }
 
 // GetIterAndBuf returns an IterAndBuf for passing into various MVCC* methods.
-func GetIterAndBuf(engine Reader, opts IterOptions) IterAndBuf {
-	return GetBufUsingIter(engine.NewIterator(opts))
+func GetIterAndBuf(reader Reader, opts IterOptions) IterAndBuf {
+	return GetBufUsingIter(reader.NewIterator(opts))
 }
 
 // GetBufUsingIter returns an IterAndBuf using the supplied iterator.
@@ -2892,11 +3083,11 @@ func (b IterAndBuf) Cleanup() {
 // txns. Returns the number of intents resolved and a resume span if
 // the max keys limit was exceeded.
 func MVCCResolveWriteIntentRange(
-	ctx context.Context, engine ReadWriter, ms *enginepb.MVCCStats, intent roachpb.Intent, max int64,
+	ctx context.Context, rw ReadWriter, ms *enginepb.MVCCStats, intent roachpb.Intent, max int64,
 ) (int64, *roachpb.Span, error) {
-	iterAndBuf := GetIterAndBuf(engine, IterOptions{UpperBound: intent.Span.EndKey})
+	iterAndBuf := GetIterAndBuf(rw, IterOptions{UpperBound: intent.Span.EndKey})
 	defer iterAndBuf.Cleanup()
-	return MVCCResolveWriteIntentRangeUsingIter(ctx, engine, iterAndBuf, ms, intent, max)
+	return MVCCResolveWriteIntentRangeUsingIter(ctx, rw, iterAndBuf, ms, intent, max)
 }
 
 // MVCCResolveWriteIntentRangeUsingIter commits or aborts (rolls back)
@@ -2906,7 +3097,7 @@ func MVCCResolveWriteIntentRange(
 // the max keys limit was exceeded.
 func MVCCResolveWriteIntentRangeUsingIter(
 	ctx context.Context,
-	engine ReadWriter,
+	rw ReadWriter,
 	iterAndBuf IterAndBuf,
 	ms *enginepb.MVCCStats,
 	intent roachpb.Intent,
@@ -2944,7 +3135,7 @@ func MVCCResolveWriteIntentRangeUsingIter(
 		if !key.IsValue() {
 			intent.Key = key.Key
 			ok, err = mvccResolveWriteIntent(
-				ctx, engine, iterAndBuf.iter, ms, intent, iterAndBuf.buf, true, /* forRange */
+				ctx, rw, iterAndBuf.iter, ms, intent, iterAndBuf.buf, true, /* forRange */
 			)
 		}
 		if err != nil {
@@ -2965,21 +3156,21 @@ func MVCCResolveWriteIntentRangeUsingIter(
 	return num, nil, nil
 }
 
-// MVCCGarbageCollect creates an iterator on the engine. In parallel
+// MVCCGarbageCollect creates an iterator on the ReadWriter. In parallel
 // it iterates through the keys listed for garbage collection by the
-// keys slice. The engine iterator is seeked in turn to each listed
+// keys slice. The iterator is seeked in turn to each listed
 // key, clearing all values with timestamps <= to expiration. The
 // timestamp parameter is used to compute the intent age on GC.
 func MVCCGarbageCollect(
 	ctx context.Context,
-	engine ReadWriter,
+	rw ReadWriter,
 	ms *enginepb.MVCCStats,
 	keys []roachpb.GCRequest_GCKey,
 	timestamp hlc.Timestamp,
 ) error {
 	// We're allowed to use a prefix iterator because we always Seek() the
 	// iterator when handling a new user key.
-	iter := engine.NewIterator(IterOptions{Prefix: true})
+	iter := rw.NewIterator(IterOptions{Prefix: true})
 	defer iter.Close()
 
 	var count int64
@@ -3009,7 +3200,7 @@ func MVCCGarbageCollect(
 		// being removed. We had this faulty functionality at some point; it
 		// should no longer be necessary since the higher levels already make
 		// sure each individual GCRequest does bounded work.
-		if !gcKey.Timestamp.Less(hlc.Timestamp(meta.Timestamp)) {
+		if hlc.Timestamp(meta.Timestamp).LessEq(gcKey.Timestamp) {
 			// For version keys, don't allow GC'ing the meta key if it's
 			// not marked deleted. However, for inline values we allow it;
 			// they are internal and GCing them directly saves the extra
@@ -3029,7 +3220,7 @@ func MVCCGarbageCollect(
 				}
 			}
 			if !implicitMeta {
-				if err := engine.Clear(iter.UnsafeKey()); err != nil {
+				if err := rw.Clear(iter.UnsafeKey()); err != nil {
 					return err
 				}
 				count++
@@ -3067,7 +3258,7 @@ func MVCCGarbageCollect(
 			if !unsafeIterKey.IsValue() {
 				break
 			}
-			if !gcKey.Timestamp.Less(unsafeIterKey.Timestamp) {
+			if unsafeIterKey.Timestamp.LessEq(gcKey.Timestamp) {
 				if ms != nil {
 					// FIXME: use prevNanos instead of unsafeIterKey.Timestamp, except
 					// when it's a deletion.
@@ -3084,7 +3275,7 @@ func MVCCGarbageCollect(
 						valSize, nil, fromNS))
 				}
 				count++
-				if err := engine.Clear(unsafeIterKey); err != nil {
+				if err := rw.Clear(unsafeIterKey); err != nil {
 					return err
 				}
 			}
@@ -3099,13 +3290,13 @@ func MVCCGarbageCollect(
 // the split is roughly targetSize bytes. The returned key will never be chosen
 // from the key ranges listed in keys.NoSplitSpans.
 func MVCCFindSplitKey(
-	ctx context.Context, engine Reader, key, endKey roachpb.RKey, targetSize int64,
+	_ context.Context, reader Reader, key, endKey roachpb.RKey, targetSize int64,
 ) (roachpb.Key, error) {
 	if key.Less(roachpb.RKey(keys.LocalMax)) {
 		key = roachpb.RKey(keys.LocalMax)
 	}
 
-	it := engine.NewIterator(IterOptions{UpperBound: endKey.AsRawKey()})
+	it := reader.NewIterator(IterOptions{UpperBound: endKey.AsRawKey()})
 	defer it.Close()
 
 	// We want to avoid splitting at the first key in the range because that
@@ -3347,10 +3538,12 @@ func ComputeStatsGo(
 					ms.IntentAge += nowNanos/1e9 - meta.Timestamp.WallTime/1e9
 				}
 				if meta.KeyBytes != MVCCVersionTimestampSize {
-					return ms, errors.Errorf("expected mvcc metadata key bytes to equal %d; got %d", MVCCVersionTimestampSize, meta.KeyBytes)
+					return ms, errors.Errorf("expected mvcc metadata key bytes to equal %d; got %d "+
+						"(meta: %s)", MVCCVersionTimestampSize, meta.KeyBytes, &meta)
 				}
 				if meta.ValBytes != int64(len(unsafeValue)) {
-					return ms, errors.Errorf("expected mvcc metadata val bytes to equal %d; got %d", len(unsafeValue), meta.ValBytes)
+					return ms, errors.Errorf("expected mvcc metadata val bytes to equal %d; got %d "+
+						"(meta: %s)", len(unsafeValue), meta.ValBytes, &meta)
 				}
 				accrueGCAgeNanos = meta.Timestamp.WallTime
 			} else {
@@ -3513,11 +3706,11 @@ func checkForKeyCollisionsGo(
 				// encounter many intents during IMPORT INTO as we lock the key space we
 				// are importing into. Older write intents could however be found in the
 				// target key space, which will require appropriate resolution logic.
-				var writeIntentErr roachpb.WriteIntentError
-				var intent roachpb.Intent
-				intent.Txn = *mvccMeta.Txn
-				intent.Key = existingIter.Key().Key
-				writeIntentErr.Intents = append(writeIntentErr.Intents, intent)
+				writeIntentErr := roachpb.WriteIntentError{
+					Intents: []roachpb.Intent{
+						roachpb.MakePendingIntent(mvccMeta.Txn, roachpb.Span{Key: existingIter.Key().Key}),
+					},
+				}
 
 				return enginepb.MVCCStats{}, &writeIntentErr
 			} else {
@@ -3535,7 +3728,7 @@ func checkForKeyCollisionsGo(
 			//
 			// If the ts of the sst key is less than that of the tombstone it is
 			// changing existing data, and we treat this as a collision.
-			if len(existingValue) == 0 && !sstKey.Timestamp.Less(existingKey.Timestamp) {
+			if len(existingValue) == 0 && existingKey.Timestamp.LessEq(sstKey.Timestamp) {
 				existingIter.NextKey()
 				ok, extErr = existingIter.Valid()
 				ok2, sstErr = sstIter.Valid()

@@ -71,8 +71,14 @@ func initFetcher(
 
 	fetcherArgs := makeFetcherArgs(entries)
 
-	if err := fetcher.Init(reverseScan, false /*reverse*/, false, /* isCheck */
-		alloc, fetcherArgs...); err != nil {
+	if err := fetcher.Init(
+		reverseScan,
+		sqlbase.ScanLockingStrength_FOR_NONE,
+		false, /* returnRangeInfo */
+		false, /* isCheck */
+		alloc,
+		fetcherArgs...,
+	); err != nil {
 		return nil, err
 	}
 
@@ -159,7 +165,7 @@ func TestNextRowSingle(t *testing.T) {
 
 			if err := rf.StartScan(
 				context.TODO(),
-				client.NewTxn(ctx, kvDB, 0, client.RootTxn),
+				client.NewTxn(ctx, kvDB, 0),
 				roachpb.Spans{tableDesc.IndexSpan(tableDesc.PrimaryIndex.ID)},
 				false, /*limitBatches*/
 				0,     /*limitHint*/
@@ -279,7 +285,7 @@ func TestNextRowBatchLimiting(t *testing.T) {
 
 			if err := rf.StartScan(
 				context.TODO(),
-				client.NewTxn(ctx, kvDB, 0, client.RootTxn),
+				client.NewTxn(ctx, kvDB, 0),
 				roachpb.Spans{tableDesc.IndexSpan(tableDesc.PrimaryIndex.ID)},
 				true,  /*limitBatches*/
 				10,    /*limitHint*/
@@ -407,7 +413,7 @@ INDEX(c)
 
 	if err := rf.StartScan(
 		context.TODO(),
-		client.NewTxn(ctx, kvDB, 0, client.RootTxn),
+		client.NewTxn(ctx, kvDB, 0),
 		roachpb.Spans{indexSpan,
 			roachpb.Span{Key: midKey, EndKey: endKey},
 		},
@@ -508,6 +514,18 @@ func TestNextRowSecondaryIndex(t *testing.T) {
 		sqlutils.RowModuloFn(storingMods[1]),
 	)
 
+	// Add family definitions to each table.
+	tablesWithFamilies := make(map[string]*fetcherEntryArgs)
+	for tableName, table := range tables {
+		argCopy := *table
+		argCopy.schema = argCopy.schema + ", FAMILY (p), FAMILY (idx), FAMILY (s1), FAMILY (s2)"
+		familyName := tableName + "_with_families"
+		tablesWithFamilies[familyName] = &argCopy
+	}
+	for tableName, args := range tablesWithFamilies {
+		tables[tableName] = args
+	}
+
 	r := sqlutils.MakeSQLRunner(sqlDB)
 	// Initialize tables first.
 	for tableName, table := range tables {
@@ -559,7 +577,7 @@ func TestNextRowSecondaryIndex(t *testing.T) {
 
 			if err := rf.StartScan(
 				context.TODO(),
-				client.NewTxn(ctx, kvDB, 0, client.RootTxn),
+				client.NewTxn(ctx, kvDB, 0),
 				roachpb.Spans{tableDesc.IndexSpan(tableDesc.Indexes[0].ID)},
 				false, /*limitBatches*/
 				0,     /*limitHint*/
@@ -920,7 +938,7 @@ func TestNextRowInterleaved(t *testing.T) {
 
 			if err := rf.StartScan(
 				context.TODO(),
-				client.NewTxn(ctx, kvDB, 0, client.RootTxn),
+				client.NewTxn(ctx, kvDB, 0),
 				lookupSpans,
 				false, /*limitBatches*/
 				0,     /*limitHint*/
@@ -1039,8 +1057,9 @@ func TestRowFetcherReset(t *testing.T) {
 	// didn't reset.
 
 	fetcherArgs := makeFetcherArgs(args)
-	if err := resetFetcher.Init(false, false /*reverse*/, false, /* isCheck */
-		&da, fetcherArgs...); err != nil {
+	if err := resetFetcher.Init(
+		false /*reverse*/, 0 /* todo */, false /* returnRangeInfo */, false /* isCheck */, &da, fetcherArgs...,
+	); err != nil {
 		t.Fatal(err)
 	}
 

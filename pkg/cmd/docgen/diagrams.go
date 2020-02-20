@@ -333,7 +333,7 @@ var specs = []stmtSpec{
 	{
 		name:    "add_constraint",
 		stmt:    "alter_onetable_stmt",
-		replace: map[string]string{"relation_expr": "table_name", "alter_table_cmds": "'ADD' 'CONSTRAINT' constraint_name constraint_elem"},
+		replace: map[string]string{"relation_expr": "table_name", "alter_table_cmds": "'ADD' 'CONSTRAINT' constraint_name constraint_elem opt_validate_behavior"},
 		unlink:  []string{"table_name"},
 	},
 	{
@@ -350,9 +350,13 @@ var specs = []stmtSpec{
 		unlink: []string{"table_name"},
 	},
 	{
-		name:    "alter_user_password_stmt",
-		replace: map[string]string{"string_or_placeholder 'WITH'": "name 'WITH'", "'PASSWORD' string_or_placeholder": "'PASSWORD' password"},
-		unlink:  []string{"name", "password"},
+		name:   "alter_user_password_stmt",
+		inline: []string{"password_clause", "opt_with"},
+		replace: map[string]string{
+			"string_or_placeholder 'WITH'":      "name 'WITH'",
+			"string_or_placeholder  'PASSWORD'": "name 'PASSWORD'",
+			"'PASSWORD' string_or_placeholder":  "'PASSWORD' password"},
+		unlink: []string{"name", "password"},
 	},
 	{
 		name:    "alter_sequence_options_stmt",
@@ -479,9 +483,10 @@ var specs = []stmtSpec{
 		inline: []string{"col_qualification_elem"},
 	},
 	{
-		name:   "comment_stmt",
-		stmt:   "comment_stmt",
-		unlink: []string{"column_path"},
+		name:    "comment",
+		stmt:    "comment_stmt",
+		replace: map[string]string{"column_path": "column_name"},
+		unlink:  []string{"column_path"},
 	},
 	{
 		name:   "commit_transaction",
@@ -494,6 +499,14 @@ var specs = []stmtSpec{
 		stmt:    "cancel_jobs_stmt",
 		replace: map[string]string{"a_expr": "job_id"},
 		unlink:  []string{"job_id"},
+	},
+	{
+		name:   "create_as_col_qual_list",
+		inline: []string{"create_as_col_qualification", "create_as_col_qualification_elem"},
+	},
+	{
+		name:   "create_as_constraint_def",
+		inline: []string{"create_as_constraint_elem"},
 	},
 	{name: "cancel_query", stmt: "cancel_queries_stmt", replace: map[string]string{"a_expr": "query_id"}, unlink: []string{"query_id"}},
 	{name: "cancel_session", stmt: "cancel_sessions_stmt", replace: map[string]string{"a_expr": "session_id"}, unlink: []string{"session_id"}},
@@ -563,7 +576,7 @@ var specs = []stmtSpec{
 	},
 	{
 		name:   "create_table_as_stmt",
-		inline: []string{"opt_column_list", "name_list"},
+		inline: []string{"create_as_opt_col_list", "create_as_table_defs"},
 	},
 	{
 		name:   "create_table_stmt",
@@ -582,7 +595,7 @@ var specs = []stmtSpec{
 	},
 	{
 		name:   "create_user_stmt",
-		inline: []string{"opt_with", "opt_password"},
+		inline: []string{"opt_with", "password_clause", "opt_password"},
 		replace: map[string]string{
 			"'PASSWORD' string_or_placeholder": "'PASSWORD' password",
 			"'USER' string_or_placeholder":     "'USER' name",
@@ -657,10 +670,7 @@ var specs = []stmtSpec{
 		regreplace: map[string]string{
 			regList: "",
 		},
-		replace: map[string]string{
-			"qualified_name": "table_name",
-		},
-		unlink: []string{"table_name", "index_name"},
+		replace: map[string]string{"standalone_index_name": "index_name"},
 	},
 	{
 		name:    "drop_role_stmt",
@@ -714,8 +724,8 @@ var specs = []stmtSpec{
 	{
 		name:    "alter_index_partition_by",
 		stmt:    "alter_oneindex_stmt",
-		inline:  []string{"alter_index_cmds", "alter_index_cmd", "partition_by"},
-		replace: map[string]string{"table_index_name": "table_name '@' index_name"},
+		inline:  []string{"alter_index_cmds", "alter_index_cmd", "partition_by", "table_index_name"},
+		replace: map[string]string{"standalone_index_name": "index_name"},
 	},
 	{
 		name:    "create_table_partition_by",
@@ -729,14 +739,17 @@ var specs = []stmtSpec{
 		name:   "explain_stmt",
 		inline: []string{"explain_option_list"},
 		replace: map[string]string{
-			"explain_option_name": "( 'VERBOSE' | 'TYPES' | 'OPT' | 'DISTSQL' )",
+			"explain_option_name": "( 'VERBOSE' | 'TYPES' | 'OPT' | 'DISTSQL' | 'VEC' )",
 		},
-		exclude: []*regexp.Regexp{regexp.MustCompile("'ANALYZE'")},
+		exclude: []*regexp.Regexp{
+			regexp.MustCompile("'ANALYZE'"),
+			regexp.MustCompile("'ANALYSE'"),
+		},
 	},
 	{
 		name:  "explain_analyze_stmt",
 		stmt:  "explain_stmt",
-		match: []*regexp.Regexp{regexp.MustCompile("ANALYZE")},
+		match: []*regexp.Regexp{regexp.MustCompile("'ANALY[SZ]E'")},
 		replace: map[string]string{
 			"explain_option_list": "'DISTSQL'",
 		},
@@ -919,8 +932,8 @@ var specs = []stmtSpec{
 		stmt:    "alter_rename_index_stmt",
 		match:   []*regexp.Regexp{regexp.MustCompile("'ALTER' 'INDEX'")},
 		inline:  []string{"table_index_name"},
-		replace: map[string]string{"qualified_name": "table_name", "'@' name": "'@' index_name"},
-		unlink:  []string{"table_name", "index_name"}},
+		replace: map[string]string{"standalone_index_name": "index_name"},
+	},
 	{
 		name:    "rename_sequence",
 		stmt:    "alter_rename_sequence_stmt",
@@ -1115,11 +1128,8 @@ var specs = []stmtSpec{
 		stmt: "show_csettings_stmt",
 	},
 	{
-		name:    "show_columns",
-		stmt:    "show_stmt",
-		match:   []*regexp.Regexp{regexp.MustCompile("'SHOW' 'COLUMNS'")},
-		replace: map[string]string{"var_name": "table_name"},
-		unlink:  []string{"table_name"},
+		name:   "show_columns_stmt",
+		inline: []string{"with_comment"},
 	},
 	{
 		name:    "show_constraints",
@@ -1134,9 +1144,8 @@ var specs = []stmtSpec{
 		unlink:  []string{"object_name"},
 	},
 	{
-		name:  "show_databases",
-		stmt:  "show_stmt",
-		match: []*regexp.Regexp{regexp.MustCompile("'SHOW' 'DATABASES'")},
+		name:   "show_databases_stmt",
+		inline: []string{"with_comment"},
 	},
 	{
 		name:    "show_backup",
@@ -1161,6 +1170,10 @@ var specs = []stmtSpec{
 		unlink: []string{"role_name", "table_name", "database_name", "user_name"},
 	},
 	{
+		name: "show_indexes",
+		stmt: "show_indexes_stmt",
+	},
+	{
 		name:    "show_index",
 		stmt:    "show_stmt",
 		match:   []*regexp.Regexp{regexp.MustCompile("'SHOW' 'INDEX'")},
@@ -1173,6 +1186,14 @@ var specs = []stmtSpec{
 		match: []*regexp.Regexp{regexp.MustCompile("'SHOW' 'KEYS'")},
 	},
 	{
+		name:    "show_locality",
+		stmt:    "show_roles_stmt",
+		replace: map[string]string{"'ROLES'": "'LOCALITY'"},
+	},
+	{
+		name: "show_partitions_stmt",
+	},
+	{
 		name:   "show_queries",
 		stmt:   "show_queries_stmt",
 		inline: []string{"opt_cluster"},
@@ -1183,6 +1204,13 @@ var specs = []stmtSpec{
 	{
 		name: "show_ranges_stmt",
 		stmt: "show_ranges_stmt",
+	},
+	{
+		name:    "show_range_for_row_stmt",
+		stmt:    "show_range_for_row_stmt",
+		inline:  []string{"expr_list"},
+		replace: map[string]string{"a_expr": "row_vals"},
+		unlink:  []string{"row_vals"},
 	},
 	{
 		name: "show_schemas",
@@ -1236,8 +1264,7 @@ var specs = []stmtSpec{
 		name:    "split_index_at",
 		stmt:    "alter_split_index_stmt",
 		inline:  []string{"table_index_name"},
-		replace: map[string]string{"qualified_name": "table_name", "'@' name": "'@' index_name"},
-		unlink:  []string{"table_name", "index_name"},
+		replace: map[string]string{"standalone_index_name": "index_name"},
 	},
 	{
 		name:   "split_table_at",
@@ -1265,6 +1292,17 @@ var specs = []stmtSpec{
 		stmt: "stmt_block",
 		replace: map[string]string{"	stmt": "	'CREATE' 'TABLE' table_name '(' ( column_def ( ',' column_def )* ) ( 'CONSTRAINT' name | ) 'UNIQUE' '(' ( column_name ( ',' column_name )* ) ')' ( table_constraints | ) ')'"},
 		unlink: []string{"table_name", "check_expr", "table_constraints"},
+	},
+	{
+		name:    "unsplit_index_at",
+		stmt:    "alter_unsplit_index_stmt",
+		inline:  []string{"table_index_name"},
+		replace: map[string]string{"standalone_index_name": "index_name"},
+	},
+	{
+		name:   "unsplit_table_at",
+		stmt:   "alter_unsplit_stmt",
+		unlink: []string{"table_name"},
 	},
 	{
 		name: "update_stmt",
@@ -1312,6 +1350,14 @@ var specs = []stmtSpec{
 		stmt:    "alter_onetable_stmt",
 		replace: map[string]string{"alter_table_cmds": "'VALIDATE' 'CONSTRAINT' constraint_name", "relation_expr": "table_name"},
 		unlink:  []string{"constraint_name", "table_name"},
+	},
+	{
+		name:   "window_definition",
+		inline: []string{"window_specification"},
+	},
+	{
+		name:   "opt_frame_clause",
+		inline: []string{"frame_extent"},
 	},
 }
 

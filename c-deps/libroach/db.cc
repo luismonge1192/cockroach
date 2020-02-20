@@ -501,8 +501,9 @@ DBStatus DBEnvWriteFile(DBEngine* db, DBSlice path, DBSlice contents) {
   return db->EnvWriteFile(path, contents);
 }
 
-DBStatus DBEnvOpenFile(DBEngine* db, DBSlice path, DBWritableFile* file) {
-  return db->EnvOpenFile(path, (rocksdb::WritableFile**)file);
+DBStatus DBEnvOpenFile(DBEngine* db, DBSlice path,  uint64_t bytes_per_sync,
+                       DBWritableFile* file) {
+  return db->EnvOpenFile(path, bytes_per_sync, (rocksdb::WritableFile**)file);
 }
 
 DBStatus DBEnvReadFile(DBEngine* db, DBSlice path, DBSlice* contents) {
@@ -937,6 +938,10 @@ DBSstFileWriter* DBSstFileWriterNew() {
   table_options.format_version = 0;
   table_options.checksum = rocksdb::kCRC32c;
   table_options.whole_key_filtering = false;
+  // This makes the sstables produced by Pebble and RocksDB byte-by-byte identical, which is
+  // useful for testing.
+  table_options.index_shortening =
+      rocksdb::BlockBasedTableOptions::IndexShorteningMode::kShortenSeparatorsAndSuccessor;
 
   rocksdb::Options* options = new rocksdb::Options();
   options->comparator = &kComparator;
@@ -1024,7 +1029,7 @@ DBStatus DBSstFileWriterCopyData(DBSstFileWriter* fw, DBString* data) {
     return ToDBStatus(status);
   }
   if (sst_contents.size() != file_size) {
-    return FmtStatus("expected to read %" PRIu64 " bytes but got %zu", file_size,
+        return FmtStatus("expected to read %" PRIu64 " bytes but got %zu", file_size,
                      sst_contents.size());
   }
 
@@ -1071,9 +1076,10 @@ DBStatus DBUnlockFile(DBFileLock lock) {
   return ToDBStatus(rocksdb::Env::Default()->UnlockFile((rocksdb::FileLock*)lock));
 }
 
-DBStatus DBExportToSst(DBKey start, DBKey end, bool export_all_revisions, DBIterOptions iter_opts,
-                       DBEngine* engine, DBString* data, DBString* write_intent,
-                       DBString* summary) {
+DBStatus DBExportToSst(DBKey start, DBKey end, bool export_all_revisions,
+                       uint64_t target_size, uint64_t max_size,
+                       DBIterOptions iter_opts, DBEngine* engine, DBString* data,
+                       DBString* write_intent, DBString* summary, DBString* resume) {
   DBSstFileWriter* writer = DBSstFileWriterNew();
   DBStatus status = DBSstFileWriterOpen(writer);
   if (status.data != NULL) {
@@ -1088,14 +1094,23 @@ DBStatus DBExportToSst(DBKey start, DBKey end, bool export_all_revisions, DBIter
   bool skip_current_key_versions = !export_all_revisions;
   DBIterState state;
   const std::string end_key = EncodeKey(end);
-  for (state = iter.seek(start);; state = iter.next(skip_current_key_versions)) {
+  // cur_key is used when paginated is true and export_all_revisions is
+  // true. If we're exporting all revisions and we're returning a paginated
+  // SST then we need to keep track of when we've finished adding all of the
+  // versions of a key to the writer.
+  const bool paginated = target_size > 0;
+  std::string cur_key;
+  std::string resume_key;
+  // Seek to the MVCC metadata key for the provided start key and let the
+  // incremental iterator find the appropriate version.
+  const DBKey seek_key = {.key = start.key};
+  for (state = iter.seek(seek_key);; state = iter.next(skip_current_key_versions)) {
     if (state.status.data != NULL) {
       DBSstFileWriterClose(writer);
       return state.status;
     } else if (!state.valid || kComparator.Compare(iter.key(), end_key) >= 0) {
       break;
     }
-
     rocksdb::Slice decoded_key;
     int64_t wall_time = 0;
     int32_t logical_time = 0;
@@ -1105,11 +1120,30 @@ DBStatus DBExportToSst(DBKey start, DBKey end, bool export_all_revisions, DBIter
       return ToDBString("Unable to decode key");
     }
 
+    const bool is_new_key = !export_all_revisions || decoded_key.compare(cur_key) != 0;
+    if (paginated && export_all_revisions && is_new_key) {
+      // Reuse the underlying buffer in cur_key.
+      cur_key.clear();
+      cur_key.reserve(decoded_key.size());
+      cur_key.assign(decoded_key.data(), decoded_key.size());
+    }
+
     // Skip tombstone (len=0) records when start time is zero (non-incremental)
     // and we are not exporting all versions.
-    bool is_skipping_deletes = start.wall_time == 0 && start.logical == 0 && !export_all_revisions;
+    const bool is_skipping_deletes =
+        start.wall_time == 0 && start.logical == 0 && !export_all_revisions;
     if (is_skipping_deletes && iter.value().size() == 0) {
       continue;
+    }
+
+    // Check to see if this is the first version of key and adding it would
+    // put us over the limit (we might already be over the limit).
+    const int64_t cur_size = bulkop_summary.data_size();
+    const bool reached_target_size = cur_size > 0 && cur_size >= target_size;
+    if (paginated && is_new_key && reached_target_size) {
+      resume_key.reserve(decoded_key.size());
+      resume_key.assign(decoded_key.data(), decoded_key.size());
+      break;
     }
 
     // Insert key into sst and update statistics.
@@ -1122,8 +1156,12 @@ DBStatus DBExportToSst(DBKey start, DBKey end, bool export_all_revisions, DBIter
     if (!row_counter.Count((iter.key()), &bulkop_summary)) {
       return ToDBString("Error in row counter");
     }
-    bulkop_summary.set_data_size(bulkop_summary.data_size() + decoded_key.size() +
-                                 iter.value().size());
+    const int64_t new_size = cur_size + decoded_key.size() + iter.value().size();
+    if (max_size > 0 && new_size > max_size) {
+      return FmtStatus("export size (%" PRIi64 " bytes) exceeds max size (%" PRIi64 " bytes)",
+                       new_size, max_size);
+    }
+    bulkop_summary.set_data_size(new_size);
   }
   *summary = ToDBString(bulkop_summary.SerializeAsString());
 
@@ -1135,5 +1173,62 @@ DBStatus DBExportToSst(DBKey start, DBKey end, bool export_all_revisions, DBIter
   auto res = DBSstFileWriterFinish(writer, data);
   DBSstFileWriterClose(writer);
 
+  // If we're not returning an error, check to see if we need to return the resume key.
+  if (res.data == NULL && resume_key.length() > 0) {
+    *resume = ToDBString(resume_key);
+  }
+
   return res;
+}
+
+DBStatus DBEnvOpenReadableFile(DBEngine* db, DBSlice path, DBReadableFile* file) {
+  return db->EnvOpenReadableFile(path, (rocksdb::RandomAccessFile**)file);
+}
+
+DBStatus DBEnvReadAtFile(DBEngine* db, DBReadableFile file, DBSlice buffer, int64_t offset,
+                         int* n) {
+  return db->EnvReadAtFile((rocksdb::RandomAccessFile*)file, buffer, offset, n);
+}
+
+DBStatus DBEnvCloseReadableFile(DBEngine* db, DBReadableFile file) {
+  return db->EnvCloseReadableFile((rocksdb::RandomAccessFile*)file);
+}
+
+DBStatus DBEnvOpenDirectory(DBEngine* db, DBSlice path, DBDirectory* file) {
+  return db->EnvOpenDirectory(path, (rocksdb::Directory**)file);
+}
+
+DBStatus DBEnvSyncDirectory(DBEngine* db, DBDirectory file) {
+  return db->EnvSyncDirectory((rocksdb::Directory*)file);
+}
+
+DBStatus DBEnvCloseDirectory(DBEngine* db, DBDirectory file) {
+  return db->EnvCloseDirectory((rocksdb::Directory*)file);
+}
+
+DBStatus DBEnvRenameFile(DBEngine* db, DBSlice oldname, DBSlice newname) {
+  return db->EnvRenameFile(oldname, newname);
+}
+
+DBStatus DBEnvCreateDir(DBEngine* db, DBSlice name) {
+  return db->EnvCreateDir(name);
+}
+
+DBStatus DBEnvDeleteDir(DBEngine* db, DBSlice name) {
+  return db->EnvDeleteDir(name);
+}
+
+DBListDirResults DBEnvListDir(DBEngine* db, DBSlice name) {
+  DBListDirResults result;
+  std::vector<std::string> contents;
+  result.status = db->EnvListDir(name, &contents);
+  result.n = contents.size();
+  // We malloc the names so it can be deallocated by the caller using free().
+  const int size = contents.size() * sizeof(DBString);
+  result.names = reinterpret_cast<DBString*>(malloc(size));
+  memset(result.names, 0, size);
+  for (int i = 0; i < contents.size(); i++) {
+    result.names[i] = ToDBString(rocksdb::Slice(contents[i].data(), contents[i].size()));
+  }
+  return result;
 }

@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 )
 
 // {{/*
@@ -49,6 +50,9 @@ var _ apd.Decimal
 
 // Dummy import to pull in "time" package.
 var _ time.Time
+
+// Dummy import to pull in "duration" package.
+var _ duration.Duration
 
 // Dummy import to pull in "math" package.
 var _ = math.MaxInt64
@@ -584,9 +588,54 @@ func (o *mergeJoin_JOIN_TYPE_STRING_FILTER_INFO_STRINGOp) probeBodyLSel_IS_L_SEL
 	rSel := o.proberState.rBatch.Selection()
 EqLoop:
 	for eqColIdx := 0; eqColIdx < len(o.left.eqCols); eqColIdx++ {
-		lVec := o.proberState.lBatch.ColVec(int(o.left.eqCols[eqColIdx]))
-		rVec := o.proberState.rBatch.ColVec(int(o.right.eqCols[eqColIdx]))
-		colType := o.left.sourceTypes[int(o.left.eqCols[eqColIdx])]
+		leftColIdx := o.left.eqCols[eqColIdx]
+		rightColIdx := o.right.eqCols[eqColIdx]
+		lVec := o.proberState.lBatch.ColVec(int(leftColIdx))
+		rVec := o.proberState.rBatch.ColVec(int(rightColIdx))
+		leftPhysType := o.left.sourceTypes[leftColIdx]
+		rightPhysType := o.right.sourceTypes[rightColIdx]
+		colType := leftPhysType
+		// Merge joiner only supports the case when the physical types in the
+		// equality columns in both inputs are the same. If that is not the case,
+		// we need to cast one of the vectors to another's physical type putting
+		// the result of the cast into a temporary vector that is used instead of
+		// the original.
+		if leftPhysType != rightPhysType {
+			castLeftToRight := false
+			// There is a hierarchy of valid casts:
+			//   Int16 -> Int32 -> Int64 -> Float64 -> Decimal
+			// and the cast is valid if 'fromType' is mentioned before 'toType'
+			// in this chain.
+			switch leftPhysType {
+			case coltypes.Int16:
+				castLeftToRight = true
+			case coltypes.Int32:
+				castLeftToRight = rightPhysType != coltypes.Int16
+			case coltypes.Int64:
+				castLeftToRight = rightPhysType != coltypes.Int16 && rightPhysType != coltypes.Int32
+			case coltypes.Float64:
+				castLeftToRight = rightPhysType == coltypes.Decimal
+			}
+			toType := leftPhysType
+			if castLeftToRight {
+				toType = rightPhysType
+			}
+			tempVec := o.scratch.tempVecByType[toType]
+			if tempVec == nil {
+				tempVec = o.allocator.NewMemColumn(toType, int(coldata.BatchSize()))
+				o.scratch.tempVecByType[toType] = tempVec
+			} else {
+				tempVec.Nulls().UnsetNulls()
+			}
+			if castLeftToRight {
+				cast(leftPhysType, rightPhysType, lVec, tempVec, o.proberState.lBatch.Length(), lSel)
+				lVec = tempVec
+				colType = o.right.sourceTypes[rightColIdx]
+			} else {
+				cast(rightPhysType, leftPhysType, rVec, tempVec, o.proberState.rBatch.Length(), rSel)
+				rVec = tempVec
+			}
+		}
 		if lVec.MaybeHasNulls() {
 			if rVec.MaybeHasNulls() {
 				_PROBE_SWITCH(_JOIN_TYPE, _FILTER_INFO, _SEL_ARG, true, true)
@@ -743,8 +792,8 @@ func (o *mergeJoin_JOIN_TYPE_STRING_FILTER_INFO_STRINGOp) buildLeftGroups(
 	sel := batch.Selection()
 	initialBuilderState := o.builderState.left
 	outputBatchSize := int(o.outputBatchSize)
-	o.allocator.performOperation(
-		o.output.ColVecs()[:len(input.outCols)],
+	o.allocator.PerformOperation(
+		o.output.ColVecs()[colOffset:colOffset+len(input.outCols)],
 		func() {
 			// Loop over every column.
 		LeftColLoop:
@@ -752,7 +801,7 @@ func (o *mergeJoin_JOIN_TYPE_STRING_FILTER_INFO_STRINGOp) buildLeftGroups(
 				outStartIdx := int(destStartIdx)
 				out := o.output.ColVec(outColIdx)
 				var src coldata.Vec
-				if batch.Width() > int(inColIdx) {
+				if batch.Length() > 0 {
 					src = batch.ColVec(int(inColIdx))
 				}
 				colType := input.sourceTypes[inColIdx]
@@ -830,20 +879,7 @@ func _RIGHT_SWITCH(_JOIN_TYPE joinTypeInfo, _HAS_SELECTION bool, _HAS_NULLS bool
 						// {{ end }}
 						{
 							v := execgen.UNSAFEGET(srcCol, int(sel[o.builderState.right.curSrcStartIdx]))
-							// We are in the fast path (we're setting a single element), so in
-							// order to not kill the performance, we only update the memory
-							// account in case of Bytes type (other types will not change the
-							// amount of memory accounted for).
-							// {{ if eq .LTyp.String "Bytes" }}
-							o.allocator.performOperation(
-								[]coldata.Vec{out},
-								func() {
-									// {{ end }}
-									execgen.SET(outCol, outStartIdx, v)
-									// {{ if eq .LTyp.String "Bytes" }}
-								},
-							)
-							// {{ end }}
+							execgen.SET(outCol, outStartIdx, v)
 						}
 						// {{ else }}
 						// {{ if _HAS_NULLS }}
@@ -853,25 +889,11 @@ func _RIGHT_SWITCH(_JOIN_TYPE joinTypeInfo, _HAS_SELECTION bool, _HAS_NULLS bool
 						// {{ end }}
 						{
 							v := execgen.UNSAFEGET(srcCol, o.builderState.right.curSrcStartIdx)
-							// We are in the fast path (we're setting a single element), so in
-							// order to not kill the performance, we only update the memory
-							// account in case of Bytes type (other types will not change the
-							// amount of memory accounted for).
-							// {{ if eq .LTyp.String "Bytes" }}
-							o.allocator.performOperation(
-								[]coldata.Vec{out},
-								func() {
-									// {{ end }}
-									execgen.SET(outCol, outStartIdx, v)
-									// {{ if eq .LTyp.String "Bytes" }}
-								},
-							)
-							// {{ end }}
+							execgen.SET(outCol, outStartIdx, v)
 						}
 						// {{ end }}
 					} else {
-						o.allocator.Copy(
-							out,
+						out.Copy(
 							coldata.CopySliceArgs{
 								SliceArgs: coldata.SliceArgs{
 									ColType:     colType,
@@ -948,34 +970,38 @@ func (o *mergeJoin_JOIN_TYPE_STRING_FILTER_INFO_STRINGOp) buildRightGroups(
 	sel := batch.Selection()
 	outputBatchSize := int(o.outputBatchSize)
 
-	// Loop over every column.
-RightColLoop:
-	for outColIdx, inColIdx := range input.outCols {
-		outStartIdx := int(destStartIdx)
-		out := o.output.ColVec(outColIdx + colOffset)
-		var src coldata.Vec
-		if batch.Width() > int(inColIdx) {
-			src = batch.ColVec(int(inColIdx))
-		}
-		colType := input.sourceTypes[inColIdx]
+	o.allocator.PerformOperation(
+		o.output.ColVecs()[colOffset:colOffset+len(input.outCols)],
+		func() {
+			// Loop over every column.
+		RightColLoop:
+			for outColIdx, inColIdx := range input.outCols {
+				outStartIdx := int(destStartIdx)
+				out := o.output.ColVec(outColIdx + colOffset)
+				var src coldata.Vec
+				if batch.Length() > 0 {
+					src = batch.ColVec(int(inColIdx))
+				}
+				colType := input.sourceTypes[inColIdx]
 
-		if sel != nil {
-			if src != nil && src.MaybeHasNulls() {
-				_RIGHT_SWITCH(_JOIN_TYPE, true, true)
-			} else {
-				_RIGHT_SWITCH(_JOIN_TYPE, true, false)
-			}
-		} else {
-			if src != nil && src.MaybeHasNulls() {
-				_RIGHT_SWITCH(_JOIN_TYPE, false, true)
-			} else {
-				_RIGHT_SWITCH(_JOIN_TYPE, false, false)
-			}
-		}
+				if sel != nil {
+					if src != nil && src.MaybeHasNulls() {
+						_RIGHT_SWITCH(_JOIN_TYPE, true, true)
+					} else {
+						_RIGHT_SWITCH(_JOIN_TYPE, true, false)
+					}
+				} else {
+					if src != nil && src.MaybeHasNulls() {
+						_RIGHT_SWITCH(_JOIN_TYPE, false, true)
+					} else {
+						_RIGHT_SWITCH(_JOIN_TYPE, false, false)
+					}
+				}
 
-		o.builderState.right.setBuilderColumnState(initialBuilderState)
-	}
-	o.builderState.right.reset()
+				o.builderState.right.setBuilderColumnState(initialBuilderState)
+			}
+			o.builderState.right.reset()
+		})
 }
 
 // {{ end }}
@@ -1092,8 +1118,8 @@ func (o *mergeJoin_JOIN_TYPE_STRING_FILTER_INFO_STRINGOp) setBuilderSourceToBuff
 	// We cannot yet reset the buffered groups because the builder will be taking
 	// input from them. The actual reset will take place on the next call to
 	// initProberState().
-	o.proberState.lBufferedGroup.needToReset = true
-	o.proberState.rBufferedGroup.needToReset = true
+	o.proberState.lBufferedGroupNeedToReset = true
+	o.proberState.rBufferedGroupNeedToReset = true
 }
 
 // exhaustLeftSource sets up the builder to process any remaining tuples from

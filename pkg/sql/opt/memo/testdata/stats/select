@@ -417,7 +417,7 @@ select
  │         ├── stats: [rows=990, distinct(1)=99, null(1)=0, distinct(2)=430.972148, null(2)=0, distinct(6)=99, null(6)=0]
  │         ├── key: (8)
  │         ├── fd: (1)-->(2,3), (8)-->(4-7), (1)==(6), (6)==(1)
- │         ├── inner-join (hash)
+ │         ├── inner-join (cross)
  │         │    ├── columns: id:1(int!null) name:2(string) state:3(string) order_id:4(int) item_id:5(int) customer_id:6(int) year:7(int) rowid:8(int!null)
  │         │    ├── stats: [rows=10000000, distinct(1)=10000, null(1)=0, distinct(2)=500, null(2)=0, distinct(6)=100, null(6)=100000, distinct(8)=1000, null(8)=0]
  │         │    ├── key: (1,8)
@@ -465,7 +465,7 @@ select
  │         ├── stats: [rows=990, distinct(1)=99, null(1)=0, distinct(2)=430.972148, null(2)=0, distinct(6)=99, null(6)=0]
  │         ├── key: (8)
  │         ├── fd: (1)-->(2,3), (8)-->(4-7), (1)==(6), (6)==(1)
- │         ├── inner-join (hash)
+ │         ├── inner-join (cross)
  │         │    ├── columns: id:1(int!null) name:2(string) state:3(string) order_id:4(int) item_id:5(int) customer_id:6(int) year:7(int) rowid:8(int!null)
  │         │    ├── stats: [rows=10000000, distinct(1)=10000, null(1)=0, distinct(2)=500, null(2)=0, distinct(6)=100, null(6)=100000, distinct(8)=1000, null(8)=0]
  │         │    ├── key: (1,8)
@@ -766,6 +766,7 @@ WHERE
 inner-join (lookup lineitem)
  ├── columns: l_shipdate:11(date!null) l_commitdate:12(date!null) l_orderkey:1(int!null) l_linenumber:4(int!null) l_quantity:5(float!null)
  ├── key columns: [1 4] = [1 4]
+ ├── lookup columns are key
  ├── stats: [rows=0.1, distinct(11)=0.1, null(11)=0, distinct(12)=0.1, null(12)=0, distinct(11,12)=0.1, null(11,12)=0]
  ├── key: (1,4)
  ├── fd: ()-->(11,12), (1,4)-->(5)
@@ -854,6 +855,7 @@ SELECT * FROM tjson WHERE b @> '{"a":"b", "c":"d"}'
 inner-join (lookup tjson)
  ├── columns: a:1(int!null) b:2(jsonb) c:3(jsonb)
  ├── key columns: [1] = [1]
+ ├── lookup columns are key
  ├── stats: [rows=61.7283951]
  ├── key: (1)
  ├── fd: (1)-->(2,3)
@@ -1089,7 +1091,7 @@ select
  │         ├── stats: [rows=990, distinct(1)=99, null(1)=0, distinct(2)=430.972148, null(2)=198, distinct(6)=99, null(6)=0]
  │         ├── key: (8)
  │         ├── fd: (1)-->(2,3), (8)-->(4-7), (1)==(6), (6)==(1)
- │         ├── inner-join (hash)
+ │         ├── inner-join (cross)
  │         │    ├── columns: id:1(int!null) name:2(string) state:3(string) order_id:4(int) item_id:5(int) customer_id:6(int) year:7(int) rowid:8(int!null)
  │         │    ├── stats: [rows=10000000, distinct(1)=10000, null(1)=0, distinct(2)=500, null(2)=2000000, distinct(6)=100, null(6)=100000, distinct(8)=1000, null(8)=0]
  │         │    ├── key: (1,8)
@@ -1137,7 +1139,7 @@ select
  │         ├── stats: [rows=990, distinct(1)=99, null(1)=0, distinct(2)=430.972148, null(2)=198, distinct(6)=99, null(6)=0]
  │         ├── key: (8)
  │         ├── fd: (1)-->(2,3), (8)-->(4-7), (1)==(6), (6)==(1)
- │         ├── inner-join (hash)
+ │         ├── inner-join (cross)
  │         │    ├── columns: id:1(int!null) name:2(string) state:3(string) order_id:4(int) item_id:5(int) customer_id:6(int) year:7(int) rowid:8(int!null)
  │         │    ├── stats: [rows=10000000, distinct(1)=10000, null(1)=0, distinct(2)=500, null(2)=2000000, distinct(6)=100, null(6)=100000, distinct(8)=1000, null(8)=0]
  │         │    ├── key: (1,8)
@@ -1421,8 +1423,8 @@ with &1 (t)
  ├── fd: ()-->(6)
  ├── project
  │    ├── columns: x:5(bool)
- │    ├── stats: [rows=4e+20, distinct(5)=3, null(5)=4e+18]
- │    ├── left-join (hash)
+ │    ├── stats: [rows=4e+20]
+ │    ├── left-join (cross)
  │    │    ├── columns: t1.x:1(bool) t2.x:3(bool)
  │    │    ├── stats: [rows=4e+20]
  │    │    ├── scan t1
@@ -1554,3 +1556,179 @@ select
  │    └── fd: (1)-->(2-4)
  └── filters
       └── (n_name, neighbor) IN (('FRANCE', 'GERMANY'), ('GERMANY', 'FRANCE')) [type=bool, outer=(2,4), constraints=(/2/4: [/'FRANCE'/'GERMANY' - /'FRANCE'/'GERMANY'] [/'GERMANY'/'FRANCE' - /'GERMANY'/'FRANCE']; /4: [/'FRANCE' - /'FRANCE'] [/'GERMANY' - /'GERMANY']; tight)]
+
+# Make sure the that histogram and distinct counts don't interfere with each
+# other during selectivity calculation.
+exec-ddl
+CREATE TABLE hist_and_distinct (
+  a INT,
+  b INT,
+  c INT,
+  d INT,
+  INDEX idx_a (a)
+)
+----
+
+exec-ddl
+ALTER TABLE hist_and_distinct INJECT STATISTICS '[
+  {
+    "columns": ["a"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 1000,
+    "distinct_count": 40,
+    "histo_col_type": "int",
+    "histo_buckets": [
+      {"num_eq": 0, "num_range": 0, "distinct_range": 0, "upper_bound": "0"},
+      {"num_eq": 10, "num_range": 90, "distinct_range": 9, "upper_bound": "10"},
+      {"num_eq": 20, "num_range": 180, "distinct_range": 9, "upper_bound": "20"},
+      {"num_eq": 30, "num_range": 270, "distinct_range": 9, "upper_bound": "30"},
+      {"num_eq": 40, "num_range": 360, "distinct_range": 9, "upper_bound": "40"}
+    ]
+  },
+  {
+    "columns": ["b"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 1000,
+    "distinct_count": 5
+  },
+  {
+    "columns": ["c"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 1000,
+    "distinct_count": 5
+  },
+  {
+    "columns": ["d"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 1000,
+    "distinct_count": 120
+  }
+]'
+----
+
+norm
+SELECT * FROM hist_and_distinct WHERE a = 10 AND b = 10 AND c = 10 AND d >= 10 AND d < 100
+----
+select
+ ├── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(int!null)
+ ├── stats: [rows=0.3, distinct(1)=0.3, null(1)=0, distinct(2)=0.3, null(2)=0, distinct(3)=0.3, null(3)=0, distinct(4)=0.3, null(4)=0]
+ │   histogram(1)=  0 0.3
+ │                <--- 10
+ ├── fd: ()-->(1-3)
+ ├── scan hist_and_distinct
+ │    ├── columns: a:1(int) b:2(int) c:3(int) d:4(int)
+ │    └── stats: [rows=1000, distinct(1)=40, null(1)=0, distinct(2)=5, null(2)=0, distinct(3)=5, null(3)=0, distinct(4)=120, null(4)=0]
+ │        histogram(1)=  0  0  90  10  180  20  270  30  360  40
+ │                     <--- 0 ---- 10 ----- 20 ----- 30 ----- 40
+ └── filters
+      ├── (d >= 10) AND (d < 100) [type=bool, outer=(4), constraints=(/4: [/10 - /99]; tight)]
+      ├── a = 10 [type=bool, outer=(1), constraints=(/1: [/10 - /10]; tight), fd=()-->(1)]
+      ├── b = 10 [type=bool, outer=(2), constraints=(/2: [/10 - /10]; tight), fd=()-->(2)]
+      └── c = 10 [type=bool, outer=(3), constraints=(/3: [/10 - /10]; tight), fd=()-->(3)]
+
+# Test that a histogram on a boolean column is used.
+exec-ddl
+CREATE TABLE hist_bool (a INT, b BOOL)
+----
+
+exec-ddl
+ALTER TABLE hist_bool INJECT STATISTICS '[
+  {
+    "columns": ["a"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 1000,
+    "distinct_count": 40
+  },
+  {
+    "columns": ["b"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 1000,
+    "distinct_count": 2,
+    "histo_col_type": "BOOL",
+    "histo_buckets": [
+      {"num_eq": 900, "num_range": 0, "distinct_range": 0, "upper_bound": "false"},
+      {"num_eq": 100, "num_range": 0, "distinct_range": 0, "upper_bound": "true"}
+    ]
+  }
+]'
+----
+
+norm
+SELECT * FROM hist_bool WHERE b = false
+----
+select
+ ├── columns: a:1(int) b:2(bool!null)
+ ├── stats: [rows=900, distinct(2)=1, null(2)=0]
+ │   histogram(2)=  0   900
+ │                <--- false
+ ├── fd: ()-->(2)
+ ├── scan hist_bool
+ │    ├── columns: a:1(int) b:2(bool)
+ │    └── stats: [rows=1000, distinct(2)=2, null(2)=0]
+ │        histogram(2)=  0   900   0  100
+ │                     <--- false --- true
+ └── filters
+      └── b = false [type=bool, outer=(2), constraints=(/2: [/false - /false]; tight), fd=()-->(2)]
+
+exec-ddl
+CREATE TABLE t0(c0 INT)
+----
+
+exec-ddl
+CREATE VIEW v0(c0) AS SELECT CASE WHEN t0.c0 > 0 THEN 1 ELSE t0.rowid END FROM t0
+----
+
+exec-ddl
+ALTER TABLE t0 INJECT STATISTICS '[
+  {
+    "columns": ["c0"],
+    "created_at": "2020-01-28 03:02:57.841772+00:00",
+    "row_count": 3,
+    "distinct_count": 1,
+    "null_count": 3
+  },
+  {
+    "columns": ["rowid"],
+    "created_at": "2020-01-28 03:03:03.012072+00:00",
+    "row_count": 2,
+    "distinct_count": 2,
+    "null_count": 0,
+    "histo_buckets": [
+      {
+        "distinct_range": 0,
+        "num_eq": 1,
+        "num_range": 0,
+        "upper_bound": "3"
+      },
+      {
+        "distinct_range": 0,
+        "num_eq": 1,
+        "num_range": 0,
+        "upper_bound": "4"
+      }
+    ],
+    "histo_col_type": "INT8"
+  }
+]'
+----
+
+# Regression test for #44418. Make sure inconsistent stats don't cause an
+# error.
+norm
+SELECT * FROM v0 WHERE v0.c0 > 0
+----
+select
+ ├── columns: c0:3(int!null)
+ ├── stats: [rows=2e-10, distinct(3)=2e-10, null(3)=0]
+ ├── project
+ │    ├── columns: rowid:3(int)
+ │    ├── stats: [rows=2, distinct(3)=1, null(3)=2]
+ │    ├── scan t0
+ │    │    ├── columns: c0:1(int) t0.rowid:2(int!null)
+ │    │    ├── stats: [rows=2, distinct(1,2)=1, null(1,2)=2]
+ │    │    ├── key: (2)
+ │    │    └── fd: (2)-->(1)
+ │    └── projections
+ │         └── CASE WHEN c0 > 0 THEN 1 ELSE t0.rowid END [type=int, outer=(1,2)]
+ └── filters
+      └── rowid > 0 [type=bool, outer=(3), constraints=(/3: [/1 - ]; tight)]

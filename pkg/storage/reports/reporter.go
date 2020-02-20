@@ -18,16 +18,17 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -52,13 +53,11 @@ type Reporter struct {
 	// Contains the list of the stores of the current node
 	localStores *storage.Stores
 	// Constraints constructed from the locality information
-	localityConstraints []config.Constraints
+	localityConstraints []zonepb.Constraints
 	// The store that is the current meta 1 leaseholder
 	meta1LeaseHolder *storage.Store
 	// Latest zone config
 	latestConfig *config.SystemConfig
-	// Node liveness by store id
-	nodeLiveStatus map[roachpb.NodeID]storagepb.NodeLivenessStatus
 
 	db        *client.DB
 	liveness  *storage.NodeLiveness
@@ -177,8 +176,6 @@ func (stats *Reporter) update(
 		return nil
 	}
 
-	stats.updateNodeLiveness()
-
 	if err := stats.updateLocalityConstraints(); err != nil {
 		log.Errorf(ctx, "unable to update the locality constraints: %s", err)
 	}
@@ -199,14 +196,19 @@ func (stats *Reporter) update(
 		return storeDescs
 	}
 
+	isLiveMap := stats.liveness.GetIsLiveMap()
+	isNodeLive := func(nodeID roachpb.NodeID) bool {
+		return isLiveMap[nodeID].IsLive
+	}
+
 	// Create the visitors that we're going to pass to visitRanges() below.
 	constraintConfVisitor := makeConstraintConformanceVisitor(
 		ctx, stats.latestConfig, getStoresFromGossip, constraintsSaver)
 	localityStatsVisitor := makeLocalityStatsVisitor(
 		ctx, stats.localityConstraints, stats.latestConfig,
-		getStoresFromGossip, stats.isNodeLive, locSaver)
+		getStoresFromGossip, isNodeLive, locSaver)
 	statusVisitor := makeReplicationStatsVisitor(
-		ctx, stats.latestConfig, stats.isNodeLive, replStatsSaver)
+		ctx, stats.latestConfig, isNodeLive, replStatsSaver)
 
 	// Iterate through all the ranges.
 	const descriptorReadBatchSize = 10000
@@ -271,45 +273,27 @@ func (stats *Reporter) updateLatestConfig() {
 }
 
 func (stats *Reporter) updateLocalityConstraints() error {
-	localityConstraintsByName := make(map[string]config.Constraints, 16)
+	localityConstraintsByName := make(map[string]zonepb.Constraints, 16)
 	for _, sd := range stats.storePool.GetStores() {
-		c := config.Constraints{
-			Constraints: make([]config.Constraint, 0),
+		c := zonepb.Constraints{
+			Constraints: make([]zonepb.Constraint, 0),
 		}
 		for _, t := range sd.Node.Locality.Tiers {
 			c.Constraints = append(
 				c.Constraints,
-				config.Constraint{Type: config.Constraint_REQUIRED, Key: t.Key, Value: t.Value})
+				zonepb.Constraint{Type: zonepb.Constraint_REQUIRED, Key: t.Key, Value: t.Value})
 			localityConstraintsByName[c.String()] = c
 		}
 	}
-	stats.localityConstraints = make([]config.Constraints, 0, len(localityConstraintsByName))
+	stats.localityConstraints = make([]zonepb.Constraints, 0, len(localityConstraintsByName))
 	for _, c := range localityConstraintsByName {
 		stats.localityConstraints = append(stats.localityConstraints, c)
 	}
 	return nil
 }
 
-func (stats *Reporter) updateNodeLiveness() {
-	stats.nodeLiveStatus = stats.liveness.GetLivenessStatusMap()
-}
-
 // nodeChecker checks whether a node is to be considered alive or not.
 type nodeChecker func(nodeID roachpb.NodeID) bool
-
-func (stats *Reporter) isNodeLive(nodeID roachpb.NodeID) bool {
-	l, ok := stats.nodeLiveStatus[nodeID]
-	if !ok {
-		return false
-	}
-	switch l {
-	// Decommissioning nodes are considered live nodes.
-	case storagepb.NodeLivenessStatus_LIVE, storagepb.NodeLivenessStatus_DECOMMISSIONING:
-		return true
-	default:
-		return false
-	}
-}
 
 // zoneResolver resolves ranges to their zone configs. It is optimized for the
 // case where a range falls in the same range as a the previously-resolved range
@@ -321,7 +305,7 @@ type zoneResolver struct {
 	// curRootZone is the lowest zone convering the previously resolved range
 	// that's not a subzone.
 	// This is used to compute the subzone for a range.
-	curRootZone *config.ZoneConfig
+	curRootZone *zonepb.ZoneConfig
 	// curZoneKey is the zone key for the previously resolved range.
 	curZoneKey ZoneKey
 }
@@ -339,7 +323,7 @@ func (c *zoneResolver) resolveRange(
 // setZone remembers the passed-in info as the reference for further
 // checkSameZone() calls.
 // Clients should generally use the higher-level updateZone().
-func (c *zoneResolver) setZone(objectID uint32, key ZoneKey, rootZone *config.ZoneConfig) {
+func (c *zoneResolver) setZone(objectID uint32, key ZoneKey, rootZone *zonepb.ZoneConfig) {
 	c.init = true
 	c.curObjectID = objectID
 	c.curRootZone = rootZone
@@ -354,14 +338,14 @@ func (c *zoneResolver) updateZone(
 	objectID, _ := config.DecodeKeyIntoZoneIDAndSuffix(rd.StartKey)
 	first := true
 	var zoneKey ZoneKey
-	var rootZone *config.ZoneConfig
+	var rootZone *zonepb.ZoneConfig
 	// We're going to walk the zone hierarchy looking for two things:
 	// 1) The lowest zone containing rd. We'll use the subzone ID for it.
 	// 2) The lowest zone containing rd that's not a subzone.
 	// visitZones() walks the zone hierarchy from the bottom upwards.
 	found, err := visitZones(
 		ctx, rd, cfg, includeSubzonePlaceholders,
-		func(_ context.Context, zone *config.ZoneConfig, key ZoneKey) bool {
+		func(_ context.Context, zone *zonepb.ZoneConfig, key ZoneKey) bool {
 			if first {
 				first = false
 				zoneKey = key
@@ -424,7 +408,7 @@ func visitZones(
 	rng *roachpb.RangeDescriptor,
 	cfg *config.SystemConfig,
 	opt visitOpt,
-	visitor func(context.Context, *config.ZoneConfig, ZoneKey) bool,
+	visitor func(context.Context, *zonepb.ZoneConfig, ZoneKey) bool,
 ) (bool, error) {
 	id, keySuffix := config.DecodeKeyIntoZoneIDAndSuffix(rng.StartKey)
 	zone, err := getZoneByID(id, cfg)
@@ -464,7 +448,7 @@ func visitAncestors(
 	ctx context.Context,
 	id uint32,
 	cfg *config.SystemConfig,
-	visitor func(context.Context, *config.ZoneConfig, ZoneKey) bool,
+	visitor func(context.Context, *zonepb.ZoneConfig, ZoneKey) bool,
 ) (bool, error) {
 	// Check to see if it's a table. If so, inherit from the database.
 	// For all other cases, inherit from the default.
@@ -502,7 +486,7 @@ func visitAncestors(
 func visitDefaultZone(
 	ctx context.Context,
 	cfg *config.SystemConfig,
-	visitor func(context.Context, *config.ZoneConfig, ZoneKey) bool,
+	visitor func(context.Context, *zonepb.ZoneConfig, ZoneKey) bool,
 ) bool {
 	zone, err := getZoneByID(keys.RootNamespaceID, cfg)
 	if err != nil {
@@ -515,12 +499,12 @@ func visitDefaultZone(
 }
 
 // getZoneByID returns a zone given its id. Inheritance does not apply.
-func getZoneByID(id uint32, cfg *config.SystemConfig) (*config.ZoneConfig, error) {
+func getZoneByID(id uint32, cfg *config.SystemConfig) (*zonepb.ZoneConfig, error) {
 	zoneVal := cfg.GetValue(config.MakeZoneKey(id))
 	if zoneVal == nil {
 		return nil, nil
 	}
-	zone := new(config.ZoneConfig)
+	zone := new(zonepb.ZoneConfig)
 	if err := zoneVal.GetProto(zone); err != nil {
 		return nil, err
 	}
@@ -530,7 +514,7 @@ func getZoneByID(id uint32, cfg *config.SystemConfig) (*config.ZoneConfig, error
 // processRange returns the list of constraints violated by a range. The range
 // is represented by the descriptors of the replicas' stores.
 func processRange(
-	ctx context.Context, storeDescs []roachpb.StoreDescriptor, constraintGroups []config.Constraints,
+	ctx context.Context, storeDescs []roachpb.StoreDescriptor, constraintGroups []zonepb.Constraints,
 ) []ConstraintRepr {
 	var res []ConstraintRepr
 	// Evaluate all zone constraints for the stores (i.e. replicas) of the given range.
@@ -551,7 +535,7 @@ func processRange(
 // constraintSatisfied checks that a range (represented by its replicas' stores)
 // satisfies a constraint.
 func constraintSatisfied(
-	c config.Constraint, replicasRequiredToMatch int, storeDescs []roachpb.StoreDescriptor,
+	c zonepb.Constraint, replicasRequiredToMatch int, storeDescs []roachpb.StoreDescriptor,
 ) bool {
 	passCount := 0
 	for _, storeDesc := range storeDescs {
@@ -562,11 +546,11 @@ func constraintSatisfied(
 		}
 
 		storeMatches := true
-		match := config.StoreMatchesConstraint(storeDesc, c)
-		if c.Type == config.Constraint_REQUIRED && !match {
+		match := zonepb.StoreMatchesConstraint(storeDesc, c)
+		if c.Type == zonepb.Constraint_REQUIRED && !match {
 			storeMatches = false
 		}
-		if c.Type == config.Constraint_PROHIBITED && match {
+		if c.Type == zonepb.Constraint_PROHIBITED && match {
 			storeMatches = false
 		}
 
@@ -861,10 +845,11 @@ type reportID int
 func getReportGenerationTime(
 	ctx context.Context, rid reportID, ex sqlutil.InternalExecutor, txn *client.Txn,
 ) (time.Time, error) {
-	row, err := ex.QueryRow(
+	row, err := ex.QueryRowEx(
 		ctx,
 		"get-previous-timestamp",
 		txn,
+		sqlbase.InternalExecutorSessionDataOverride{User: security.NodeUser},
 		"select generated from system.reports_meta where id = $1",
 		rid,
 	)

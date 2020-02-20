@@ -14,6 +14,8 @@ import (
 	"math"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
+	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvfeed"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -28,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/span"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
@@ -39,16 +42,13 @@ type changeAggregator struct {
 	spec    execinfrapb.ChangeAggregatorSpec
 	memAcc  mon.BoundAccount
 
-	// cancel shuts down the processor, both the `Next()` flow and the poller.
+	// cancel shuts down the processor, both the `Next()` flow and the kvfeed.
 	cancel func()
-	// errCh contains the return values of the poller.
+	// errCh contains the return values of the kvfeed.
 	errCh chan error
-	// poller runs in the background and puts kv changes and resolved spans into
-	// a buffer, which is used by `Next()`.
-	poller *poller
-	// pollerDoneCh is closed when the poller exits.
-	pollerDoneCh chan struct{}
-	pollerMemMon *mon.BytesMonitor
+	// kvFeedDoneCh is closed when the kvfeed exits.
+	kvFeedDoneCh chan struct{}
+	kvFeedMemMon *mon.BytesMonitor
 
 	// encoder is the Encoder to use for key and value serialization.
 	encoder Encoder
@@ -73,7 +73,7 @@ type timestampLowerBoundOracle interface {
 }
 
 type changeAggregatorLowerBoundOracle struct {
-	sf                         *spanFrontier
+	sf                         *span.Frontier
 	initialInclusiveLowerBound hlc.Timestamp
 }
 
@@ -164,7 +164,7 @@ func (ca *changeAggregator) Start(ctx context.Context) context.Context {
 	// This object is used to filter out some previously emitted rows, and
 	// by the cloudStorageSink to name its output files in lexicographically
 	// monotonic fashion.
-	sf := makeSpanFrontier(spans...)
+	sf := span.MakeFrontier(spans...)
 	for _, watch := range ca.spec.Watches {
 		sf.Forward(watch.Span, watch.InitialResolved)
 	}
@@ -204,20 +204,38 @@ func (ca *changeAggregator) Start(ctx context.Context) context.Context {
 	// for the poller, but there is a race between the flow's MemoryMonitor
 	// getting Stopped and `changeAggregator.Close`, which causes panics. Not sure
 	// what to do about this yet.
-	pollerMemMonCapacity := memBufferDefaultCapacity
+	pollerMemMonCapacity := kvfeed.MemBufferDefaultCapacity
 	if knobs.MemBufferCapacity != 0 {
 		pollerMemMonCapacity = knobs.MemBufferCapacity
 	}
 	pollerMemMon := mon.MakeMonitorInheritWithLimit("poller", math.MaxInt64, ca.ProcessorBase.MemMonitor)
 	pollerMemMon.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(pollerMemMonCapacity))
-	ca.pollerMemMon = &pollerMemMon
+	ca.kvFeedMemMon = &pollerMemMon
 
-	buf := makeBuffer()
+	buf := kvfeed.MakeChanBuffer()
 	leaseMgr := ca.flowCtx.Cfg.LeaseManager.(*sql.LeaseManager)
-	ca.poller = makePoller(
-		ca.flowCtx.Cfg.Settings, ca.flowCtx.Cfg.DB, ca.flowCtx.Cfg.DB.Clock(), ca.flowCtx.Cfg.Gossip,
-		spans, ca.spec.Feed, initialHighWater, buf, leaseMgr, metrics, ca.pollerMemMon,
-	)
+	_, withDiff := ca.spec.Feed.Opts[changefeedbase.OptDiff]
+	kvfeedCfg := kvfeed.Config{
+		Sink:             buf,
+		Settings:         ca.flowCtx.Cfg.Settings,
+		DB:               ca.flowCtx.Cfg.DB,
+		Clock:            ca.flowCtx.Cfg.DB.Clock(),
+		Gossip:           ca.flowCtx.Cfg.Gossip,
+		Spans:            spans,
+		Targets:          ca.spec.Feed.Targets,
+		LeaseMgr:         leaseMgr,
+		Metrics:          &metrics.KVFeedMetrics,
+		MM:               ca.kvFeedMemMon,
+		InitialHighWater: initialHighWater,
+		WithDiff:         withDiff,
+	}
+	// The initial scan semantics are currently defined by whether this is the
+	// first run of a changefeed which did not specify a cursor.
+	kvfeedCfg.NeedsInitialScan = kvfeedCfg.InitialHighWater == (hlc.Timestamp{})
+	if kvfeedCfg.NeedsInitialScan {
+		kvfeedCfg.InitialHighWater = ca.spec.Feed.StatementTime
+	}
+
 	rowsFn := kvsToRows(leaseMgr, ca.spec.Feed, buf.Get)
 
 	ca.tickFn = emitEntries(
@@ -227,20 +245,18 @@ func (ca *changeAggregator) Start(ctx context.Context) context.Context {
 	// but only the first one is ever used.
 	ca.errCh = make(chan error, 2)
 
-	ca.pollerDoneCh = make(chan struct{})
+	ca.kvFeedDoneCh = make(chan struct{})
 	if err := ca.flowCtx.Stopper().RunAsyncTask(ctx, "changefeed-poller", func(ctx context.Context) {
-		defer close(ca.pollerDoneCh)
-		err := ca.poller.RunUsingRangefeeds(ctx)
-
+		defer close(ca.kvFeedDoneCh)
 		// Trying to call MoveToDraining here is racy (`MoveToDraining called in
 		// state stateTrailingMeta`), so return the error via a channel.
-		ca.errCh <- err
+		ca.errCh <- kvfeed.Run(ctx, kvfeedCfg)
 		ca.cancel()
 	}); err != nil {
 		// If err != nil then the RunAsyncTask closure never ran, which means we
-		// need to manually close ca.pollerDoneCh so `(*changeAggregator).close`
+		// need to manually close ca.kvFeedDoneCh so `(*changeAggregator).close`
 		// doesn't hang.
-		close(ca.pollerDoneCh)
+		close(ca.kvFeedDoneCh)
 		ca.errCh <- err
 		ca.cancel()
 	}
@@ -260,8 +276,8 @@ func (ca *changeAggregator) close() {
 			ca.cancel()
 		}
 		// Wait for the poller to finish shutting down.
-		if ca.pollerDoneCh != nil {
-			<-ca.pollerDoneCh
+		if ca.kvFeedDoneCh != nil {
+			<-ca.kvFeedDoneCh
 		}
 		if ca.sink != nil {
 			if err := ca.sink.Close(); err != nil {
@@ -269,8 +285,8 @@ func (ca *changeAggregator) close() {
 			}
 		}
 		ca.memAcc.Close(ca.Ctx)
-		if ca.pollerMemMon != nil {
-			ca.pollerMemMon.Stop(ca.Ctx)
+		if ca.kvFeedMemMon != nil {
+			ca.kvFeedMemMon.Stop(ca.Ctx)
 		}
 		ca.MemMonitor.Stop(ca.Ctx)
 	}
@@ -355,7 +371,7 @@ type changeFrontier struct {
 
 	// sf contains the current resolved timestamp high-water for the tracked
 	// span set.
-	sf *spanFrontier
+	sf *span.Frontier
 	// encoder is the Encoder to use for resolved timestamp serialization.
 	encoder Encoder
 	// sink is the Sink to write resolved timestamps to. Rows are never written
@@ -407,7 +423,7 @@ func newChangeFrontierProcessor(
 		spec:    spec,
 		memAcc:  memMonitor.MakeBoundAccount(),
 		input:   input,
-		sf:      makeSpanFrontier(spec.TrackedSpans...),
+		sf:      span.MakeFrontier(spec.TrackedSpans...),
 	}
 	if err := cf.Init(
 		cf, &execinfrapb.PostProcessSpec{},
@@ -427,7 +443,7 @@ func newChangeFrontierProcessor(
 		return nil, err
 	}
 
-	if r, ok := cf.spec.Feed.Opts[optResolvedTimestamps]; ok {
+	if r, ok := cf.spec.Feed.Opts[changefeedbase.OptResolvedTimestamps]; ok {
 		var err error
 		if r == `` {
 			// Empty means emit them as often as we have them.
@@ -638,7 +654,7 @@ func (cf *changeFrontier) noteResolvedSpan(d sqlbase.EncDatum) error {
 	// rangefeed is only checked at changefeed start/resume, so instead of
 	// switching on it here, just add them. Also add 1 second in case both these
 	// settings are set really low (as they are in unit tests).
-	pollInterval := changefeedPollInterval.Get(&cf.flowCtx.Cfg.Settings.SV)
+	pollInterval := changefeedbase.TableDescriptorPollInterval.Get(&cf.flowCtx.Cfg.Settings.SV)
 	closedtsInterval := closedts.TargetDuration.Get(&cf.flowCtx.Cfg.Settings.SV)
 	slownessThreshold := time.Second + 10*(pollInterval+closedtsInterval)
 	frontier := cf.sf.Frontier()
@@ -655,7 +671,7 @@ func (cf *changeFrontier) noteResolvedSpan(d sqlbase.EncDatum) error {
 		const slowSpanMaxFrequency = 10 * time.Second
 		if now.Sub(cf.lastSlowSpanLog) > slowSpanMaxFrequency {
 			cf.lastSlowSpanLog = now
-			s := cf.sf.peekFrontierSpan()
+			s := cf.sf.PeekFrontierSpan()
 			log.Infof(cf.Ctx, "%s span %s is behind by %s", description, s, resolvedBehind)
 		}
 	}

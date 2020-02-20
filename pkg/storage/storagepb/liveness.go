@@ -13,48 +13,29 @@ package storagepb
 import (
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
-// IsLive returns whether the node is considered live at the given time with the
-// given clock offset.
-func (l *Liveness) IsLive(now hlc.Timestamp, maxOffset time.Duration) bool {
-	if maxOffset == timeutil.ClocklessMaxOffset {
-		// When using clockless reads, we're live without a buffer period.
-		maxOffset = 0
-	}
-	expiration := hlc.Timestamp(l.Expiration).Add(-maxOffset.Nanoseconds(), 0)
-	return now.Less(expiration)
+// IsLive returns whether the node is considered live at the given time.
+//
+// NOTE: If one is interested whether the Liveness is valid currently, then the
+// timestamp passed in should be the known high-water mark of all the clocks of
+// the nodes in the cluster. For example, if the liveness expires at ts 100, our
+// physical clock is at 90, but we know that another node's clock is at 110,
+// then it's preferable (more consistent across nodes) for the liveness to be
+// considered expired. For that purpose, it's better to pass in
+// clock.Now().GoTime() rather than clock.PhysicalNow() - the former takes into
+// consideration clock signals from other nodes, the latter doesn't.
+func (l *Liveness) IsLive(now time.Time) bool {
+	expiration := timeutil.Unix(0, l.Expiration.WallTime)
+	return now.Before(expiration)
 }
 
-// IsDead returns whether the node is considered dead at the given time with the
-// given threshold.
-func (l *Liveness) IsDead(now hlc.Timestamp, threshold time.Duration) bool {
-	deadAsOf := hlc.Timestamp(l.Expiration).GoTime().Add(threshold)
-	return !now.GoTime().Before(deadAsOf)
-}
-
-// LivenessStatus returns a NodeLivenessStatus enumeration value for this liveness
-// based on the provided timestamp, threshold, and clock max offset.
-func (l *Liveness) LivenessStatus(
-	now time.Time, threshold, maxOffset time.Duration,
-) NodeLivenessStatus {
-	nowHlc := hlc.Timestamp{WallTime: now.UnixNano()}
-	if l.IsDead(nowHlc, threshold) {
-		if l.Decommissioning {
-			return NodeLivenessStatus_DECOMMISSIONED
-		}
-		return NodeLivenessStatus_DEAD
-	}
-	if l.Decommissioning {
-		return NodeLivenessStatus_DECOMMISSIONING
-	}
-	if l.Draining {
-		return NodeLivenessStatus_UNAVAILABLE
-	}
-	if l.IsLive(nowHlc, maxOffset) {
-		return NodeLivenessStatus_LIVE
-	}
-	return NodeLivenessStatus_UNAVAILABLE
+// IsDead returns true if the liveness expired more than threshold ago.
+//
+// Note that, because of threshold, IsDead() is not the inverse of IsLive().
+func (l *Liveness) IsDead(now time.Time, threshold time.Duration) bool {
+	expiration := timeutil.Unix(0, l.Expiration.WallTime)
+	deadAsOf := expiration.Add(threshold)
+	return !now.Before(deadAsOf)
 }

@@ -24,6 +24,7 @@ import (
 	circuit "github.com/cockroachdb/circuitbreaker"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -35,6 +36,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sqlmigrations"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
@@ -44,8 +47,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
-	"github.com/pkg/errors"
 )
 
 const (
@@ -157,6 +160,9 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	}
 	if params.SQLMemoryPoolSize != 0 {
 		cfg.SQLMemoryPoolSize = params.SQLMemoryPoolSize
+	}
+	if params.CacheSize != 0 {
+		cfg.CacheSize = params.CacheSize
 	}
 
 	if params.JoinAddr != "" {
@@ -389,7 +395,7 @@ func (ts *TestServer) ExpectedInitialRangeCount() (int, error) {
 // ExpectedInitialRangeCount returns the expected number of ranges that should
 // be on the server after bootstrap.
 func ExpectedInitialRangeCount(
-	db *client.DB, defaultZoneConfig *config.ZoneConfig, defaultSystemZoneConfig *config.ZoneConfig,
+	db *client.DB, defaultZoneConfig *zonepb.ZoneConfig, defaultSystemZoneConfig *zonepb.ZoneConfig,
 ) (int, error) {
 	descriptorIDs, err := sqlmigrations.ExpectedDescriptorIDs(context.Background(), db, defaultZoneConfig, defaultSystemZoneConfig)
 	if err != nil {
@@ -546,16 +552,19 @@ func (ts *TestServer) getAuthenticatedHTTPClientAndCookie(
 }
 
 func (ts *TestServer) createAuthUser(userName string, isAdmin bool) error {
-	if _, err := ts.Server.internalExecutor.Exec(context.TODO(),
-		"create-auth-user", nil, "CREATE USER $1", userName,
+	if _, err := ts.Server.internalExecutor.ExecEx(context.TODO(),
+		"create-auth-user", nil,
+		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+		"CREATE USER $1", userName,
 	); err != nil {
 		return err
 	}
 	if isAdmin {
 		// We can't use the GRANT statement here because we don't want
 		// to rely on CCL code.
-		if _, err := ts.Server.internalExecutor.Exec(context.TODO(),
+		if _, err := ts.Server.internalExecutor.ExecEx(context.TODO(),
 			"grant-admin", nil,
+			sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 			"INSERT INTO system.role_members (role, member, \"isAdmin\") VALUES ('admin', $1, true)", userName,
 		); err != nil {
 			return err
@@ -627,11 +636,6 @@ func (ts *TestServer) InternalExecutor() interface{} {
 // GetNode exposes the Server's Node.
 func (ts *TestServer) GetNode() *Node {
 	return ts.node
-}
-
-// GetNodeLiveness exposes the Server's nodeLiveness.
-func (ts *TestServer) GetNodeLiveness() *storage.NodeLiveness {
-	return ts.nodeLiveness
 }
 
 // DistSenderI is part of DistSendeInterface.
@@ -840,6 +844,41 @@ func (ts *TestServer) GCSystemLog(
 	ctx context.Context, table string, timestampLowerBound, timestampUpperBound time.Time,
 ) (time.Time, int64, error) {
 	return ts.gcSystemLog(ctx, table, timestampLowerBound, timestampUpperBound)
+}
+
+// ForceTableGC is part of TestServerInterface.
+func (ts *TestServer) ForceTableGC(
+	ctx context.Context, database, table string, timestamp hlc.Timestamp,
+) error {
+	tableIDQuery := `
+ SELECT tables.id FROM system.namespace tables
+   JOIN system.namespace dbs ON dbs.id = tables."parentID"
+   WHERE dbs.name = $1 AND tables.name = $2
+ `
+	row, err := ts.internalExecutor.QueryRowEx(
+		ctx, "resolve-table-id", nil, /* txn */
+		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+		tableIDQuery, database, table)
+	if err != nil {
+		return err
+	}
+	if row == nil {
+		return errors.Errorf("table not found")
+	}
+	if len(row) != 1 {
+		return errors.AssertionFailedf("expected 1 column from internal query")
+	}
+	tableID := uint32(*row[0].(*tree.DInt))
+	tblKey := roachpb.Key(keys.MakeTablePrefix(tableID))
+	gcr := roachpb.GCRequest{
+		RequestHeader: roachpb.RequestHeader{
+			Key:    tblKey,
+			EndKey: tblKey.PrefixEnd(),
+		},
+		Threshold: timestamp,
+	}
+	_, pErr := client.SendWrapped(ctx, ts.distSender, &gcr)
+	return pErr.GoError()
 }
 
 type testServerFactoryImpl struct{}

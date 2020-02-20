@@ -17,6 +17,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -72,6 +73,7 @@ func (n *explainVecNode) startExec(params runParams) error {
 	distSQLPlanner.FinalizePlan(planCtx, &plan)
 	flows := plan.GenerateFlowSpecs(params.extendedEvalCtx.NodeID)
 	flowCtx := makeFlowCtx(planCtx, plan, params)
+	flowCtx.Cfg.ClusterID = &distSQLPlanner.rpcCtx.ClusterID
 
 	// Temporarily set vectorize to on so that we can get the whole plan back even
 	// if we wouldn't support it due to lack of streaming.
@@ -95,12 +97,19 @@ func (n *explainVecNode) startExec(params runParams) error {
 		if flow.nodeID == thisNodeID && !willDistributePlan {
 			fuseOpt = flowinfra.FuseAggressively
 		}
-		opChains, err := colflow.SupportsVectorized(params.ctx, flowCtx, flow.flow.Processors, fuseOpt)
+		opChains, err := colflow.SupportsVectorized(params.ctx, flowCtx, flow.flow.Processors, fuseOpt, nil /* output */)
 		if err != nil {
 			return err
 		}
-		for _, op := range opChains {
-			formatOpChain(op, node, verbose)
+		// It is possible that when iterating over execinfra.OpNodes we will hit
+		// a panic (an input that doesn't implement OpNode interface), so we're
+		// catching such errors.
+		if err := execerror.CatchVectorizedRuntimeError(func() {
+			for _, op := range opChains {
+				formatOpChain(op, node, verbose)
+			}
+		}); err != nil {
+			return err
 		}
 	}
 	n.run.lines = tp.FormattedRows()
@@ -160,8 +169,8 @@ func doFormatOpChain(
 	verbose bool,
 	seenOps map[reflect.Value]struct{},
 ) {
-	for i := 0; i < operator.ChildCount(); i++ {
-		child := operator.Child(i)
+	for i := 0; i < operator.ChildCount(verbose); i++ {
+		child := operator.Child(i, verbose)
 		childOpValue := reflect.ValueOf(child)
 		childOpName := reflect.TypeOf(child).String()
 		if _, seenOp := seenOps[childOpValue]; seenOp {

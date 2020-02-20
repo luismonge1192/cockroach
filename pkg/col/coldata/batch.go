@@ -40,6 +40,9 @@ type Batch interface {
 	SetSelection(bool)
 	// AppendCol appends the given Vec to this batch.
 	AppendCol(Vec)
+	// ReplaceCol replaces the current Vec at the provided index with the
+	// provided Vec.
+	ReplaceCol(Vec, int)
 	// Reset modifies the caller in-place to have the given length and columns
 	// with the given coltypes. If it's possible, Reset will reuse the existing
 	// columns and allocations, invalidating existing references to the Batch or
@@ -58,17 +61,41 @@ type Batch interface {
 
 var _ Batch = &MemBatch{}
 
-const maxBatchSize = 1024
+const (
+	// MinBatchSize is the minimum acceptable size of batches.
+	MinBatchSize = 3
+	// MaxBatchSize is the maximum acceptable size of batches.
+	MaxBatchSize = 4096
+)
 
+// TODO(jordan): tune.
 var batchSize = uint16(1024)
 
 // BatchSize is the maximum number of tuples that fit in a column batch.
-// TODO(jordan): tune
 func BatchSize() uint16 {
 	return batchSize
 }
 
-// NewMemBatch allocates a new in-memory Batch.
+// SetBatchSizeForTests modifies batchSize variable. It should only be used in
+// tests.
+func SetBatchSizeForTests(newBatchSize uint16) {
+	if newBatchSize > MaxBatchSize {
+		panic(
+			fmt.Sprintf("requested batch size %d is greater than MaxBatchSize %d",
+				newBatchSize, MaxBatchSize),
+		)
+	}
+	if newBatchSize < MinBatchSize {
+		panic(
+			fmt.Sprintf("requested batch size %d is smaller than MinBatchSize %d",
+				newBatchSize, MinBatchSize),
+		)
+	}
+	batchSize = newBatchSize
+}
+
+// NewMemBatch allocates a new in-memory Batch. A coltypes.Unknown type
+// will create a placeholder Vec that may not be accessed.
 // TODO(jordan): pool these allocations.
 func NewMemBatch(types []coltypes.T) Batch {
 	return NewMemBatchWithSize(types, int(BatchSize()))
@@ -77,25 +104,59 @@ func NewMemBatch(types []coltypes.T) Batch {
 // NewMemBatchWithSize allocates a new in-memory Batch with the given column
 // size. Use for operators that have a precisely-sized output batch.
 func NewMemBatchWithSize(types []coltypes.T, size int) Batch {
+	b := NewMemBatchNoCols(types, size).(*MemBatch)
+	for i, t := range types {
+		b.b[i] = NewMemColumn(t, size)
+	}
+	return b
+}
+
+// NewMemBatchNoCols creates a "skeleton" of new in-memory Batch. It allocates
+// memory for the selection vector but does *not* allocate any memory for the
+// column vectors - those will have to be added separately.
+func NewMemBatchNoCols(types []coltypes.T, size int) Batch {
 	if max := math.MaxUint16; size > max {
 		panic(fmt.Sprintf(`batches cannot have length larger than %d; requested %d`, max, size))
 	}
 	b := &MemBatch{}
 	b.b = make([]Vec, len(types))
-
-	for i, t := range types {
-		b.b[i] = NewMemColumn(t, size)
-	}
 	b.sel = make([]uint16, size)
-
 	return b
 }
 
 // ZeroBatch is a schema-less Batch of length 0.
-var ZeroBatch = NewMemBatchWithSize(nil /* types */, 0 /* size */)
+var ZeroBatch = &zeroBatch{MemBatch: NewMemBatchWithSize(nil /* types */, 0 /* size */).(*MemBatch)}
 
-func init() {
-	ZeroBatch.SetLength(0)
+// zeroBatch is a wrapper around MemBatch that prohibits modifications of the
+// batch.
+type zeroBatch struct {
+	*MemBatch
+}
+
+var _ Batch = &zeroBatch{}
+
+func (b *zeroBatch) Length() uint16 {
+	return 0
+}
+
+func (b *zeroBatch) SetLength(uint16) {
+	panic("length should not be changed on zero batch")
+}
+
+func (b *zeroBatch) SetSelection(bool) {
+	panic("selection should not be changed on zero batch")
+}
+
+func (b *zeroBatch) AppendCol(Vec) {
+	panic("no columns should be appended to zero batch")
+}
+
+func (b *zeroBatch) ReplaceCol(Vec, int) {
+	panic("no columns should be replaced in zero batch")
+}
+
+func (b *zeroBatch) Reset([]coltypes.T, int) {
+	panic("zero batch should not be reset")
 }
 
 // MemBatch is an in-memory implementation of Batch.
@@ -158,6 +219,11 @@ func (m *MemBatch) AppendCol(col Vec) {
 	m.b = append(m.b, col)
 }
 
+// ReplaceCol implements the Batch interface.
+func (m *MemBatch) ReplaceCol(col Vec, colIdx int) {
+	m.b[colIdx] = col
+}
+
 // Reset implements the Batch interface.
 func (m *MemBatch) Reset(types []coltypes.T, length int) {
 	// The columns are always sized the same as the selection vector, so use it as
@@ -195,7 +261,9 @@ func (m *MemBatch) Reset(types []coltypes.T, length int) {
 func (m *MemBatch) ResetInternalBatch() {
 	m.SetSelection(false)
 	for _, v := range m.b {
-		v.Nulls().UnsetNulls()
+		if v.Type() != coltypes.Unhandled {
+			v.Nulls().UnsetNulls()
+		}
 		if v.Type() == coltypes.Bytes {
 			v.Bytes().Reset()
 		}

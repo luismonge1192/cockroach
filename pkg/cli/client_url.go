@@ -171,7 +171,7 @@ func (u urlParser) Set(v string) error {
 		cliCtx.extraConnURLOptions = options
 
 		switch sslMode := options.Get("sslmode"); sslMode {
-		case "disable":
+		case "", "disable":
 			if err := fl.Set(cliflags.ClientInsecure.Name, "true"); err != nil {
 				return errors.Wrapf(err, "setting insecure connection based on --url")
 			}
@@ -293,7 +293,8 @@ func (u urlParser) Set(v string) error {
 				}
 			}
 		default:
-			return fmt.Errorf("unsupported sslmode=%s (supported: disable, require, verify-ca, verify-full", sslMode)
+			return fmt.Errorf(
+				"unsupported sslmode=%s (supported: disable, require, verify-ca, verify-full)", sslMode)
 		}
 	}
 

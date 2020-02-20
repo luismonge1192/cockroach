@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -106,8 +106,8 @@ func initCLIDefaults() {
 	serverCfg.DelayedBootstrapFn = nil
 	serverCfg.SocketFile = ""
 	serverCfg.JoinList = nil
-	serverCfg.DefaultZoneConfig = config.DefaultZoneConfig()
-	serverCfg.DefaultSystemZoneConfig = config.DefaultSystemZoneConfig()
+	serverCfg.DefaultZoneConfig = zonepb.DefaultZoneConfig()
+	serverCfg.DefaultSystemZoneConfig = zonepb.DefaultSystemZoneConfig()
 	// Attempt to default serverCfg.SQLMemoryPoolSize to 25% if possible.
 	if bytes, _ := memoryPercentResolver(25); bytes != 0 {
 		serverCfg.SQLMemoryPoolSize = bytes
@@ -150,6 +150,8 @@ func initCLIDefaults() {
 	networkBenchCtx.addresses = []string{"localhost:8081"}
 
 	demoCtx.nodes = 1
+	demoCtx.sqlPoolMemorySize = 128 << 20 // 128MB, chosen to fit 9 nodes on 2GB machine.
+	demoCtx.cacheSize = 64 << 20          // 64MB, chosen to fit 9 nodes on 2GB machine.
 	demoCtx.useEmptyDatabase = false
 	demoCtx.simulateLatency = false
 	demoCtx.runWorkload = false
@@ -158,6 +160,8 @@ func initCLIDefaults() {
 	demoCtx.disableTelemetry = false
 	demoCtx.disableLicenseAcquisition = false
 	demoCtx.transientCluster = nil
+
+	authCtx.validityPeriod = 1 * time.Hour
 
 	initPreFlagsDefaults()
 
@@ -260,6 +264,13 @@ var dumpCtx struct {
 	asOf string
 }
 
+// authCtx captures the command-line parameters of the `auth-session`
+// command.
+var authCtx struct {
+	onlyCookie     bool
+	validityPeriod time.Duration
+}
+
 // debugCtx captures the command-line parameters of the `debug` command.
 // Defaults set by InitCLIDefaults() above.
 var debugCtx struct {
@@ -355,6 +366,8 @@ var sqlfmtCtx struct {
 // Defaults set by InitCLIDefaults() above.
 var demoCtx struct {
 	nodes                     int
+	sqlPoolMemorySize         int64
+	cacheSize                 int64
 	disableTelemetry          bool
 	disableLicenseAcquisition bool
 	useEmptyDatabase          bool

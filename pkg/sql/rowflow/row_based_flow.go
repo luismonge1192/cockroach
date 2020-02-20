@@ -48,16 +48,20 @@ func NewRowBasedFlow(base *flowinfra.FlowBase) flowinfra.Flow {
 // Setup if part of the flowinfra.Flow interface.
 func (f *rowBasedFlow) Setup(
 	ctx context.Context, spec *execinfrapb.FlowSpec, opt flowinfra.FuseOpt,
-) error {
-	f.SetSpec(spec)
+) (context.Context, error) {
+	var err error
+	ctx, err = f.FlowBase.Setup(ctx, spec, opt)
+	if err != nil {
+		return ctx, err
+	}
 	// First step: setup the input synchronizers for all processors.
 	inputSyncs, err := f.setupInputSyncs(ctx, spec, opt)
 	if err != nil {
-		return err
+		return ctx, err
 	}
 
 	// Then, populate processors.
-	return f.setupProcessors(ctx, spec, inputSyncs)
+	return ctx, f.setupProcessors(ctx, spec, inputSyncs)
 }
 
 // setupProcessors creates processors for each spec in f.spec, fusing processors
@@ -394,13 +398,18 @@ func (f *rowBasedFlow) setupRouter(spec *execinfrapb.OutputRouterSpec) (router, 
 	return makeRouter(spec, streams)
 }
 
+// IsVectorized is part of the flowinfra.Flow interface.
+func (f *rowBasedFlow) IsVectorized() bool {
+	return false
+}
+
 // Release releases this rowBasedFlow back to the pool.
 func (f *rowBasedFlow) Release() {
 	*f = rowBasedFlow{}
 	rowBasedFlowPool.Put(f)
 }
 
-// Cleanup is part of the Flow interface.
+// Cleanup is part of the flowinfra.Flow interface.
 func (f *rowBasedFlow) Cleanup(ctx context.Context) {
 	f.FlowBase.Cleanup(ctx)
 	f.Release()

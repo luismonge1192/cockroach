@@ -20,7 +20,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/kr/pretty"
 	"github.com/pkg/errors"
@@ -102,7 +103,7 @@ func createTestStorePool(
 	rpcContext := rpc.NewContext(
 		log.AmbientContext{Tracer: st.Tracer}, &base.Config{Insecure: true}, clock, stopper, st)
 	server := rpc.NewServer(rpcContext) // never started
-	g := gossip.NewTest(1, rpcContext, server, stopper, metric.NewRegistry(), config.DefaultZoneConfigRef())
+	g := gossip.NewTest(1, rpcContext, server, stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 	mnl := newMockNodeLiveness(defaultNodeStatus)
 
 	TimeUntilStoreDead.Override(&st.SV, timeUntilStoreDeadValue)
@@ -147,7 +148,7 @@ func TestStorePoolGossipUpdate(t *testing.T) {
 // verifyStoreList ensures that the returned list of stores is correct.
 func verifyStoreList(
 	sp *StorePool,
-	constraints []config.Constraints,
+	constraints []zonepb.Constraints,
 	storeIDs roachpb.StoreIDSlice, // optional
 	rangeID roachpb.RangeID,
 	filter storeFilter,
@@ -196,11 +197,11 @@ func TestStorePoolGetStoreList(t *testing.T) {
 		storagepb.NodeLivenessStatus_DEAD)
 	defer stopper.Stop(context.TODO())
 	sg := gossiputil.NewStoreGossiper(g)
-	constraints := []config.Constraints{
+	constraints := []zonepb.Constraints{
 		{
-			Constraints: []config.Constraint{
-				{Type: config.Constraint_REQUIRED, Value: "ssd"},
-				{Type: config.Constraint_REQUIRED, Value: "dc"},
+			Constraints: []zonepb.Constraint{
+				{Type: zonepb.Constraint_REQUIRED, Value: "ssd"},
+				{Type: zonepb.Constraint_REQUIRED, Value: "dc"},
 			},
 		},
 	}
@@ -353,13 +354,13 @@ func TestStorePoolGetStoreList(t *testing.T) {
 func TestStoreListFilter(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	constraints := []config.Constraints{
+	constraints := []zonepb.Constraints{
 		{
-			Constraints: []config.Constraint{
-				{Type: config.Constraint_REQUIRED, Key: "region", Value: "us-west"},
-				{Type: config.Constraint_REQUIRED, Value: "MustMatch"},
-				{Type: config.Constraint_DEPRECATED_POSITIVE, Value: "MatchingOptional"},
-				{Type: config.Constraint_PROHIBITED, Value: "MustNotMatch"},
+			Constraints: []zonepb.Constraint{
+				{Type: zonepb.Constraint_REQUIRED, Key: "region", Value: "us-west"},
+				{Type: zonepb.Constraint_REQUIRED, Value: "MustMatch"},
+				{Type: zonepb.Constraint_DEPRECATED_POSITIVE, Value: "MatchingOptional"},
+				{Type: zonepb.Constraint_PROHIBITED, Value: "MustNotMatch"},
 			},
 		},
 	}
@@ -591,11 +592,13 @@ func TestStorePoolUpdateLocalStoreBeforeGossip(t *testing.T) {
 
 	// Create replica.
 	rg := roachpb.RangeDescriptor{
-		RangeID:  1,
-		StartKey: roachpb.RKey([]byte("a")),
-		EndKey:   roachpb.RKey([]byte("b")),
+		RangeID:       1,
+		StartKey:      roachpb.RKey([]byte("a")),
+		EndKey:        roachpb.RKey([]byte("b")),
+		NextReplicaID: 1,
 	}
-	replica, err := NewReplica(&rg, store, roachpb.ReplicaID(0))
+	rg.AddReplica(1, 1, roachpb.VOTER_FULL)
+	replica, err := newReplica(ctx, &rg, store, 1)
 	if err != nil {
 		t.Fatalf("make replica error : %+v", err)
 	}
@@ -960,5 +963,141 @@ func TestStorePoolDecommissioningReplicas(t *testing.T) {
 	decommissioningReplicas := sp.decommissioningReplicas(0, replicas)
 	if a, e := decommissioningReplicas, replicas[3:4]; !reflect.DeepEqual(a, e) {
 		t.Fatalf("expected decommissioning replicas %+v; got %+v", e, a)
+	}
+}
+
+func TestNodeLivenessLivenessStatus(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	now := timeutil.Now()
+	threshold := 5 * time.Minute
+
+	for _, tc := range []struct {
+		liveness storagepb.Liveness
+		expected storagepb.NodeLivenessStatus
+	}{
+		// Valid status.
+		{
+			liveness: storagepb.Liveness{
+				NodeID: 1,
+				Epoch:  1,
+				Expiration: hlc.LegacyTimestamp{
+					WallTime: now.Add(5 * time.Minute).UnixNano(),
+				},
+				Decommissioning: false,
+				Draining:        false,
+			},
+			expected: storagepb.NodeLivenessStatus_LIVE,
+		},
+		{
+			liveness: storagepb.Liveness{
+				NodeID: 1,
+				Epoch:  1,
+				Expiration: hlc.LegacyTimestamp{
+					// Expires just slightly in the future.
+					WallTime: now.UnixNano() + 1,
+				},
+				Decommissioning: false,
+				Draining:        false,
+			},
+			expected: storagepb.NodeLivenessStatus_LIVE,
+		},
+		// Expired status.
+		{
+			liveness: storagepb.Liveness{
+				NodeID: 1,
+				Epoch:  1,
+				Expiration: hlc.LegacyTimestamp{
+					// Just expired.
+					WallTime: now.UnixNano(),
+				},
+				Decommissioning: false,
+				Draining:        false,
+			},
+			expected: storagepb.NodeLivenessStatus_UNAVAILABLE,
+		},
+		// Expired status.
+		{
+			liveness: storagepb.Liveness{
+				NodeID: 1,
+				Epoch:  1,
+				Expiration: hlc.LegacyTimestamp{
+					WallTime: now.UnixNano(),
+				},
+				Decommissioning: false,
+				Draining:        false,
+			},
+			expected: storagepb.NodeLivenessStatus_UNAVAILABLE,
+		},
+		// Max bound of expired.
+		{
+			liveness: storagepb.Liveness{
+				NodeID: 1,
+				Epoch:  1,
+				Expiration: hlc.LegacyTimestamp{
+					WallTime: now.Add(-threshold).UnixNano() + 1,
+				},
+				Decommissioning: false,
+				Draining:        false,
+			},
+			expected: storagepb.NodeLivenessStatus_UNAVAILABLE,
+		},
+		// Dead status.
+		{
+			liveness: storagepb.Liveness{
+				NodeID: 1,
+				Epoch:  1,
+				Expiration: hlc.LegacyTimestamp{
+					WallTime: now.Add(-threshold).UnixNano(),
+				},
+				Decommissioning: false,
+				Draining:        false,
+			},
+			expected: storagepb.NodeLivenessStatus_DEAD,
+		},
+		// Decommissioning.
+		{
+			liveness: storagepb.Liveness{
+				NodeID: 1,
+				Epoch:  1,
+				Expiration: hlc.LegacyTimestamp{
+					WallTime: now.Add(time.Second).UnixNano(),
+				},
+				Decommissioning: true,
+				Draining:        false,
+			},
+			expected: storagepb.NodeLivenessStatus_DECOMMISSIONING,
+		},
+		// Decommissioned.
+		{
+			liveness: storagepb.Liveness{
+				NodeID: 1,
+				Epoch:  1,
+				Expiration: hlc.LegacyTimestamp{
+					WallTime: now.Add(-threshold).UnixNano(),
+				},
+				Decommissioning: true,
+				Draining:        false,
+			},
+			expected: storagepb.NodeLivenessStatus_DECOMMISSIONED,
+		},
+		// Draining (reports as unavailable).
+		{
+			liveness: storagepb.Liveness{
+				NodeID: 1,
+				Epoch:  1,
+				Expiration: hlc.LegacyTimestamp{
+					WallTime: now.Add(5 * time.Minute).UnixNano(),
+				},
+				Decommissioning: false,
+				Draining:        true,
+			},
+			expected: storagepb.NodeLivenessStatus_UNAVAILABLE,
+		},
+	} {
+		t.Run("", func(t *testing.T) {
+			if a, e := LivenessStatus(tc.liveness, now, threshold), tc.expected; a != e {
+				t.Errorf("liveness status was %s, wanted %s", a.String(), e.String())
+			}
+		})
 	}
 }

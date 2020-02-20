@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/pkg/errors"
 )
 
@@ -55,6 +56,9 @@ var _ = math.MaxInt64
 
 // Dummy import to pull in "time" package.
 var _ time.Time
+
+// Dummy import to pull in "duration" package.
+var _ duration.Duration
 
 // Dummy import to pull in "coltypes" package.
 var _ coltypes.T
@@ -85,14 +89,18 @@ type _OP_CONST_NAME struct {
 }
 
 func (p _OP_CONST_NAME) Next(ctx context.Context) coldata.Batch {
+	// In order to inline the templated code of overloads, we need to have a
+	// `decimalScratch` local variable of type `decimalOverloadScratch`.
+	decimalScratch := p.decimalScratch
+	// However, the scratch is not used in all of the projection operators, so
+	// we add this to go around "unused" error.
+	_ = decimalScratch
 	batch := p.input.Next(ctx)
 	n := batch.Length()
-	if p.outputIdx == batch.Width() {
-		p.allocator.AppendColumn(batch, coltypes._RET_TYP)
-	}
 	if n == 0 {
-		return batch
+		return coldata.ZeroBatch
 	}
+	p.allocator.MaybeAddColumn(batch, coltypes._RET_TYP, p.outputIdx)
 	vec := batch.ColVec(p.colIdx)
 	// {{if _IS_CONST_LEFT}}
 	col := vec._R_TYP()
@@ -106,6 +114,9 @@ func (p _OP_CONST_NAME) Next(ctx context.Context) coldata.Batch {
 	} else {
 		_SET_PROJECTION(false)
 	}
+	// Although we didn't change the length of the batch, it is necessary to set
+	// the length anyway (this helps maintaining the invariant of flat bytes).
+	batch.SetLength(n)
 	return batch
 }
 
@@ -131,9 +142,8 @@ func _SET_PROJECTION(_HAS_NULLS bool) {
 		}
 	} else {
 		col = execgen.SLICE(col, 0, int(n))
-		colLen := execgen.LEN(col)
-		_ = _RET_UNSAFEGET(projCol, colLen-1)
-		for execgen.RANGE(i, col) {
+		_ = _RET_UNSAFEGET(projCol, int(n)-1)
+		for execgen.RANGE(i, col, 0, int(n)) {
 			_SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS)
 		}
 	}

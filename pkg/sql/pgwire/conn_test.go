@@ -109,7 +109,7 @@ func TestConn(t *testing.T) {
 			// sqlServer - nil means don't create a command processor and a write side of the conn
 			nil,
 			mon.BoundAccount{}, /* reserved */
-			authOptions{skipAuth: true},
+			authOptions{testingSkipAuth: true},
 			s.Stopper())
 		return nil
 	})
@@ -226,7 +226,9 @@ func execQuery(
 	ctx context.Context, query string, s serverutils.TestServerInterface, c *conn,
 ) error {
 	rows, cols, err := s.InternalExecutor().(sqlutil.InternalExecutor).QueryWithCols(
-		ctx, "test", nil /* txn */, query,
+		ctx, "test", nil, /* txn */
+		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser, Database: "system"},
+		query,
 	)
 	if err != nil {
 		return err
@@ -328,8 +330,8 @@ func waitForClientConn(ln net.Listener) (*conn, error) {
 		return nil, errors.Errorf("unexpected protocol version: %d", version)
 	}
 
-	// Consumer the connection options.
-	if _, err := parseOptions(context.TODO(), buf.Msg); err != nil {
+	// Consume the connection options.
+	if _, err := parseClientProvidedSessionParameters(context.TODO(), nil, &buf); err != nil {
 		return nil, err
 	}
 
@@ -778,7 +780,7 @@ func TestMaliciousInputs(t *testing.T) {
 				func() bool { return false }, /* draining */
 				nil,                          /* sqlServer */
 				mon.BoundAccount{},           /* reserved */
-				authOptions{skipAuth: true},
+				authOptions{testingSkipAuth: true},
 				stopper,
 			)
 			if err := <-errChan; err != nil {

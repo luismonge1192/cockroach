@@ -188,7 +188,7 @@ func TestProcessorBasic(t *testing.T) {
 	// Add a registration.
 	r1Stream := newTestStream()
 	r1ErrC := make(chan *roachpb.Error, 1)
-	r1OK := p.Register(
+	r1OK, r1Filter := p.Register(
 		roachpb.RSpan{Key: roachpb.RKey("a"), EndKey: roachpb.RKey("m")},
 		hlc.Timestamp{WallTime: 1},
 		nil,   /* catchUpIter */
@@ -201,18 +201,26 @@ func TestProcessorBasic(t *testing.T) {
 	require.Equal(t, 1, p.Len())
 	require.Equal(t,
 		[]*roachpb.RangeFeedEvent{rangeFeedCheckpoint(
-			roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("z")},
+			roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("m")},
 			hlc.Timestamp{WallTime: 1},
 		)},
 		r1Stream.Events(),
 	)
+
+	// Test the processor's operation filter.
+	require.True(t, r1Filter.NeedVal(roachpb.Span{Key: roachpb.Key("a")}))
+	require.True(t, r1Filter.NeedVal(roachpb.Span{Key: roachpb.Key("d"), EndKey: roachpb.Key("r")}))
+	require.False(t, r1Filter.NeedVal(roachpb.Span{Key: roachpb.Key("z")}))
+	require.False(t, r1Filter.NeedPrevVal(roachpb.Span{Key: roachpb.Key("a")}))
+	require.False(t, r1Filter.NeedPrevVal(roachpb.Span{Key: roachpb.Key("d"), EndKey: roachpb.Key("r")}))
+	require.False(t, r1Filter.NeedPrevVal(roachpb.Span{Key: roachpb.Key("z")}))
 
 	// Test checkpoint with one registration.
 	p.ForwardClosedTS(hlc.Timestamp{WallTime: 5})
 	p.syncEventAndRegistrations()
 	require.Equal(t,
 		[]*roachpb.RangeFeedEvent{rangeFeedCheckpoint(
-			roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("z")},
+			roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("m")},
 			hlc.Timestamp{WallTime: 5},
 		)},
 		r1Stream.Events(),
@@ -264,7 +272,7 @@ func TestProcessorBasic(t *testing.T) {
 	p.syncEventAndRegistrations()
 	require.Equal(t,
 		[]*roachpb.RangeFeedEvent{rangeFeedCheckpoint(
-			roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("z")},
+			roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("m")},
 			hlc.Timestamp{WallTime: 9},
 		)},
 		r1Stream.Events(),
@@ -274,7 +282,7 @@ func TestProcessorBasic(t *testing.T) {
 	p.syncEventAndRegistrations()
 	require.Equal(t,
 		[]*roachpb.RangeFeedEvent{rangeFeedCheckpoint(
-			roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("z")},
+			roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("m")},
 			hlc.Timestamp{WallTime: 11},
 		)},
 		r1Stream.Events(),
@@ -294,21 +302,21 @@ func TestProcessorBasic(t *testing.T) {
 				},
 			),
 			rangeFeedCheckpoint(
-				roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("z")},
+				roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("m")},
 				hlc.Timestamp{WallTime: 15},
 			),
 		},
 		r1Stream.Events(),
 	)
 
-	// Add another registration.
+	// Add another registration with withDiff = true.
 	r2Stream := newTestStream()
 	r2ErrC := make(chan *roachpb.Error, 1)
-	r2OK := p.Register(
+	r2OK, r1And2Filter := p.Register(
 		roachpb.RSpan{Key: roachpb.RKey("c"), EndKey: roachpb.RKey("z")},
 		hlc.Timestamp{WallTime: 1},
-		nil,   /* catchUpIter */
-		false, /* withDiff */
+		nil,  /* catchUpIter */
+		true, /* withDiff */
 		r2Stream,
 		r2ErrC,
 	)
@@ -317,21 +325,35 @@ func TestProcessorBasic(t *testing.T) {
 	require.Equal(t, 2, p.Len())
 	require.Equal(t,
 		[]*roachpb.RangeFeedEvent{rangeFeedCheckpoint(
-			roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("z")},
+			roachpb.Span{Key: roachpb.Key("c"), EndKey: roachpb.Key("z")},
 			hlc.Timestamp{WallTime: 15},
 		)},
 		r2Stream.Events(),
 	)
 
+	// Test the processor's new operation filter.
+	require.True(t, r1And2Filter.NeedVal(roachpb.Span{Key: roachpb.Key("a")}))
+	require.True(t, r1And2Filter.NeedVal(roachpb.Span{Key: roachpb.Key("y")}))
+	require.True(t, r1And2Filter.NeedVal(roachpb.Span{Key: roachpb.Key("y"), EndKey: roachpb.Key("zzz")}))
+	require.False(t, r1And2Filter.NeedVal(roachpb.Span{Key: roachpb.Key("zzz")}))
+	require.False(t, r1And2Filter.NeedPrevVal(roachpb.Span{Key: roachpb.Key("a")}))
+	require.True(t, r1And2Filter.NeedPrevVal(roachpb.Span{Key: roachpb.Key("y")}))
+	require.True(t, r1And2Filter.NeedPrevVal(roachpb.Span{Key: roachpb.Key("y"), EndKey: roachpb.Key("zzz")}))
+	require.False(t, r1And2Filter.NeedPrevVal(roachpb.Span{Key: roachpb.Key("zzz")}))
+
 	// Both registrations should see checkpoint.
 	p.ForwardClosedTS(hlc.Timestamp{WallTime: 20})
 	p.syncEventAndRegistrations()
-	chEvent := []*roachpb.RangeFeedEvent{rangeFeedCheckpoint(
-		roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("z")},
+	chEventAM := []*roachpb.RangeFeedEvent{rangeFeedCheckpoint(
+		roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("m")},
 		hlc.Timestamp{WallTime: 20},
 	)}
-	require.Equal(t, chEvent, r1Stream.Events())
-	require.Equal(t, chEvent, r2Stream.Events())
+	require.Equal(t, chEventAM, r1Stream.Events())
+	chEventCZ := []*roachpb.RangeFeedEvent{rangeFeedCheckpoint(
+		roachpb.Span{Key: roachpb.Key("c"), EndKey: roachpb.Key("z")},
+		hlc.Timestamp{WallTime: 20},
+	)}
+	require.Equal(t, chEventCZ, r2Stream.Events())
 
 	// Test value with two registration that overlaps both.
 	p.ConsumeLogicalOps(
@@ -375,7 +397,7 @@ func TestProcessorBasic(t *testing.T) {
 	// Adding another registration should fail.
 	r3Stream := newTestStream()
 	r3ErrC := make(chan *roachpb.Error, 1)
-	r3OK := p.Register(
+	r3OK, _ := p.Register(
 		roachpb.RSpan{Key: roachpb.RKey("c"), EndKey: roachpb.RKey("z")},
 		hlc.Timestamp{WallTime: 1},
 		nil,   /* catchUpIter */
@@ -410,9 +432,6 @@ func TestProcessorSlowConsumer(t *testing.T) {
 	p, stopper := newTestProcessor(nil /* rtsIter */)
 	defer stopper.Stop(context.Background())
 
-	// Set the Processor's eventC timeout.
-	p.EventChanTimeout = 100 * time.Millisecond
-
 	// Add a registration.
 	r1Stream := newTestStream()
 	r1ErrC := make(chan *roachpb.Error, 1)
@@ -438,62 +457,61 @@ func TestProcessorSlowConsumer(t *testing.T) {
 	require.Equal(t, 2, p.Len())
 	require.Equal(t,
 		[]*roachpb.RangeFeedEvent{rangeFeedCheckpoint(
-			roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("z")},
+			roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("m")},
 			hlc.Timestamp{WallTime: 0},
 		)},
 		r1Stream.Events(),
 	)
+	require.Equal(t,
+		[]*roachpb.RangeFeedEvent{rangeFeedCheckpoint(
+			roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("z")},
+			hlc.Timestamp{WallTime: 0},
+		)},
+		r2Stream.Events(),
+	)
 
-	// Block its Send method and fill up the processor's input channel.
+	// Block its Send method and fill up the registration's input channel.
 	unblock := r1Stream.BlockSend()
 	defer func() {
 		if unblock != nil {
 			unblock()
 		}
 	}()
-	fillEventC := func() {
-		// Need one more message to fill the channel because the first one
-		// will be Sent to the stream and block the processor goroutine.
-		toFill := testProcessorEventCCap + 1
-		for i := 0; i < toFill; i++ {
-			ts := hlc.Timestamp{WallTime: int64(i + 2)}
-			p.ConsumeLogicalOps(
-				writeValueOpWithKV(roachpb.Key("k"), ts, []byte("val")),
-			)
-		}
-	}
-	fillEventC()
-	p.syncEventC()
-
-	// Wait for just the unblocked registration to catch up. This prevents the
-	// race condition where this registration overflows anyway due to the rapid
-	// event consumption and small buffer size.
-	p.syncEventAndRegistrationSpan(spXY)
-
-	// Consume one more event. Should not block.
-	consumedC := make(chan struct{})
-	go func() {
+	// Need one more message to fill the channel because the first one will be
+	// sent to the stream and block the registration outputLoop goroutine.
+	toFill := testProcessorEventCCap + 1
+	for i := 0; i < toFill; i++ {
+		ts := hlc.Timestamp{WallTime: int64(i + 2)}
 		p.ConsumeLogicalOps(
-			writeValueOpWithKV(roachpb.Key("k"), hlc.Timestamp{WallTime: 15}, []byte("val")),
+			writeValueOpWithKV(roachpb.Key("k"), ts, []byte("val")),
 		)
-		close(consumedC)
-	}()
-	<-consumedC
-	p.syncEventC()
+
+		// Wait for just the unblocked registration to catch up. This prevents
+		// the race condition where this registration overflows anyway due to
+		// the rapid event consumption and small buffer size.
+		p.syncEventAndRegistrationSpan(spXY)
+	}
+
+	// Consume one more event. Should not block, but should cause r1 to overflow
+	// its registration buffer and drop the event.
+	p.ConsumeLogicalOps(
+		writeValueOpWithKV(roachpb.Key("k"), hlc.Timestamp{WallTime: 18}, []byte("val")),
+	)
 
 	// Wait for just the unblocked registration to catch up.
 	p.syncEventAndRegistrationSpan(spXY)
-	events := r2Stream.Events()
-	require.Equal(t, testProcessorEventCCap+3, len(events))
+	require.Equal(t, toFill+1, len(r2Stream.Events()))
 	require.Equal(t, 2, p.reg.Len())
 
 	// Unblock the send channel. The events should quickly be consumed.
 	unblock()
 	unblock = nil
-	<-consumedC
 	p.syncEventAndRegistrations()
-	// One event was dropped due to overflow.
-	require.Equal(t, testProcessorEventCCap+1, len(r1Stream.Events()))
+	// At least one event should have been dropped due to overflow. We expect
+	// exactly one event to be dropped, but it is possible that multiple events
+	// were dropped due to rapid event consumption before the r1's outputLoop
+	// began consuming from its event buffer.
+	require.LessOrEqual(t, len(r1Stream.Events()), toFill)
 	require.Equal(t, newErrBufferCapacityExceeded().GoError(), (<-r1ErrC).GoError())
 	testutils.SucceedsSoon(t, func() error {
 		if act, exp := p.Len(), 1; exp != act {
@@ -560,7 +578,7 @@ func TestProcessorInitializeResolvedTimestamp(t *testing.T) {
 	// The registration should be provided a checkpoint immediately with an
 	// empty resolved timestamp because it did not perform a catch-up scan.
 	chEvent := []*roachpb.RangeFeedEvent{rangeFeedCheckpoint(
-		roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("z")},
+		roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("m")},
 		hlc.Timestamp{},
 	)}
 	require.Equal(t, chEvent, r1Stream.Events())
@@ -591,7 +609,7 @@ func TestProcessorInitializeResolvedTimestamp(t *testing.T) {
 
 	// The registration should have been informed of the new resolved timestamp.
 	chEvent = []*roachpb.RangeFeedEvent{rangeFeedCheckpoint(
-		roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("z")},
+		roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("m")},
 		hlc.Timestamp{WallTime: 18},
 	)}
 	require.Equal(t, chEvent, r1Stream.Events())

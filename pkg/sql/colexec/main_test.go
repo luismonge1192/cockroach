@@ -12,11 +12,14 @@ package colexec
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
@@ -43,6 +46,22 @@ func TestMain(m *testing.M) {
 		testMemAcc = &memAcc
 		testAllocator = NewAllocator(ctx, testMemAcc)
 		defer testMemAcc.Close(ctx)
+		// Pick a random batch size in [coldata.MinBatchSize, coldata.MaxBatchSize]
+		// range. The randomization can be disabled using COCKROACH_RANDOMIZE_BATCH_SIZE=false.
+		randomBatchSize := generateBatchSize()
+		fmt.Printf("coldata.BatchSize() is set to %d\n", randomBatchSize)
+		coldata.SetBatchSizeForTests(randomBatchSize)
 		return m.Run()
 	}())
+}
+
+func generateBatchSize() uint16 {
+	randomizeBatchSize := envutil.EnvOrDefaultBool("COCKROACH_RANDOMIZE_BATCH_SIZE", true)
+	if randomizeBatchSize {
+		rng, _ := randutil.NewPseudoRand()
+		batchSize := uint16(coldata.MinBatchSize +
+			rng.Intn(coldata.MaxBatchSize-coldata.MinBatchSize))
+		return batchSize
+	}
+	return coldata.BatchSize()
 }

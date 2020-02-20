@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow/colrpc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -25,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/stretchr/testify/require"
 )
@@ -208,21 +210,133 @@ func TestDrainOnlyInputDAG(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 	f := &flowinfra.FlowBase{FlowCtx: execinfra.FlowCtx{EvalCtx: &evalCtx, NodeID: roachpb.NodeID(1)}}
 	var wg sync.WaitGroup
-	vfc := newVectorizedFlowCreator(
-		&vectorizedFlowCreatorHelper{f: f},
-		componentCreator,
-		false, /* recordingStats */
-		&wg,
-		&execinfra.RowChannel{},
-		nil, /* nodeDialer */
-		execinfrapb.FlowID{},
-	)
+	vfc := newVectorizedFlowCreator(&vectorizedFlowCreatorHelper{f: f}, componentCreator, false, &wg, &execinfra.RowChannel{}, nil, execinfrapb.FlowID{}, colcontainer.DiskQueueCfg{})
 
-	acc := evalCtx.Mon.MakeBoundAccount()
-	defer acc.Close(ctx)
-	_, err := vfc.setupFlow(ctx, &f.FlowCtx, procs, &acc, flowinfra.FuseNormally)
+	_, err := vfc.setupFlow(ctx, &f.FlowCtx, procs, flowinfra.FuseNormally)
+	defer func() {
+		for _, memAcc := range vfc.streamingMemAccounts {
+			memAcc.Close(ctx)
+		}
+	}()
 	require.NoError(t, err)
 
 	// Verify that an outbox was actually created.
 	require.True(t, outboxCreated)
+}
+
+// TestVectorizedFlowTempDirectory tests a flow's interactions with the
+// temporary directory that will be used when spilling execution. Refer to
+// subtests for a more thorough explanation.
+func TestVectorizedFlowTempDirectory(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.MakeTestingEvalContext(st)
+	ctx := context.Background()
+	defer evalCtx.Stop(ctx)
+
+	const baseDirName = "base"
+
+	ngn := engine.NewDefaultInMem()
+	defer ngn.Close()
+	require.NoError(t, ngn.CreateDir(baseDirName))
+
+	newVectorizedFlow := func() *vectorizedFlow {
+		return NewVectorizedFlow(
+			&flowinfra.FlowBase{
+				FlowCtx: execinfra.FlowCtx{
+					Cfg: &execinfra.ServerConfig{
+						TempFS:          ngn,
+						TempStoragePath: baseDirName,
+					},
+					EvalCtx: &evalCtx,
+					NodeID:  roachpb.NodeID(1),
+				},
+			},
+		).(*vectorizedFlow)
+	}
+
+	checkDirs := func(t *testing.T, numDirs int) {
+		t.Helper()
+		dirs, err := ngn.ListDir(baseDirName)
+		require.NoError(t, err)
+		require.Equal(t, numDirs, len(dirs), "expected %d directories but found %d: %s", numDirs, len(dirs), dirs)
+	}
+
+	// LazilyCreated asserts that a directory is not created during flow Setup
+	// but is done so when an operator spills to disk.
+	t.Run("LazilyCreated", func(t *testing.T) {
+		vf := newVectorizedFlow()
+		var creator *vectorizedFlowCreator
+		vf.testingKnobs.onSetupFlow = func(c *vectorizedFlowCreator) {
+			creator = c
+		}
+
+		_, err := vf.Setup(ctx, &execinfrapb.FlowSpec{}, flowinfra.FuseNormally)
+		require.NoError(t, err)
+
+		// No directory should have been created.
+		checkDirs(t, 0)
+
+		// After the call to Setup, creator should be non-nil (i.e. the testing knob
+		// should have been called).
+		require.NotNil(t, creator)
+
+		// Now simulate an operator spilling to disk. The flow should have set this
+		// up to create its directory.
+		creator.diskQueueCfg.OnNewDiskQueueCb()
+
+		// We should now have one directory, the flow's temporary storage directory.
+		checkDirs(t, 1)
+
+		// Another operator calling OnNewDiskQueueCb again should not create a new
+		// directory
+		creator.diskQueueCfg.OnNewDiskQueueCb()
+		checkDirs(t, 1)
+
+		// When the flow is Cleaned up, this directory should be removed.
+		vf.Cleanup(ctx)
+		checkDirs(t, 0)
+	})
+
+	// This subtest verifies that two local flows with the same ID create
+	// different directories. This case happens regularly with local flows, since
+	// they have an unset ID.
+	t.Run("DirCreationHandlesUnsetIDCollisions", func(t *testing.T) {
+		flowID := execinfrapb.FlowID{}
+		vf1 := newVectorizedFlow()
+		var creator1 *vectorizedFlowCreator
+		vf1.testingKnobs.onSetupFlow = func(c *vectorizedFlowCreator) {
+			creator1 = c
+		}
+		// Explicitly set an empty ID.
+		vf1.ID = flowID
+		_, err := vf1.Setup(ctx, &execinfrapb.FlowSpec{}, flowinfra.FuseNormally)
+		require.NoError(t, err)
+
+		checkDirs(t, 0)
+		creator1.diskQueueCfg.OnNewDiskQueueCb()
+		checkDirs(t, 1)
+
+		// Now a new flow with the same ID gets set up.
+		vf2 := newVectorizedFlow()
+		var creator2 *vectorizedFlowCreator
+		vf2.testingKnobs.onSetupFlow = func(c *vectorizedFlowCreator) {
+			creator2 = c
+		}
+		vf2.ID = flowID
+		_, err = vf2.Setup(ctx, &execinfrapb.FlowSpec{}, flowinfra.FuseNormally)
+		require.NoError(t, err)
+
+		// Still only 1 directory.
+		checkDirs(t, 1)
+		creator2.diskQueueCfg.OnNewDiskQueueCb()
+		// A new directory should have been created for this flow.
+		checkDirs(t, 2)
+
+		vf1.Cleanup(ctx)
+		checkDirs(t, 1)
+		vf2.Cleanup(ctx)
+		checkDirs(t, 0)
+	})
 }

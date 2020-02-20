@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cli/syncbench"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -39,6 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/gc"
 	"github.com/cockroachdb/cockroach/pkg/storage/rditer"
 	"github.com/cockroachdb/cockroach/pkg/storage/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
@@ -145,6 +147,8 @@ func OpenEngine(dir string, stopper *stop.Stopper, opts OpenEngineOptions) (engi
 			Opts:          engine.DefaultPebbleOptions(),
 		}
 		cfg.Opts.Cache = pebble.NewCache(server.DefaultCacheSize)
+		defer cfg.Opts.Cache.Unref()
+
 		cfg.Opts.MaxOpenFiles = int(maxOpenFiles)
 		cfg.Opts.ReadOnly = opts.ReadOnly
 
@@ -285,7 +289,7 @@ func runDebugRangeData(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	iter := rditer.NewReplicaDataIterator(&desc, db, debugCtx.replicated)
+	iter := rditer.NewReplicaDataIterator(&desc, db, debugCtx.replicated, false /* seekEnd */)
 	defer iter.Close()
 	for ; ; iter.Next() {
 		if ok, err := iter.Valid(); err != nil {
@@ -323,7 +327,7 @@ func loadRangeDescriptor(
 		if err := storage.IsRangeDescriptorKey(kv.Key); err != nil {
 			// Range descriptor keys are interleaved with others, so if it
 			// doesn't parse as a range descriptor just skip it.
-			return false, nil
+			return false, nil //nolint:returnerrcheck
 		}
 		if len(kv.Value) == 0 {
 			// RangeDescriptor was deleted (range merged away).
@@ -554,13 +558,14 @@ func runDebugGCCmd(cmd *cobra.Command, args []string) error {
 	for _, desc := range descs {
 		snap := db.NewSnapshot()
 		defer snap.Close()
-		info, err := storage.RunGC(
+		policy := zonepb.GCPolicy{TTLSeconds: int32(gcTTLInSeconds)}
+		now := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
+		thresh := gc.CalculateThreshold(now, policy)
+		info, err := gc.Run(
 			context.Background(),
-			&desc,
-			snap,
-			hlc.Timestamp{WallTime: timeutil.Now().UnixNano()},
-			config.GCPolicy{TTLSeconds: int32(gcTTLInSeconds)},
-			storage.NoopGCer{},
+			&desc, snap,
+			now, thresh, policy,
+			gc.NoopGCer{},
 			func(_ context.Context, _ []roachpb.Intent) error { return nil },
 			func(_ context.Context, _ *roachpb.Transaction, _ []roachpb.Intent) error { return nil },
 		)
@@ -863,11 +868,11 @@ func runTimeSeriesDump(cmd *cobra.Command, args []string) error {
 	var name, source string
 	for {
 		data, err := stream.Recv()
-		if err != nil {
-			if err != io.EOF {
-				return err
-			}
+		if err == io.EOF {
 			return nil
+		}
+		if err != nil {
+			return err
 		}
 		if name != data.Name || source != data.Source {
 			name, source = data.Name, data.Source
@@ -1127,7 +1132,7 @@ func removeDeadReplicas(
 				return nil, err
 			}
 			intent.Status = roachpb.ABORTED
-			if err := engine.MVCCResolveWriteIntent(ctx, batch, &ms, intent); err != nil {
+			if _, err := engine.MVCCResolveWriteIntent(ctx, batch, &ms, intent); err != nil {
 				return nil, err
 			}
 			// With the intent resolved, we can try again.

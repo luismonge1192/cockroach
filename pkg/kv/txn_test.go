@@ -52,8 +52,8 @@ func TestTxnDBBasics(t *testing.T) {
 			}
 
 			// Attempt to read in another txn.
-			conflictTxn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */, client.RootTxn)
-			conflictTxn.InternalSetPriority(enginepb.MaxTxnPriority)
+			conflictTxn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */)
+			conflictTxn.TestingSetPriority(enginepb.MaxTxnPriority)
 			if gr, err := conflictTxn.Get(ctx, key); err != nil {
 				return err
 			} else if gr.Exists() {
@@ -141,6 +141,7 @@ func TestLostUpdate(t *testing.T) {
 		})
 	}()
 
+	firstAttempt := true
 	if err := s.DB.Txn(context.TODO(), func(ctx context.Context, txn *client.Txn) error {
 		// Issue a read to get initial value.
 		gr, err := txn.Get(ctx, key)
@@ -164,16 +165,14 @@ func TestLostUpdate(t *testing.T) {
 			newVal = "oops!"
 		}
 		b := txn.NewBatch()
-		b.Header.DeferWriteTooOldError = true
 		b.Put(key, newVal)
-		if err := txn.Run(ctx, b); err != nil {
-			t.Fatal(err)
+		err = txn.Run(ctx, b)
+		if firstAttempt {
+			require.Error(t, err, "RETRY_WRITE_TOO_OLD")
+			firstAttempt = false
+			return err
 		}
-		// Verify that the WriteTooOld boolean is set on the txn.
-		proto := txn.Serialize()
-		if (txn.Epoch() == 0) != proto.WriteTooOld {
-			t.Fatalf("expected write too old set (%t): got %t", (txn.Epoch() == 0), proto.WriteTooOld)
-		}
+		require.NoError(t, err)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -238,7 +237,7 @@ func TestPriorityRatchetOnAbortOrPush(t *testing.T) {
 			if iteration == 1 {
 				// Verify our priority has ratcheted to one less than the pusher's priority
 				expPri := enginepb.MaxTxnPriority - 1
-				if pri := txn.Serialize().Priority; pri != expPri {
+				if pri := txn.TestingCloneTxn().Priority; pri != expPri {
 					t.Fatalf("%s: expected priority on retry to ratchet to %d; got %d", key, expPri, pri)
 				}
 				return nil
@@ -268,10 +267,10 @@ func TestPriorityRatchetOnAbortOrPush(t *testing.T) {
 	}
 }
 
-// TestTxnTimestampRegression verifies that if a transaction's
-// timestamp is pushed forward by a concurrent read, it may still
-// commit. A bug in the EndTransaction implementation used to compare
-// the transaction's current timestamp instead of original timestamp.
+// TestTxnTimestampRegression verifies that if a transaction's timestamp is
+// pushed forward by a concurrent read, it may still commit. A bug in the EndTxn
+// implementation used to compare the transaction's current timestamp instead of
+// original timestamp.
 func TestTxnTimestampRegression(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s := createTestDB(t)
@@ -286,8 +285,8 @@ func TestTxnTimestampRegression(t *testing.T) {
 		}
 
 		// Attempt to read in another txn (this will push timestamp of transaction).
-		conflictTxn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */, client.RootTxn)
-		conflictTxn.InternalSetPriority(enginepb.MaxTxnPriority)
+		conflictTxn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */)
+		conflictTxn.TestingSetPriority(enginepb.MaxTxnPriority)
 		if _, err := conflictTxn.Get(context.TODO(), keyA); err != nil {
 			return err
 		}
@@ -501,9 +500,9 @@ func TestTxnRestartedSerializableTimestampRegression(t *testing.T) {
 	}
 	// We expect no restarts (so a count of one). The transaction continues
 	// despite the push and timestamp forwarding in order to lay down all
-	// intents in the first pass. On the first EndTransaction, the difference
-	// in timestamps would cause the serializable transaction to update spans,
-	// but only writes occurred during the transaction, so the commit succeeds.
+	// intents in the first pass. On the first EndTxn, the difference in
+	// timestamps would cause the serializable transaction to update spans, but
+	// only writes occurred during the transaction, so the commit succeeds.
 	const expCount = 1
 	if count != expCount {
 		t.Fatalf("expected %d restarts, but got %d", expCount, count)
@@ -611,7 +610,7 @@ func TestTxnCommitTimestampAdvancedByRefresh(t *testing.T) {
 	var refreshTS hlc.Timestamp
 	errKey := roachpb.Key("inject_err")
 	s := createTestDBWithContextAndKnobs(t, client.DefaultDBContext(), &storage.StoreTestingKnobs{
-		TestingRequestFilter: func(ba roachpb.BatchRequest) *roachpb.Error {
+		TestingRequestFilter: func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
 			if g, ok := ba.GetArg(roachpb.Get); ok && g.(*roachpb.GetRequest).Key.Equal(errKey) {
 				if injected {
 					return nil
@@ -647,4 +646,46 @@ func TestTxnCommitTimestampAdvancedByRefresh(t *testing.T) {
 		return nil
 	})
 	require.NoError(t, err)
+}
+
+// Test that in some write too old situations (i.e. when the server returns the
+// WriteTooOld flag set and then the client fails to refresh), intents are
+// properly left behind.
+func TestTxnLeavesIntentBehindAfterWriteTooOldError(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+	s := createTestDB(t)
+	defer s.Stop()
+
+	key := []byte("b")
+
+	txn := s.DB.NewTxn(ctx, "test txn")
+	// Perform a Get so that the transaction can't refresh.
+	_, err := txn.Get(ctx, key)
+	require.NoError(t, err)
+
+	// Another guy writes at a higher timestamp.
+	require.NoError(t, s.DB.Put(ctx, key, "newer value"))
+
+	// Now we write and expect a WriteTooOld.
+	intentVal := []byte("test")
+	err = txn.Put(ctx, key, intentVal)
+	require.IsType(t, &roachpb.TransactionRetryWithProtoRefreshError{}, err)
+	require.Error(t, err, "WriteTooOld")
+
+	// Check that the intent was left behind.
+	b := client.Batch{}
+	b.Header.ReadConsistency = roachpb.READ_UNCOMMITTED
+	b.Get(key)
+	require.NoError(t, s.DB.Run(ctx, &b))
+	getResp := b.RawResponse().Responses[0].GetGet()
+	require.NotNil(t, getResp)
+	intent := getResp.IntentValue
+	require.NotNil(t, intent)
+	intentBytes, err := intent.GetBytes()
+	require.NoError(t, err)
+	require.Equal(t, intentVal, intentBytes)
+
+	// Cleanup.
+	require.NoError(t, txn.Rollback(ctx))
 }

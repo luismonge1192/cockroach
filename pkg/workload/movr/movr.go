@@ -12,6 +12,7 @@ package movr
 
 import (
 	gosql "database/sql"
+	"fmt"
 	"math"
 	"strings"
 	"sync"
@@ -43,6 +44,13 @@ const movrUsersSchema = `(
   credit_card VARCHAR NULL,
   PRIMARY KEY (city ASC, id ASC)
 )`
+
+// Indexes into the rows in movrUsers.
+const (
+	usersIDIdx   = 0
+	usersCityIdx = 1
+)
+
 const movrVehiclesSchema = `(
   id UUID NOT NULL,
   city VARCHAR NOT NULL,
@@ -55,6 +63,13 @@ const movrVehiclesSchema = `(
   PRIMARY KEY (city ASC, id ASC),
   INDEX vehicles_auto_index_fk_city_ref_users (city ASC, owner_id ASC)
 )`
+
+// Indexes into the rows in movrVehicles.
+const (
+	vehiclesIDIdx   = 0
+	vehiclesCityIdx = 1
+)
+
 const movrRidesSchema = `(
   id UUID NOT NULL,
   city VARCHAR NOT NULL,
@@ -71,6 +86,13 @@ const movrRidesSchema = `(
   INDEX rides_auto_index_fk_vehicle_city_ref_vehicles (vehicle_city ASC, vehicle_id ASC),
   CONSTRAINT check_vehicle_city_city CHECK (vehicle_city = city)
 )`
+
+// Indexes into the rows in movrRides.
+const (
+	ridesIDIdx   = 0
+	ridesCityIdx = 1
+)
+
 const movrVehicleLocationHistoriesSchema = `(
   city VARCHAR NOT NULL,
   ride_id UUID NOT NULL,
@@ -122,6 +144,7 @@ type movr struct {
 	seed                              uint64
 	users, vehicles, rides, histories cityDistributor
 	numPromoCodes                     int
+	ranges                            int
 
 	creationTime time.Time
 
@@ -148,6 +171,7 @@ var movrMeta = workload.Meta{
 		g.flags.IntVar(&g.histories.numRows, `num-histories`, 1000,
 			`Initial number of ride location histories.`)
 		g.flags.IntVar(&g.numPromoCodes, `num-promo-codes`, 1000, `Initial number of promo codes.`)
+		g.flags.IntVar(&g.ranges, `num-ranges`, 9, `Initial number of ranges to break the tables into`)
 		g.connFlags = workload.NewConnFlags(&g.flags)
 		g.creationTime = time.Date(2019, 1, 2, 3, 4, 5, 6, time.UTC)
 		return g
@@ -327,6 +351,14 @@ func (g *movr) Tables() []workload.Table {
 			g.users.numRows,
 			g.movrUsersInitialRow,
 		),
+		Splits: workload.Tuples(
+			g.ranges-1,
+			func(splitIdx int) []interface{} {
+				row := g.movrUsersInitialRow((splitIdx + 1) * (g.users.numRows / g.ranges))
+				// The split tuples returned must be valid primary key columns.
+				return []interface{}{row[usersCityIdx], row[usersIDIdx]}
+			},
+		),
 	}
 	tables[TablesVehiclesIdx] = workload.Table{
 		Name:   `vehicles`,
@@ -335,6 +367,14 @@ func (g *movr) Tables() []workload.Table {
 			g.vehicles.numRows,
 			g.movrVehiclesInitialRow,
 		),
+		Splits: workload.Tuples(
+			g.ranges-1,
+			func(splitIdx int) []interface{} {
+				row := g.movrVehiclesInitialRow((splitIdx + 1) * (g.vehicles.numRows / g.ranges))
+				// The split tuples returned must be valid primary key columns.
+				return []interface{}{row[vehiclesCityIdx], row[vehiclesIDIdx]}
+			},
+		),
 	}
 	tables[TablesRidesIdx] = workload.Table{
 		Name:   `rides`,
@@ -342,6 +382,14 @@ func (g *movr) Tables() []workload.Table {
 		InitialRows: workload.Tuples(
 			g.rides.numRows,
 			g.movrRidesInitialRow,
+		),
+		Splits: workload.Tuples(
+			g.ranges-1,
+			func(splitIdx int) []interface{} {
+				row := g.movrRidesInitialRow((splitIdx + 1) * (g.rides.numRows / g.ranges))
+				// The split tuples returned must be valid primary key columns.
+				return []interface{}{row[ridesCityIdx], row[ridesIDIdx]}
+			},
 		),
 	}
 	tables[TablesVehicleLocationHistoriesIdx] = workload.Table{
@@ -504,6 +552,7 @@ func (g *movr) movrVehicleLocationHistoriesInitialRow(rowIdx int) []interface{} 
 func (g *movr) movrPromoCodesInitialRow(rowIdx int) []interface{} {
 	rng := rand.New(rand.NewSource(g.seed + uint64(rowIdx)))
 	code := strings.ToLower(strings.Join(g.faker.Words(rng, 3), `_`))
+	code = fmt.Sprintf("%d_%s", rowIdx, code)
 	description := g.faker.Paragraph(rng)
 	expirationTime := g.creationTime.Add(time.Duration(rng.Intn(30)) * 24 * time.Hour)
 	// TODO(dan): This is nil in the reference impl, is that intentional?

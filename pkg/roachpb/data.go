@@ -37,7 +37,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timetz"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/pkg/errors"
 	"go.etcd.io/etcd/raft/raftpb"
@@ -766,6 +765,12 @@ func (ts TransactionStatus) IsFinalized() bool {
 	return ts == COMMITTED || ts == ABORTED
 }
 
+// IsCommittedOrStaging determines if the transaction is morally committed (i.e.
+// in the COMMITTED or STAGING state).
+func (ts TransactionStatus) IsCommittedOrStaging() bool {
+	return ts == COMMITTED || ts == STAGING
+}
+
 var _ log.SafeMessager = Transaction{}
 
 // MakeTransaction creates a new transaction. The transaction key is
@@ -782,15 +787,7 @@ func MakeTransaction(
 	name string, baseKey Key, userPriority UserPriority, now hlc.Timestamp, maxOffsetNs int64,
 ) Transaction {
 	u := uuid.FastMakeV4()
-	var maxTS hlc.Timestamp
-	if maxOffsetNs == timeutil.ClocklessMaxOffset {
-		// For clockless reads, use the largest possible maxTS. This means we'll
-		// always restart if we see something in our future (but we do so at
-		// most once thanks to ObservedTimestamps).
-		maxTS.WallTime = math.MaxInt64
-	} else {
-		maxTS = now.Add(maxOffsetNs, 0)
-	}
+	maxTS := now.Add(maxOffsetNs, 0)
 
 	return Transaction{
 		TxnMeta: enginepb.TxnMeta{
@@ -807,28 +804,6 @@ func MakeTransaction(
 		MaxTimestamp:            maxTS,
 		DeprecatedOrigTimestamp: now, // For compatibility with 19.2.
 	}
-}
-
-// MakeTxnCoordMeta creates a new transaction coordinator meta for the given
-// transaction.
-func MakeTxnCoordMeta(txn Transaction) TxnCoordMeta {
-	return TxnCoordMeta{Txn: txn}
-}
-
-// StripRootToLeaf strips out all information that is unnecessary to communicate
-// to leaf transactions.
-func (meta *TxnCoordMeta) StripRootToLeaf() *TxnCoordMeta {
-	meta.CommandCount = 0
-	meta.RefreshReads = nil
-	meta.RefreshWrites = nil
-	return meta
-}
-
-// StripLeafToRoot strips out all information that is unnecessary to communicate
-// back to the root transaction.
-func (meta *TxnCoordMeta) StripLeafToRoot() *TxnCoordMeta {
-	meta.InFlightWrites = nil
-	return meta
 }
 
 // LastActive returns the last timestamp at which client activity definitely
@@ -966,6 +941,7 @@ func (t *Transaction) Restart(
 	t.CommitTimestampFixed = false
 	t.IntentSpans = nil
 	t.InFlightWrites = nil
+	t.IgnoredSeqNums = nil
 }
 
 // BumpEpoch increments the transaction's epoch, allowing for an in-place
@@ -973,17 +949,6 @@ func (t *Transaction) Restart(
 // epochs.
 func (t *Transaction) BumpEpoch() {
 	t.Epoch++
-}
-
-// InclusiveTimeBounds returns start and end timestamps such that all intents written as
-// part of this transaction have a timestamp in the interval [start, end].
-func (t *Transaction) InclusiveTimeBounds() (hlc.Timestamp, hlc.Timestamp) {
-	min := t.MinTimestamp
-	max := t.WriteTimestamp
-	if min.IsEmpty() {
-		log.Fatalf(context.TODO(), "missing MinTimestamp on txn: %s", t)
-	}
-	return min, max
 }
 
 // Update ratchets priority, timestamp and original timestamp values (among
@@ -1015,6 +980,7 @@ func (t *Transaction) Update(o *Transaction) {
 		t.Sequence = o.Sequence
 		t.IntentSpans = o.IntentSpans
 		t.InFlightWrites = o.InFlightWrites
+		t.IgnoredSeqNums = o.IgnoredSeqNums
 	} else if t.Epoch == o.Epoch {
 		// Forward all epoch-scoped state.
 		switch t.Status {
@@ -1032,15 +998,22 @@ func (t *Transaction) Update(o *Transaction) {
 			// Nothing to do.
 		}
 
-		// If the refreshed timestamp move forward, overwrite
-		// WriteTooOld, otherwise the flags are cumulative.
-		if t.ReadTimestamp.Less(o.ReadTimestamp) {
-			t.WriteTooOld = o.WriteTooOld
-			t.CommitTimestampFixed = o.CommitTimestampFixed
-		} else {
+		if t.ReadTimestamp.Equal(o.ReadTimestamp) {
+			// If neither of the transactions has a bumped ReadTimestamp, then the
+			// WriteTooOld flag is cumulative.
 			t.WriteTooOld = t.WriteTooOld || o.WriteTooOld
 			t.CommitTimestampFixed = t.CommitTimestampFixed || o.CommitTimestampFixed
+		} else if t.ReadTimestamp.Less(o.ReadTimestamp) {
+			// If `o` has a higher ReadTimestamp (i.e. it's the result of a refresh,
+			// which refresh generally clears the WriteTooOld field), then it dictates
+			// the WriteTooOld field. This relies on refreshes not being performed
+			// concurrently with any requests whose response's WriteTooOld field
+			// matters.
+			t.WriteTooOld = o.WriteTooOld
+			t.CommitTimestampFixed = o.CommitTimestampFixed
 		}
+		// If t has a higher ReadTimestamp, than it gets to dictate the
+		// WriteTooOld field - so there's nothing to update.
 
 		if t.Sequence < o.Sequence {
 			t.Sequence = o.Sequence
@@ -1050,6 +1023,9 @@ func (t *Transaction) Update(o *Transaction) {
 		}
 		if len(o.InFlightWrites) > 0 {
 			t.InFlightWrites = o.InFlightWrites
+		}
+		if len(o.IgnoredSeqNums) > 0 {
+			t.IgnoredSeqNums = o.IgnoredSeqNums
 		}
 	} else /* t.Epoch > o.Epoch */ {
 		// Ignore epoch-specific state from previous epoch.
@@ -1115,6 +1091,9 @@ func (t Transaction) String() string {
 	if nw := len(t.InFlightWrites); t.Status != PENDING && nw > 0 {
 		fmt.Fprintf(&buf, " ifw=%d", nw)
 	}
+	if ni := len(t.IgnoredSeqNums); ni > 0 {
+		fmt.Fprintf(&buf, " isn=%d", ni)
+	}
 	return buf.String()
 }
 
@@ -1134,6 +1113,9 @@ func (t Transaction) SafeMessage() string {
 	}
 	if nw := len(t.InFlightWrites); t.Status != PENDING && nw > 0 {
 		fmt.Fprintf(&buf, " ifw=%d", nw)
+	}
+	if ni := len(t.IgnoredSeqNums); ni > 0 {
+		fmt.Fprintf(&buf, " isn=%d", ni)
 	}
 	return buf.String()
 }
@@ -1181,6 +1163,7 @@ func (t *Transaction) AsRecord() TransactionRecord {
 	tr.LastHeartbeat = t.LastHeartbeat
 	tr.IntentSpans = t.IntentSpans
 	tr.InFlightWrites = t.InFlightWrites
+	tr.IgnoredSeqNums = t.IgnoredSeqNums
 	return tr
 }
 
@@ -1194,6 +1177,7 @@ func (tr *TransactionRecord) AsTransaction() Transaction {
 	t.LastHeartbeat = tr.LastHeartbeat
 	t.IntentSpans = tr.IntentSpans
 	t.InFlightWrites = tr.InFlightWrites
+	t.IgnoredSeqNums = tr.IgnoredSeqNums
 	return t
 }
 
@@ -1716,7 +1700,7 @@ func (l Lease) Equivalent(newL Lease) bool {
 		// For expiration-based leases, extensions are considered equivalent.
 		// This is the one case where Equivalent is not commutative and, as
 		// such, requires special handling beneath Raft (see checkForcedErrLocked).
-		if !newL.GetExpiration().Less(l.GetExpiration()) {
+		if l.GetExpiration().LessEq(newL.GetExpiration()) {
 			l.Expiration, newL.Expiration = nil, nil
 		}
 	}
@@ -1803,11 +1787,8 @@ func (l *Lease) Equal(that interface{}) bool {
 func AsIntents(spans []Span, txn *Transaction) []Intent {
 	ret := make([]Intent, len(spans))
 	for i := range spans {
-		ret[i] = Intent{
-			Span:   spans[i],
-			Txn:    txn.TxnMeta,
-			Status: txn.Status,
-		}
+		ret[i] = Intent{Span: spans[i]}
+		ret[i].SetTxn(txn)
 	}
 	return ret
 }
@@ -2147,4 +2128,29 @@ func init() {
 	// Inject the format dependency into the enginepb package.
 	enginepb.FormatBytesAsKey = func(k []byte) string { return Key(k).String() }
 	enginepb.FormatBytesAsValue = func(v []byte) string { return Value{RawBytes: v}.PrettyPrint() }
+}
+
+// MakeIntent makes an intent from the given span and txn.
+func MakeIntent(txn *Transaction, span Span) Intent {
+	intent := Intent{Span: span}
+	intent.SetTxn(txn)
+	return intent
+}
+
+// MakePendingIntent makes an intent in the pending state with the
+// given span and txn. This is suitable for use when constructing
+// WriteIntentError.
+func MakePendingIntent(txn *enginepb.TxnMeta, span Span) Intent {
+	return Intent{
+		Span:   span,
+		Txn:    *txn,
+		Status: PENDING,
+	}
+}
+
+// SetTxn updates the transaction details in the intent.
+func (i *Intent) SetTxn(txn *Transaction) {
+	i.Txn = txn.TxnMeta
+	i.Status = txn.Status
+	i.IgnoredSeqNums = txn.IgnoredSeqNums
 }

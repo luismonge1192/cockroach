@@ -36,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
@@ -666,10 +667,11 @@ func (s *statusServer) Details(
 		return nil, grpcstatus.Error(codes.Unavailable, "node is not ready")
 	}
 
-	isHealthy, err := s.nodeLiveness.IsHealthy(nodeID)
+	l, err := s.nodeLiveness.GetLiveness(nodeID)
 	if err != nil {
 		return nil, grpcstatus.Error(codes.Internal, err.Error())
 	}
+	isHealthy := l.IsLive(s.admin.server.clock.Now().GoTime()) && !l.Draining
 	if !isHealthy {
 		return nil, grpcstatus.Error(codes.Unavailable, "node is not ready")
 	}
@@ -1005,6 +1007,12 @@ func (s *statusServer) Profile(
 }
 
 // Nodes returns all node statuses.
+//
+// The LivenessByNodeID in the response returns the known liveness
+// information according to gossip. Nodes for which there is no gossip
+// information will not have an entry. Clients can exploit the fact
+// that status "UNKNOWN" has value 0 (the default) when accessing the
+// map.
 func (s *statusServer) Nodes(
 	ctx context.Context, req *serverpb.NodesRequest,
 ) (*serverpb.NodesResponse, error) {
@@ -1030,22 +1038,25 @@ func (s *statusServer) Nodes(
 			return nil, grpcstatus.Errorf(codes.Internal, err.Error())
 		}
 	}
+
+	clock := s.admin.server.clock
+	resp.LivenessByNodeID = getLivenessStatusMap(s.nodeLiveness, clock.Now().GoTime(), s.st)
+
 	return &resp, nil
 }
 
-// NodesWithLiveness returns all node statuses and their known
-// liveness information according to gossip. Any known-dead, known-decommissioned
-// nodes (= removed nodes) are excluded. Nodes for which there is
-// no gossip information will have a liveness status set to UNKNOWN.
-func (s *statusServer) NodesWithLiveness(
+// nodesStatusWithLiveness is like Nodes but for internal
+// use within this package.
+func (s *statusServer) nodesStatusWithLiveness(
 	ctx context.Context,
-) (map[roachpb.NodeID]NodeStatusWithLiveness, error) {
+) (map[roachpb.NodeID]nodeStatusWithLiveness, error) {
 	nodes, err := s.Nodes(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
-	statusMap := s.nodeLiveness.GetLivenessStatusMap()
-	ret := make(map[roachpb.NodeID]NodeStatusWithLiveness)
+	clock := s.admin.server.clock
+	statusMap := getLivenessStatusMap(s.nodeLiveness, clock.Now().GoTime(), s.st)
+	ret := make(map[roachpb.NodeID]nodeStatusWithLiveness)
 	for _, node := range nodes.Nodes {
 		nodeID := node.Desc.NodeID
 		livenessStatus := statusMap[nodeID]
@@ -1053,18 +1064,18 @@ func (s *statusServer) NodesWithLiveness(
 			// Skip over removed nodes.
 			continue
 		}
-		ret[nodeID] = NodeStatusWithLiveness{
+		ret[nodeID] = nodeStatusWithLiveness{
 			NodeStatus:     node,
-			LivenessStatus: livenessStatus,
+			livenessStatus: livenessStatus,
 		}
 	}
 	return ret, nil
 }
 
-// NodeStatusWithLiveness combines a NodeStatus with a NodeLivenessStatus.
-type NodeStatusWithLiveness struct {
+// nodeStatusWithLiveness combines a NodeStatus with a NodeLivenessStatus.
+type nodeStatusWithLiveness struct {
 	statuspb.NodeStatus
-	LivenessStatus storagepb.NodeLivenessStatus
+	livenessStatus storagepb.NodeLivenessStatus
 }
 
 // handleNodeStatus handles GET requests for a single node's status.
@@ -1588,7 +1599,7 @@ func (s *statusServer) iterateNodes(
 	responseFn func(nodeID roachpb.NodeID, resp interface{}),
 	errorFn func(nodeID roachpb.NodeID, nodeFnError error),
 ) error {
-	nodeStatuses, err := s.NodesWithLiveness(ctx)
+	nodeStatuses, err := s.nodesStatusWithLiveness(ctx)
 	if err != nil {
 		return err
 	}
@@ -1612,7 +1623,7 @@ func (s *statusServer) iterateNodes(
 		})
 		if err != nil {
 			err = errors.Wrapf(err, "failed to dial into node %d (%s)",
-				nodeID, nodeStatuses[nodeID].LivenessStatus)
+				nodeID, nodeStatuses[nodeID].livenessStatus)
 			responseChan <- nodeResponse{nodeID: nodeID, err: err}
 			return
 		}
@@ -1620,7 +1631,7 @@ func (s *statusServer) iterateNodes(
 		res, err := nodeFn(ctx, client, nodeID)
 		if err != nil {
 			err = errors.Wrapf(err, "error requesting %s from node %d (%s)",
-				errorCtx, nodeID, nodeStatuses[nodeID].LivenessStatus)
+				errorCtx, nodeID, nodeStatuses[nodeID].livenessStatus)
 		}
 		responseChan <- nodeResponse{nodeID: nodeID, response: res, err: err}
 	}
@@ -1985,4 +1996,40 @@ func (si *systemInfoOnce) systemInfo(ctx context.Context) serverpb.SystemInfo {
 		si.info.KernelInfo = string(bytes.TrimSpace(output))
 	})
 	return si.info
+}
+
+// RegistryStatus returns details about the jobs running on the registry at a
+// particular node.
+func (s *statusServer) JobRegistryStatus(
+	ctx context.Context, req *serverpb.JobRegistryStatusRequest,
+) (*serverpb.JobRegistryStatusResponse, error) {
+	if _, err := s.admin.requireAdminUser(ctx); err != nil {
+		return nil, err
+	}
+
+	ctx = propagateGatewayMetadata(ctx)
+	ctx = s.AnnotateCtx(ctx)
+	nodeID, local, err := s.parseNodeID(req.NodeId)
+	if err != nil {
+		return nil, grpcstatus.Errorf(codes.InvalidArgument, err.Error())
+	}
+	if !local {
+		status, err := s.dialNode(ctx, nodeID)
+		if err != nil {
+			return nil, err
+		}
+		return status.JobRegistryStatus(ctx, req)
+	}
+
+	remoteNodeID := s.gossip.NodeID.Get()
+	resp := &serverpb.JobRegistryStatusResponse{
+		NodeID: remoteNodeID,
+	}
+	for _, jID := range s.admin.server.jobRegistry.CurrentlyRunningJobs() {
+		job := jobspb.Job{
+			Id: jID,
+		}
+		resp.RunningJobs = append(resp.RunningJobs, &job)
+	}
+	return resp, nil
 }

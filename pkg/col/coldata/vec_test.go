@@ -11,6 +11,7 @@
 package coldata
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
@@ -19,7 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestMemColumnSlice(t *testing.T) {
+func TestMemColumnWindow(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	rng, _ := randutil.NewPseudoRand()
@@ -35,25 +36,25 @@ func TestMemColumnSlice(t *testing.T) {
 		}
 	}
 
-	startSlice := uint16(1)
-	endSlice := uint16(0)
-	for startSlice > endSlice {
-		startSlice = uint16(rng.Intn(int(BatchSize())))
-		endSlice = uint16(1 + rng.Intn(int(BatchSize())))
+	startWindow := uint16(1)
+	endWindow := uint16(0)
+	for startWindow > endWindow {
+		startWindow = uint16(rng.Intn(int(BatchSize())))
+		endWindow = uint16(1 + rng.Intn(int(BatchSize())))
 	}
 
-	slice := c.Slice(coltypes.Int64, uint64(startSlice), uint64(endSlice))
-	sliceInts := slice.Int64()
+	window := c.Window(coltypes.Int64, uint64(startWindow), uint64(endWindow))
+	windowInts := window.Int64()
 	// Verify that every other value is null.
-	for i, j := startSlice, uint16(0); i < endSlice; i, j = i+1, j+1 {
+	for i, j := startWindow, uint16(0); i < endWindow; i, j = i+1, j+1 {
 		if i%2 == 0 {
-			if !slice.Nulls().NullAt(j) {
+			if !window.Nulls().NullAt(j) {
 				t.Fatalf("expected null at %d (original index: %d)", j, i)
 			}
 			continue
 		}
-		if ints[i] != sliceInts[j] {
-			t.Fatalf("unexected value at index %d (original index: %d): expected %d got %d", j, i, ints[i], sliceInts[j])
+		if ints[i] != windowInts[j] {
+			t.Fatalf("unexected value at index %d (original index: %d): expected %d got %d", j, i, ints[i], windowInts[j])
 		}
 	}
 }
@@ -211,6 +212,59 @@ func TestAppend(t *testing.T) {
 			dest := NewMemColumn(typ, int(BatchSize()))
 			dest.Append(tc.args)
 			require.Equal(t, tc.expectedLength, len(dest.Int64()))
+		})
+	}
+}
+
+// TestAppendBytesWithLastNull makes sure that Append handles correctly the
+// case when the last element of Bytes vector is NULL.
+func TestAppendBytesWithLastNull(t *testing.T) {
+	src := NewMemColumn(coltypes.Bytes, 4)
+	sel := []uint16{0, 2, 3}
+	src.Bytes().Set(0, []byte("zero"))
+	src.Nulls().SetNull(1)
+	src.Bytes().Set(2, []byte("two"))
+	src.Nulls().SetNull(3)
+	sliceArgs := SliceArgs{
+		Src:         src,
+		ColType:     coltypes.Bytes,
+		DestIdx:     0,
+		SrcStartIdx: 0,
+		SrcEndIdx:   uint64(len(sel)),
+	}
+	dest := NewMemColumn(coltypes.Bytes, 3)
+	expected := NewMemColumn(coltypes.Bytes, 3)
+	for _, withSel := range []bool{false, true} {
+		t.Run(fmt.Sprintf("AppendBytesWithLastNull/sel=%t", withSel), func(t *testing.T) {
+			expected.Nulls().UnsetNulls()
+			expected.Bytes().Reset()
+			if withSel {
+				sliceArgs.Sel = sel
+				for expIdx, srcIdx := range sel {
+					if src.Nulls().NullAt(srcIdx) {
+						expected.Nulls().SetNull(uint16(expIdx))
+					} else {
+						expected.Bytes().Set(expIdx, src.Bytes().Get(int(srcIdx)))
+					}
+				}
+			} else {
+				sliceArgs.Sel = nil
+				for expIdx := 0; expIdx < 3; expIdx++ {
+					if src.Nulls().NullAt(uint16(expIdx)) {
+						expected.Nulls().SetNull(uint16(expIdx))
+					} else {
+						expected.Bytes().Set(expIdx, src.Bytes().Get(expIdx))
+					}
+				}
+			}
+			expected.Bytes().UpdateOffsetsToBeNonDecreasing(3)
+			// require.Equal checks the "string-ified" versions of the vectors for
+			// equality. Bytes uses maxSetIndex to print out "truncated"
+			// representation, so we manually update it (Vec.Append will use
+			// AppendVal function that updates maxSetIndex itself).
+			expected.Bytes().maxSetIndex = 2
+			dest.Append(sliceArgs)
+			require.Equal(t, expected, dest)
 		})
 	}
 }
@@ -409,10 +463,11 @@ func TestCopySelOnDestDoesNotUnsetOldNulls(t *testing.T) {
 }
 
 func BenchmarkAppend(b *testing.B) {
-	const typ = coltypes.Int64
-
-	src := NewMemColumn(typ, int(BatchSize()))
-	sel := make([]uint16, len(src.Int64()))
+	rng, _ := randutil.NewPseudoRand()
+	sel := make([]uint16, BatchSize())
+	for i, selIdx := range rng.Perm(len(sel)) {
+		sel[i] = uint16(selIdx)
+	}
 
 	benchCases := []struct {
 		name string
@@ -430,27 +485,34 @@ func BenchmarkAppend(b *testing.B) {
 		},
 	}
 
-	for _, bc := range benchCases {
-		bc.args.Src = src
-		bc.args.ColType = typ
-		bc.args.SrcEndIdx = uint64(BatchSize())
-		dest := NewMemColumn(typ, int(BatchSize()))
-		b.Run(bc.name, func(b *testing.B) {
-			b.SetBytes(8 * int64(BatchSize()))
-			for i := 0; i < b.N; i++ {
-				dest.Append(bc.args)
-				// "Reset" dest for another round.
-				dest.SetCol(dest.Int64()[:BatchSize()])
+	for _, typ := range []coltypes.T{coltypes.Bytes, coltypes.Decimal, coltypes.Int64} {
+		for _, nullProbability := range []float64{0, 0.2} {
+			src := NewMemColumn(typ, int(BatchSize()))
+			RandomVec(rng, typ, 8 /* bytesFixedLength */, src, int(BatchSize()), nullProbability)
+			for _, bc := range benchCases {
+				bc.args.Src = src
+				bc.args.ColType = typ
+				bc.args.SrcEndIdx = uint64(BatchSize())
+				dest := NewMemColumn(typ, int(BatchSize()))
+				b.Run(fmt.Sprintf("%s/%s/NullProbability=%.1f", typ, bc.name, nullProbability), func(b *testing.B) {
+					b.SetBytes(8 * int64(BatchSize()))
+					bc.args.DestIdx = 0
+					for i := 0; i < b.N; i++ {
+						dest.Append(bc.args)
+						bc.args.DestIdx += uint64(BatchSize())
+					}
+				})
 			}
-		})
+		}
 	}
 }
 
 func BenchmarkCopy(b *testing.B) {
-	const typ = coltypes.Int64
-
-	src := NewMemColumn(typ, int(BatchSize()))
-	sel := make([]uint16, len(src.Int64()))
+	rng, _ := randutil.NewPseudoRand()
+	sel := make([]uint16, BatchSize())
+	for i, selIdx := range rng.Perm(len(sel)) {
+		sel[i] = uint16(selIdx)
+	}
 
 	benchCases := []struct {
 		name string
@@ -470,16 +532,28 @@ func BenchmarkCopy(b *testing.B) {
 		},
 	}
 
-	for _, bc := range benchCases {
-		bc.args.Src = src
-		bc.args.ColType = typ
-		bc.args.SrcEndIdx = uint64(BatchSize())
-		dest := NewMemColumn(typ, int(BatchSize()))
-		b.Run(bc.name, func(b *testing.B) {
-			b.SetBytes(8 * int64(BatchSize()))
-			for i := 0; i < b.N; i++ {
-				dest.Copy(bc.args)
+	for _, typ := range []coltypes.T{coltypes.Bytes, coltypes.Decimal, coltypes.Int64} {
+		for _, nullProbability := range []float64{0, 0.2} {
+			src := NewMemColumn(typ, int(BatchSize()))
+			RandomVec(rng, typ, 8 /* bytesFixedLength */, src, int(BatchSize()), nullProbability)
+			for _, bc := range benchCases {
+				bc.args.Src = src
+				bc.args.ColType = typ
+				bc.args.SrcEndIdx = uint64(BatchSize())
+				dest := NewMemColumn(typ, int(BatchSize()))
+				b.Run(fmt.Sprintf("%s/%s/NullProbability=%.1f", typ, bc.name, nullProbability), func(b *testing.B) {
+					b.SetBytes(8 * int64(BatchSize()))
+					for i := 0; i < b.N; i++ {
+						dest.Copy(bc.args)
+						if typ == coltypes.Bytes {
+							// We need to reset flat bytes so that we could copy into it
+							// (otherwise it'll panic on the second copy due to maxSetIndex
+							// being not zero).
+							dest.Bytes().Reset()
+						}
+					}
+				})
 			}
-		})
+		}
 	}
 }

@@ -574,10 +574,10 @@ ALTER TABLE add_default ADD g INT UNIQUE DEFAULT 1
 statement ok
 CREATE SEQUENCE initial_seq
 
-statement error cannot backfill such sequence operation
+statement error pgcode 0A000 cannot evaluate scalar expressions containing sequence operations in this context
 ALTER TABLE add_default ADD g INT DEFAULT nextval('initial_seq')
 
-statement error cannot backfill such evaluated expression
+statement error pgcode 22C01 cannot evaluate scalar expressions using table lookups in this context
 ALTER TABLE add_default ADD g OID DEFAULT 'foo'::regclass::oid
 
 statement error cannot access virtual schema in anonymous database
@@ -745,7 +745,7 @@ foo
 
 # Create a table with a computed column that we'll de-compute
 statement ok
-CREATE TABLE decomputed_column (a INT PRIMARY KEY, b INT AS ( a + 1 ) STORED)
+CREATE TABLE decomputed_column (a INT PRIMARY KEY, b INT AS ( a + 1 ) STORED, FAMILY "primary" (a, b))
 
 statement ok
 INSERT INTO decomputed_column VALUES (1), (2)
@@ -1010,3 +1010,52 @@ SHOW CONSTRAINTS FROM t
 ----
 t  check_a   CHECK  CHECK  ((a < 100))  true
 t  check_a1  CHECK  CHECK  ((a < 16))   true
+
+subtest regression_42858
+
+statement ok
+CREATE TABLE TEST2 (COL1 SERIAL PRIMARY KEY, COL2 INT8)
+
+statement ok
+CREATE TABLE TEST1 (COL1 SERIAL PRIMARY KEY, COL2 INT8, COL3 INT8)
+
+statement ok
+ALTER TABLE TEST1 ADD CONSTRAINT duplicate_name FOREIGN KEY (COL2) REFERENCES TEST2 (COL1)
+
+statement error pq: duplicate constraint name: "duplicate_name"
+ALTER TABLE TEST1 ADD CONSTRAINT duplicate_name FOREIGN KEY (COL3) REFERENCES TEST2 (COL1)
+
+statement ok
+DROP TABLE test1; DROP TABLE test2
+
+subtest multiple_set_drop_not_null_inside_txn
+
+statement ok
+CREATE TABLE t1(x INT, y INT);
+
+statement ok
+BEGIN;
+ALTER TABLE t1 ALTER COLUMN x SET NOT NULL;
+ALTER TABLE t1 ALTER COLUMN y SET NOT NULL;
+COMMIT
+
+statement ok
+BEGIN;
+ALTER TABLE t1 ALTER COLUMN x DROP NOT NULL;
+ALTER TABLE t1 ALTER COLUMN y DROP NOT NULL;
+COMMIT
+
+statement ok
+DROP TABLE t1
+
+subtest regression_43092
+
+statement ok
+CREATE TABLE t43092(x INT PRIMARY KEY)
+
+statement error pgcode 42P16 column "x" is in a primary index
+ALTER TABLE t43092 ALTER COLUMN x DROP NOT NULL
+
+statement ok
+DROP TABLE t43092
+

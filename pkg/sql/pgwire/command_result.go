@@ -14,11 +14,13 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 )
@@ -84,8 +86,10 @@ type commandResult struct {
 	released bool
 }
 
+var _ sql.CommandResult = &commandResult{}
+
 // Close is part of the CommandResult interface.
-func (r *commandResult) Close(t sql.TransactionStatusIndicator) {
+func (r *commandResult) Close(ctx context.Context, t sql.TransactionStatusIndicator) {
 	r.assertNotReleased()
 	defer r.release()
 	if r.errExpected && r.err == nil {
@@ -94,7 +98,7 @@ func (r *commandResult) Close(t sql.TransactionStatusIndicator) {
 
 	r.conn.writerState.fi.registerCmd(r.pos)
 	if r.err != nil {
-		r.conn.bufferErr(r.err)
+		r.conn.bufferErr(ctx, r.err)
 		return
 	}
 
@@ -125,18 +129,6 @@ func (r *commandResult) Close(t sql.TransactionStatusIndicator) {
 	default:
 		panic(fmt.Sprintf("unknown type: %v", r.typ))
 	}
-}
-
-// CloseWithErr is part of the CommandResult interface.
-func (r *commandResult) CloseWithErr(err error) {
-	r.assertNotReleased()
-	defer r.release()
-	if r.err != nil {
-		panic(fmt.Sprintf("can't overwrite err: %s with err: %s", r.err, err))
-	}
-
-	r.conn.writerState.fi.registerCmd(r.pos)
-	r.conn.bufferErr(err)
 }
 
 // Discard is part of the CommandResult interface.
@@ -407,6 +399,7 @@ func (r *limitedCommandResult) moreResultsNeeded(ctx context.Context) error {
 			// the cleanup. We are in effect peeking to see if the
 			// next message is a delete portal.
 			if c.Type != pgwirebase.PreparePortal || c.Name != r.portalName {
+				telemetry.Inc(sqltelemetry.InterleavedPortalRequestCounter)
 				return errors.WithDetail(sql.ErrLimitedResultNotSupported,
 					"cannot close a portal while a different one is open")
 			}
@@ -418,6 +411,7 @@ func (r *limitedCommandResult) moreResultsNeeded(ctx context.Context) error {
 		case sql.ExecPortal:
 			// The happy case: the client wants more rows from the portal.
 			if c.Name != r.portalName {
+				telemetry.Inc(sqltelemetry.InterleavedPortalRequestCounter)
 				return errors.WithDetail(sql.ErrLimitedResultNotSupported,
 					"cannot execute a portal while a different one is open")
 			}
@@ -438,6 +432,7 @@ func (r *limitedCommandResult) moreResultsNeeded(ctx context.Context) error {
 			}
 		default:
 			// We got some other message, but we only support executing to completion.
+			telemetry.Inc(sqltelemetry.InterleavedPortalRequestCounter)
 			return errors.WithSafeDetails(sql.ErrLimitedResultNotSupported,
 				"cannot perform operation %T while a different portal is open",
 				errors.Safe(c))

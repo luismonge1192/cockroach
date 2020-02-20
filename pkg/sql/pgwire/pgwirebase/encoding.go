@@ -281,13 +281,13 @@ func DecodeOidDatum(
 			}
 			return d, nil
 		case oid.T_time:
-			d, err := tree.ParseDTime(nil, string(b))
+			d, err := tree.ParseDTime(nil, string(b), time.Microsecond)
 			if err != nil {
 				return nil, pgerror.Newf(pgcode.Syntax, "could not parse string %q as time", b)
 			}
 			return d, nil
 		case oid.T_timetz:
-			d, err := tree.ParseDTimeTZ(ctx, string(b))
+			d, err := tree.ParseDTimeTZ(ctx, string(b), time.Microsecond)
 			if err != nil {
 				return nil, pgerror.Newf(pgcode.Syntax, "could not parse string %q as timetz", b)
 			}
@@ -738,32 +738,39 @@ func pgBinaryToIPAddr(b []byte) (ipaddr.IPAddr, error) {
 func decodeBinaryArray(
 	ctx tree.ParseTimeContext, elemOid oid.Oid, b []byte, code FormatCode,
 ) (tree.Datum, error) {
-	hdr := struct {
+	var hdr struct {
 		Ndims int32
 		// Nullflag
 		_       int32
 		ElemOid int32
+	}
+	var dim struct {
 		// The next two fields should be arrays of size Ndims. However, since
 		// we only support 1-dimensional arrays for now, for convenience we can
 		// leave them in this struct as such for `binary.Read` to parse for us.
 		DimSize int32
 		// Dim lower bound
 		_ int32
-	}{}
+	}
 	r := bytes.NewBuffer(b)
 	if err := binary.Read(r, binary.BigEndian, &hdr); err != nil {
 		return nil, err
 	}
-	if err := validateArrayDimensions(int(hdr.Ndims), int(hdr.DimSize)); err != nil {
-		return nil, err
-	}
-
 	if elemOid != oid.Oid(hdr.ElemOid) {
 		return nil, pgerror.Newf(pgcode.DatatypeMismatch, "wrong element type")
 	}
 	arr := tree.NewDArray(types.OidToType[elemOid])
+	if hdr.Ndims == 0 {
+		return arr, nil
+	}
+	if err := binary.Read(r, binary.BigEndian, &dim); err != nil {
+		return nil, err
+	}
+	if err := validateArrayDimensions(int(hdr.Ndims), int(dim.DimSize)); err != nil {
+		return nil, err
+	}
 	var vlen int32
-	for i := int32(0); i < hdr.DimSize; i++ {
+	for i := int32(0); i < dim.DimSize; i++ {
 		if err := binary.Read(r, binary.BigEndian, &vlen); err != nil {
 			return nil, err
 		}

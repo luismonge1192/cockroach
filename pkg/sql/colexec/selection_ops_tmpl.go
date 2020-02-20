@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/pkg/errors"
 )
 
@@ -55,6 +56,9 @@ var _ = math.MaxInt64
 
 // Dummy import to pull in "time" package.
 var _ time.Time
+
+// Dummy import to pull in "duration" package.
+var _ duration.Duration
 
 // Dummy import to pull in "coltypes" package.
 var _ = coltypes.Bool
@@ -92,7 +96,7 @@ func _SEL_CONST_LOOP(_HAS_NULLS bool) { // */}}
 		batch.SetSelection(true)
 		sel := batch.Selection()
 		col = execgen.SLICE(col, 0, int(n))
-		for execgen.RANGE(i, col) {
+		for execgen.RANGE(i, col, 0, int(n)) {
 			var cmp bool
 			arg := execgen.UNSAFEGET(col, i)
 			_ASSIGN_CMP("cmp", "arg", "p.constArg")
@@ -137,10 +141,15 @@ func _SEL_LOOP(_HAS_NULLS bool) { // */}}
 	} else {
 		batch.SetSelection(true)
 		sel := batch.Selection()
+		// {{if not (eq .LTyp.String "Bytes")}}
+		// {{/* Slice is a noop for Bytes type, so col1Len below might contain an
+		// incorrect value. In order to keep bounds check elimination for all other
+		// types, we simply omit this code snippet for Bytes. */}}
 		col1 = execgen.SLICE(col1, 0, int(n))
 		col1Len := execgen.LEN(col1)
 		col2 = _R_SLICE(col2, 0, col1Len)
-		for execgen.RANGE(i, col1) {
+		// {{end}}
+		for execgen.RANGE(i, col1, 0, int(n)) {
 			var cmp bool
 			arg1 := execgen.UNSAFEGET(col1, i)
 			arg2 := _R_UNSAFEGET(col2, i)
@@ -168,6 +177,12 @@ type _OP_CONST_NAME struct {
 }
 
 func (p *_OP_CONST_NAME) Next(ctx context.Context) coldata.Batch {
+	// In order to inline the templated code of overloads, we need to have a
+	// `decimalScratch` local variable of type `decimalOverloadScratch`.
+	decimalScratch := p.decimalScratch
+	// However, the scratch is not used in all of the selection operators, so
+	// we add this to go around "unused" error.
+	_ = decimalScratch
 	for {
 		batch := p.input.Next(ctx)
 		if batch.Length() == 0 {
@@ -203,6 +218,12 @@ type _OP_NAME struct {
 }
 
 func (p *_OP_NAME) Next(ctx context.Context) coldata.Batch {
+	// In order to inline the templated code of overloads, we need to have a
+	// `decimalScratch` local variable of type `decimalOverloadScratch`.
+	decimalScratch := p.decimalScratch
+	// However, the scratch is not used in all of the selection operators, so
+	// we add this to go around "unused" error.
+	_ = decimalScratch
 	for {
 		batch := p.input.Next(ctx)
 		if batch.Length() == 0 {

@@ -77,9 +77,6 @@ type Metadata struct {
 	// sequences stores information about each metadata sequence, indexed by SequenceID.
 	sequences []cat.Sequence
 
-	// values is the highest id for a Values clause that has been assigned.
-	values ValuesID
-
 	// deps stores information about all data source objects depended on by the
 	// query, as well as the privileges required to access them. The objects are
 	// deduplicated: any name/object pair shows up at most once.
@@ -93,7 +90,10 @@ type Metadata struct {
 	// needed for EXPLAIN (opt, env).
 	views []cat.View
 
-	// NOTE! When adding fields here, update CopyFrom.
+	// currUniqueID is the highest UniqueID that has been assigned.
+	currUniqueID UniqueID
+
+	// NOTE! When adding fields here, update Init, CopyFrom and TestMetadata.
 }
 
 type mdDep struct {
@@ -128,17 +128,34 @@ func (md *Metadata) Init() {
 	for i := range md.schemas {
 		md.schemas[i] = nil
 	}
+	md.schemas = md.schemas[:0]
+
 	for i := range md.cols {
 		md.cols[i] = ColumnMeta{}
 	}
+	md.cols = md.cols[:0]
+
 	for i := range md.tables {
 		md.tables[i] = TableMeta{}
 	}
-	md.schemas = md.schemas[:0]
-	md.cols = md.cols[:0]
 	md.tables = md.tables[:0]
-	md.views = md.views[:0]
+
+	for i := range md.sequences {
+		md.sequences[i] = nil
+	}
+	md.sequences = md.sequences[:0]
+
+	for i := range md.deps {
+		md.deps[i] = mdDep{}
+	}
 	md.deps = md.deps[:0]
+
+	for i := range md.views {
+		md.views[i] = nil
+	}
+	md.views = md.views[:0]
+
+	md.currUniqueID = 0
 }
 
 // CopyFrom initializes the metadata with a copy of the provided metadata.
@@ -154,16 +171,19 @@ func (md *Metadata) CopyFrom(from *Metadata) {
 	md.schemas = append(md.schemas, from.schemas...)
 	md.cols = append(md.cols, from.cols...)
 	md.tables = append(md.tables, from.tables...)
-	md.views = append(md.views, from.views...)
 
 	// Clear table annotations. These objects can be mutable and can't be safely
 	// shared between different metadata instances.
 	for i := range md.tables {
 		md.tables[i].clearAnnotations()
 	}
+	// TODO(radu): we aren't copying the scalar expressions in Constraints and
+	// ComputedCols..
 
 	md.sequences = append(md.sequences, from.sequences...)
 	md.deps = append(md.deps, from.deps...)
+	md.views = append(md.views, from.views...)
+	md.currUniqueID = from.currUniqueID
 }
 
 // DepByName is used with AddDependency when the data source was looked up using a
@@ -446,17 +466,19 @@ func (md *Metadata) AllSequences() []cat.Sequence {
 	return md.sequences
 }
 
-// ValuesID uniquely identifies the usage of a values clause within the scope of a
-// query.
+// UniqueID should be used to disambiguate multiple uses of an expression
+// within the scope of a query. For example, a UniqueID field should be
+// added to an expression type if two instances of that type might otherwise
+// be indistinguishable based on the values of their other fields.
 //
 // See the comment for Metadata for more details on identifiers.
-type ValuesID uint64
+type UniqueID uint64
 
-// NextValuesID returns a fresh ValuesID which is guaranteed to never have been
-// allocated prior in this memo.
-func (md *Metadata) NextValuesID() ValuesID {
-	md.values++
-	return md.values
+// NextUniqueID returns a fresh UniqueID which is guaranteed to never have been
+// previously allocated in this memo.
+func (md *Metadata) NextUniqueID() UniqueID {
+	md.currUniqueID++
+	return md.currUniqueID
 }
 
 // AddView adds a new reference to a view used by the query.

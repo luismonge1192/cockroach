@@ -35,7 +35,7 @@ import (
 )
 
 const (
-	// Messages that provide detail about why a preemptive snapshot was rejected.
+	// Messages that provide detail about why a snapshot was rejected.
 	snapshotStoreTooFullMsg = "store almost out of disk space"
 	snapshotApplySemBusyMsg = "store busy applying snapshots"
 	storeDrainingMsg        = "store is draining"
@@ -66,15 +66,11 @@ type outgoingSnapshotStream interface {
 type snapshotStrategy interface {
 	// Receive streams SnapshotRequests in from the provided stream and
 	// constructs an IncomingSnapshot.
-	Receive(
-		context.Context, incomingSnapshotStream, SnapshotRequest_Header,
-	) (IncomingSnapshot, error)
+	Receive(context.Context, incomingSnapshotStream, SnapshotRequest_Header) (IncomingSnapshot, error)
 
 	// Send streams SnapshotRequests created from the OutgoingSnapshot in to the
 	// provided stream.
-	Send(
-		context.Context, outgoingSnapshotStream, SnapshotRequest_Header, *OutgoingSnapshot,
-	) error
+	Send(context.Context, outgoingSnapshotStream, SnapshotRequest_Header, *OutgoingSnapshot) error
 
 	// Status provides a status report on the work performed during the
 	// snapshot. Only valid if the strategy succeeded.
@@ -110,14 +106,14 @@ type kvBatchSnapshotStrategy struct {
 	// before flushing to disk. Only used on the receiver side.
 	sstChunkSize int64
 	// Only used on the receiver side.
-	ssss *SSTSnapshotStorageScratch
+	scratch *SSTSnapshotStorageScratch
 }
 
 // multiSSTWriter is a wrapper around RocksDBSstFileWriter and
 // SSTSnapshotStorageScratch that handles chunking SSTs and persisting them to
 // disk.
 type multiSSTWriter struct {
-	ssss      *SSTSnapshotStorageScratch
+	scratch   *SSTSnapshotStorageScratch
 	currSST   engine.SSTWriter
 	keyRanges []rditer.KeyRange
 	currRange int
@@ -128,12 +124,12 @@ type multiSSTWriter struct {
 
 func newMultiSSTWriter(
 	ctx context.Context,
-	ssss *SSTSnapshotStorageScratch,
+	scratch *SSTSnapshotStorageScratch,
 	keyRanges []rditer.KeyRange,
 	sstChunkSize int64,
 ) (multiSSTWriter, error) {
 	msstw := multiSSTWriter{
-		ssss:         ssss,
+		scratch:      scratch,
 		keyRanges:    keyRanges,
 		sstChunkSize: sstChunkSize,
 	}
@@ -144,7 +140,7 @@ func newMultiSSTWriter(
 }
 
 func (msstw *multiSSTWriter) initSST(ctx context.Context) error {
-	newSSTFile, err := msstw.ssss.NewFile(ctx, msstw.sstChunkSize)
+	newSSTFile, err := msstw.scratch.NewFile(ctx, msstw.sstChunkSize)
 	if err != nil {
 		return errors.Wrap(err, "failed to create new sst file")
 	}
@@ -224,7 +220,7 @@ func (kvSS *kvBatchSnapshotStrategy) Receive(
 	// At the moment we'll write at most three SSTs.
 	// TODO(jeffreyxiao): Re-evaluate as the default range size grows.
 	keyRanges := rditer.MakeReplicatedKeyRanges(header.State.Desc)
-	msstw, err := newMultiSSTWriter(ctx, kvSS.ssss, keyRanges, kvSS.sstChunkSize)
+	msstw, err := newMultiSSTWriter(ctx, kvSS.scratch, keyRanges, kvSS.sstChunkSize)
 	if err != nil {
 		return noSnap, err
 	}
@@ -283,7 +279,7 @@ func (kvSS *kvBatchSnapshotStrategy) Receive(
 			inSnap := IncomingSnapshot{
 				UsesUnreplicatedTruncatedState: header.UnreplicatedTruncatedState,
 				SnapUUID:                       snapUUID,
-				SSSS:                           kvSS.ssss,
+				SSTStorageScratch:              kvSS.scratch,
 				LogEntries:                     logEntries,
 				State:                          &header.State,
 				snapType:                       header.Type,
@@ -299,20 +295,7 @@ func (kvSS *kvBatchSnapshotStrategy) Receive(
 					inSnap.String(), len(logEntries), expLen)
 			}
 
-			// 19.1 nodes don't set the Type field on the SnapshotRequest_Header proto
-			// when sending this RPC, so in a mixed cluster setting we may have gotten
-			// the zero value of RAFT. Since the RPC didn't have type information
-			// previously, a 19.1 node receiving a snapshot distinguished between RAFT
-			// and PREEMPTIVE (19.1 nodes never sent LEARNER snapshots) by checking
-			// whether the replica was a placeholder (ReplicaID == 0).
-			//
-			// This adjustment can be removed after 19.2.
-			if inSnap.snapType == SnapshotRequest_RAFT &&
-				header.RaftMessageRequest.ToReplica.ReplicaID == 0 {
-				inSnap.snapType = SnapshotRequest_PREEMPTIVE
-			}
-
-			kvSS.status = fmt.Sprintf("log entries: %d, ssts: %d", len(logEntries), len(kvSS.ssss.SSTs()))
+			kvSS.status = fmt.Sprintf("log entries: %d, ssts: %d", len(logEntries), len(kvSS.scratch.SSTs()))
 			return inSnap, nil
 		}
 	}
@@ -391,31 +374,6 @@ func (kvSS *kvBatchSnapshotStrategy) Send(
 		if err == nil {
 			logEntries = append(logEntries, bytes)
 			raftLogBytes += int64(len(bytes))
-			if snap.snapType == SnapshotRequest_PREEMPTIVE &&
-				raftLogBytes > 4*kvSS.raftCfg.RaftLogTruncationThreshold {
-				// If the raft log is too large, abort the snapshot instead of
-				// potentially running out of memory. However, if this is a
-				// raft-initiated snapshot (instead of a preemptive one), we
-				// have a dilemma. It may be impossible to truncate the raft
-				// log until we have caught up a peer with a snapshot. Since
-				// we don't know the exact size at which we will run out of
-				// memory, we err on the size of allowing the snapshot if it
-				// is raft-initiated, while aborting preemptive snapshots at a
-				// reasonable threshold. (Empirically, this is good enough:
-				// the situations that result in large raft logs have not been
-				// observed to result in raft-initiated snapshots).
-				//
-				// By aborting preemptive snapshots here, we disallow replica
-				// changes until the current replicas have caught up and
-				// truncated the log (either the range is available, in which
-				// case this will eventually happen, or it's not,in which case
-				// the preemptive snapshot would be wasted anyway because the
-				// change replicas transaction would be unable to commit).
-				return false, errors.Errorf(
-					"aborting snapshot because raft log is too large "+
-						"(%d bytes after processing %d of %d entries)",
-					raftLogBytes, len(logEntries), endIndex-firstIndex)
-			}
 		}
 		return false, err
 	}
@@ -520,11 +478,11 @@ func (kvSS *kvBatchSnapshotStrategy) Status() string { return kvSS.status }
 
 // Close implements the snapshotStrategy interface.
 func (kvSS *kvBatchSnapshotStrategy) Close(ctx context.Context) {
-	if kvSS.ssss != nil {
+	if kvSS.scratch != nil {
 		// A failure to clean up the storage is benign except that it will leak
 		// disk space (which is reclaimed on node restart). It is unexpected
 		// though, so log a warning.
-		if err := kvSS.ssss.Clear(); err != nil {
+		if err := kvSS.scratch.Clear(); err != nil {
 			log.Warningf(ctx, "error closing kvBatchSnapshotStrategy: %v", err)
 		}
 	}
@@ -767,15 +725,16 @@ func (s *Store) receiveSnapshot(
 		}
 	}
 
-	// Defensive check that any non-preemptive snapshot contains this store in the
-	// descriptor.
-	if !header.IsPreemptive() {
-		storeID := s.StoreID()
-		if _, ok := header.State.Desc.GetReplicaDescriptor(storeID); !ok {
-			return crdberrors.AssertionFailedf(
-				`snapshot of type %s was sent to s%d which did not contain it as a replica: %s`,
-				header.Type, storeID, header.State.Desc.Replicas())
-		}
+	if header.IsPreemptive() {
+		return crdberrors.AssertionFailedf(`expected a raft or learner snapshot`)
+	}
+
+	// Defensive check that any snapshot contains this store in the	descriptor.
+	storeID := s.StoreID()
+	if _, ok := header.State.Desc.GetReplicaDescriptor(storeID); !ok {
+		return crdberrors.AssertionFailedf(
+			`snapshot of type %s was sent to s%d which did not contain it as a replica: %s`,
+			header.Type, storeID, header.State.Desc.Replicas())
 	}
 
 	cleanup, rejectionMsg, err := s.reserveSnapshot(ctx, header)
@@ -795,18 +754,10 @@ func (s *Store) receiveSnapshot(
 	// We'll perform this check again later after receiving the rest of the
 	// snapshot data - this is purely an optimization to prevent downloading
 	// a snapshot that we know we won't be able to apply.
-	if header.IsPreemptive() {
-		if _, err := s.canApplyPreemptiveSnapshot(ctx, header, false /* authoritative */); err != nil {
-			return sendSnapshotError(stream,
-				errors.Wrapf(err, "%s,r%d: cannot apply snapshot", s, header.State.Desc.RangeID),
-			)
-		}
-	} else {
-		if err := s.shouldAcceptSnapshotData(ctx, header); err != nil {
-			return sendSnapshotError(stream,
-				errors.Wrapf(err, "%s,r%d: cannot apply snapshot", s, header.State.Desc.RangeID),
-			)
-		}
+	if err := s.shouldAcceptSnapshotData(ctx, header); err != nil {
+		return sendSnapshotError(stream,
+			errors.Wrapf(err, "%s,r%d: cannot apply snapshot", s, header.State.Desc.RangeID),
+		)
 	}
 
 	// Determine which snapshot strategy the sender is using to send this
@@ -823,7 +774,7 @@ func (s *Store) receiveSnapshot(
 
 		ss = &kvBatchSnapshotStrategy{
 			raftCfg:      &s.cfg.RaftConfig,
-			ssss:         s.sss.NewSSTSnapshotStorageScratch(header.State.Desc.RangeID, snapUUID),
+			scratch:      s.sstSnapshotStorage.NewScratchSpace(header.State.Desc.RangeID, snapUUID),
 			sstChunkSize: snapshotSSTWriteSyncRate.Get(&s.cfg.Settings.SV),
 		}
 		defer ss.Close(ctx)
@@ -845,14 +796,8 @@ func (s *Store) receiveSnapshot(
 	if err != nil {
 		return err
 	}
-	if header.IsPreemptive() {
-		if err := s.processPreemptiveSnapshotRequest(ctx, header, inSnap); err != nil {
-			return sendSnapshotError(stream, errors.Wrap(err.GoError(), "failed to apply snapshot"))
-		}
-	} else {
-		if err := s.processRaftSnapshotRequest(ctx, header, inSnap); err != nil {
-			return sendSnapshotError(stream, errors.Wrap(err.GoError(), "failed to apply snapshot"))
-		}
+	if err := s.processRaftSnapshotRequest(ctx, header, inSnap); err != nil {
+		return sendSnapshotError(stream, errors.Wrap(err.GoError(), "failed to apply snapshot"))
 	}
 
 	return stream.Send(&SnapshotResponse{Status: SnapshotResponse_APPLIED})
@@ -870,12 +815,21 @@ type SnapshotStorePool interface {
 	throttle(reason throttleReason, why string, toStoreID roachpb.StoreID)
 }
 
+// validatePositive is a function to validate that a settings value is positive.
+func validatePositive(v int64) error {
+	if v <= 0 {
+		return errors.Errorf("%d is not positive", v)
+	}
+	return nil
+}
+
 // rebalanceSnapshotRate is the rate at which preemptive snapshots can be sent.
 // This includes snapshots generated for upreplication or for rebalancing.
-var rebalanceSnapshotRate = settings.RegisterPublicByteSizeSetting(
+var rebalanceSnapshotRate = settings.RegisterPublicValidatedByteSizeSetting(
 	"kv.snapshot_rebalance.max_rate",
 	"the rate limit (bytes/sec) to use for rebalance and upreplication snapshots",
 	envutil.EnvOrDefaultBytes("COCKROACH_PREEMPTIVE_SNAPSHOT_RATE", 8<<20),
+	validatePositive,
 )
 
 // recoverySnapshotRate is the rate at which Raft-initiated spanshots can be
@@ -884,10 +838,11 @@ var rebalanceSnapshotRate = settings.RegisterPublicByteSizeSetting(
 // completely get rid of them.
 // TODO(tbg): The existence of this rate, separate from rebalanceSnapshotRate,
 // does not make a whole lot of sense.
-var recoverySnapshotRate = settings.RegisterPublicByteSizeSetting(
+var recoverySnapshotRate = settings.RegisterPublicValidatedByteSizeSetting(
 	"kv.snapshot_recovery.max_rate",
 	"the rate limit (bytes/sec) to use for recovery snapshots",
 	envutil.EnvOrDefaultBytes("COCKROACH_RAFT_SNAPSHOT_RATE", 8<<20),
+	validatePositive,
 )
 
 // snapshotSSTWriteSyncRate is the size of chunks to write before fsync-ing.

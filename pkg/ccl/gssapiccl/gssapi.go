@@ -15,12 +15,14 @@
 package gssapiccl
 
 import (
+	"context"
 	"crypto/tls"
 	"strings"
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/hba"
@@ -41,10 +43,10 @@ const (
 // authGSS performs GSS authentication. See:
 // https:github.com/postgres/postgres/blob/0f9cdd7dca694d487ab663d463b308919f591c02/src/backend/libpq/auth.c#L1090
 func authGSS(
+	ctx context.Context,
 	c pgwire.AuthConn,
 	tlsState tls.ConnectionState,
-	insecure bool,
-	hashedPassword []byte,
+	_ pgwire.PasswordRetrievalFn,
 	execCfg *sql.ExecutorConfig,
 	entry *hba.Entry,
 ) (security.UserAuthHook, error) {
@@ -188,5 +190,5 @@ func checkEntry(entry hba.Entry) error {
 }
 
 func init() {
-	pgwire.RegisterAuthMethod("gss", authGSS, checkEntry)
+	pgwire.RegisterAuthMethod("gss", authGSS, cluster.Version19_1, hba.ConnHostSSL, checkEntry)
 }

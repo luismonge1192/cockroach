@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timetz"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -170,6 +171,78 @@ func EncodeTableKey(b []byte, val tree.Datum, dir encoding.Direction) ([]byte, e
 	return nil, errors.Errorf("unable to encode table key: %T", val)
 }
 
+// SkipTableKey skips a value of type valType in key, returning the remainder
+// of the key.
+// TODO(jordan): each type could be optimized here.
+func SkipTableKey(valType *types.T, key []byte, dir IndexDescriptor_Direction) ([]byte, error) {
+	if (dir != IndexDescriptor_ASC) && (dir != IndexDescriptor_DESC) {
+		return nil, errors.AssertionFailedf("invalid direction: %d", log.Safe(dir))
+	}
+	var isNull bool
+	if key, isNull = encoding.DecodeIfNull(key); isNull {
+		return key, nil
+	}
+	var rkey []byte
+	var err error
+	switch valType.Family() {
+	case types.BoolFamily, types.IntFamily, types.DateFamily, types.OidFamily, types.TimeFamily:
+		if dir == IndexDescriptor_ASC {
+			rkey, _, err = encoding.DecodeVarintAscending(key)
+		} else {
+			rkey, _, err = encoding.DecodeVarintDescending(key)
+		}
+	case types.FloatFamily:
+		if dir == IndexDescriptor_ASC {
+			rkey, _, err = encoding.DecodeFloatAscending(key)
+		} else {
+			rkey, _, err = encoding.DecodeFloatDescending(key)
+		}
+	case types.BytesFamily, types.StringFamily, types.UuidFamily, types.INetFamily, types.CollatedStringFamily:
+		if dir == IndexDescriptor_ASC {
+			rkey, _, err = encoding.DecodeBytesAscending(key, nil)
+		} else {
+			rkey, _, err = encoding.DecodeBytesDescending(key, nil)
+		}
+	case types.DecimalFamily:
+		if dir == IndexDescriptor_ASC {
+			rkey, _, err = encoding.DecodeDecimalAscending(key, nil)
+		} else {
+			rkey, _, err = encoding.DecodeDecimalDescending(key, nil)
+		}
+	case types.TimestampFamily, types.TimestampTZFamily:
+		if dir == IndexDescriptor_ASC {
+			rkey, _, err = encoding.DecodeTimeAscending(key)
+		} else {
+			rkey, _, err = encoding.DecodeTimeDescending(key)
+		}
+	case types.TimeTZFamily:
+		if dir == IndexDescriptor_ASC {
+			rkey, _, err = encoding.DecodeTimeTZAscending(key)
+		} else {
+			rkey, _, err = encoding.DecodeTimeTZDescending(key)
+		}
+	case types.IntervalFamily:
+		if dir == IndexDescriptor_ASC {
+			rkey, _, err = encoding.DecodeDurationAscending(key)
+		} else {
+			rkey, _, err = encoding.DecodeDurationDescending(key)
+		}
+	case types.BitFamily:
+		if dir == IndexDescriptor_ASC {
+			rkey, _, err = encoding.DecodeBitArrayAscending(key)
+		} else {
+			rkey, _, err = encoding.DecodeBitArrayDescending(key)
+		}
+	default:
+		// Tuples and arrays aren't indexable types right now, so we don't have cases for them.
+		return key, errors.AssertionFailedf("unsupported type %+v", log.Safe(valType))
+	}
+	if err != nil {
+		return key, err
+	}
+	return rkey, nil
+}
+
 // DecodeTableKey decodes a value encoded by EncodeTableKey.
 func DecodeTableKey(
 	a *DatumAlloc, valType *types.T, key []byte, dir encoding.Direction,
@@ -245,7 +318,8 @@ func DecodeTableKey(
 		if err != nil {
 			return nil, nil, err
 		}
-		return tree.NewDCollatedString(r, valType.Locale(), &a.env), rkey, err
+		d, err := tree.NewDCollatedString(r, valType.Locale(), &a.env)
+		return d, rkey, err
 	case types.JsonFamily:
 		return tree.DNull, []byte{}, nil
 	case types.BytesFamily:
@@ -454,7 +528,11 @@ func decodeUntaggedDatum(a *DatumAlloc, t *types.T, buf []byte) (tree.Datum, []b
 		return a.NewDString(tree.DString(data)), b, nil
 	case types.CollatedStringFamily:
 		b, data, err := encoding.DecodeUntaggedBytesValue(buf)
-		return tree.NewDCollatedString(string(data), t.Locale(), &a.env), b, err
+		if err != nil {
+			return nil, b, err
+		}
+		d, err := tree.NewDCollatedString(string(data), t.Locale(), &a.env)
+		return d, b, err
 	case types.BitFamily:
 		b, data, err := encoding.DecodeUntaggedBitArrayValue(buf)
 		return a.NewDBitArray(tree.DBitArray{BitArray: data}), b, err
@@ -807,7 +885,7 @@ func UnmarshalColumnValue(a *DatumAlloc, typ *types.T, value roachpb.Value) (tre
 		if err != nil {
 			return nil, err
 		}
-		return tree.NewDCollatedString(string(v), typ.Locale(), &a.env), nil
+		return tree.NewDCollatedString(string(v), typ.Locale(), &a.env)
 	case types.UuidFamily:
 		v, err := value.GetBytes()
 		if err != nil {

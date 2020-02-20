@@ -20,10 +20,12 @@ import (
 	"testing/quick"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/gc"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -68,7 +70,7 @@ func TestGCQueueScoreString(t *testing.T) {
 		},
 			`queue=true with 4.31/fuzz(1.25)=3.45=valScaleScore(4.00)*deadFrac(0.25)+intentScore(0.45)
 likely last GC: 5s ago, 3.0 KiB non-live, curr. age 512 KiB*s, min exp. reduction: 256 KiB*s`},
-		// Check case of empty GCThreshold.
+		// Check case of empty Threshold.
 		{gcQueueScore{ShouldQueue: true}, `queue=true with 0.00/fuzz(0.00)=NaN=valScaleScore(0.00)*deadFrac(0.00)+intentScore(0.00)
 likely last GC: never, 0 B non-live, curr. age 0 B*s, min exp. reduction: 0 B*s`},
 	} {
@@ -103,7 +105,7 @@ func TestGCQueueMakeGCScoreInvariantQuick(t *testing.T) {
 			GCBytesAge:      gcByteAge,
 		}
 		now := initialNow.Add(timePassed.Nanoseconds(), 0)
-		r := makeGCQueueScoreImpl(ctx, int64(seed), now, ms, ttlSec)
+		r := makeGCQueueScoreImpl(ctx, int64(seed), now, ms, zonepb.GCPolicy{TTLSeconds: ttlSec})
 		wouldHaveToDeleteSomething := gcBytes*int64(ttlSec) < ms.GCByteAge(now.WallTime)
 		result := !r.ShouldQueue || wouldHaveToDeleteSomething
 		if !result {
@@ -124,7 +126,7 @@ func TestGCQueueMakeGCScoreAnomalousStats(t *testing.T) {
 			LiveBytes:         int64(liveBytes),
 			ValBytes:          int64(valBytes),
 			KeyBytes:          int64(keyBytes),
-		}, 60)
+		}, zonepb.GCPolicy{TTLSeconds: 60})
 		return r.DeadFraction >= 0 && r.DeadFraction <= 1
 	}, &quick.Config{MaxCount: 1000}); err != nil {
 		t.Fatal(err)
@@ -244,7 +246,9 @@ func (cws *cachedWriteSimulator) shouldQueue(
 ) {
 	cws.t.Helper()
 	ts := hlc.Timestamp{}.Add(ms.LastUpdateNanos+after.Nanoseconds(), 0)
-	r := makeGCQueueScoreImpl(context.Background(), 0 /* seed */, ts, ms, int32(ttl.Seconds()))
+	r := makeGCQueueScoreImpl(context.Background(), 0 /* seed */, ts, ms, zonepb.GCPolicy{
+		TTLSeconds: int32(ttl.Seconds()),
+	})
 	if fmt.Sprintf("%.2f", r.FinalScore) != fmt.Sprintf("%.2f", prio) || b != r.ShouldQueue {
 		cws.t.Errorf("expected queued=%t (is %t), prio=%.2f, got %.2f: after=%s, ttl=%s:\nms: %+v\nscore: %s",
 			b, r.ShouldQueue, prio, r.FinalScore, after, ttl, ms, r)
@@ -373,12 +377,12 @@ func TestGCQueueProcess(t *testing.T) {
 	tc.manualClock.Increment(48 * 60 * 60 * 1e9) // 2d past the epoch
 	now := tc.Clock().Now().WallTime
 
-	ts1 := makeTS(now-2*24*60*60*1e9+1, 0)                     // 2d old (add one nanosecond so we're not using zero timestamp)
-	ts2 := makeTS(now-25*60*60*1e9, 0)                         // GC will occur at time=25 hours
-	ts2m1 := ts2.Prev()                                        // ts2 - 1 so we have something not right at the GC time
-	ts3 := makeTS(now-intentAgeThreshold.Nanoseconds(), 0)     // 2h old
-	ts4 := makeTS(now-(intentAgeThreshold.Nanoseconds()-1), 0) // 2h-1ns old
-	ts5 := makeTS(now-1e9, 0)                                  // 1s old
+	ts1 := makeTS(now-2*24*60*60*1e9+1, 0)                        // 2d old (add one nanosecond so we're not using zero timestamp)
+	ts2 := makeTS(now-25*60*60*1e9, 0)                            // GC will occur at time=25 hours
+	ts2m1 := ts2.Prev()                                           // ts2 - 1 so we have something not right at the GC time
+	ts3 := makeTS(now-gc.IntentAgeThreshold.Nanoseconds(), 0)     // 2h old
+	ts4 := makeTS(now-(gc.IntentAgeThreshold.Nanoseconds()-1), 0) // 2h-1ns old
+	ts5 := makeTS(now-1e9, 0)                                     // 1s old
 	key1 := roachpb.Key("a")
 	key2 := roachpb.Key("b")
 	key3 := roachpb.Key("c")
@@ -481,7 +485,7 @@ func TestGCQueueProcess(t *testing.T) {
 		t.Fatal("config not set")
 	}
 
-	// The total size of the GC'able versions of the keys and values in GCInfo.
+	// The total size of the GC'able versions of the keys and values in Info.
 	// Key size: len("a") + MVCCVersionTimestampSize (13 bytes) = 14 bytes.
 	// Value size: len("value") + headerSize (5 bytes) = 10 bytes.
 	// key1 at ts1  (14 bytes) => "value" (10 bytes)
@@ -494,8 +498,8 @@ func TestGCQueueProcess(t *testing.T) {
 	var expectedVersionsKeyBytes int64 = 7 * 14
 	var expectedVersionsValBytes int64 = 5 * 10
 
-	// Call RunGC with dummy functions to get current GCInfo.
-	gcInfo, err := func() (GCInfo, error) {
+	// Call Run with dummy functions to get current Info.
+	gcInfo, err := func() (gc.Info, error) {
 		snap := tc.repl.store.Engine().NewSnapshot()
 		desc := tc.repl.Desc()
 		defer snap.Close()
@@ -506,8 +510,9 @@ func TestGCQueueProcess(t *testing.T) {
 		}
 
 		now := tc.Clock().Now()
-		return RunGC(ctx, desc, snap, now, *zone.GC,
-			NoopGCer{},
+		newThreshold := gc.CalculateThreshold(now, *zone.GC)
+		return gc.Run(ctx, desc, snap, now, newThreshold, *zone.GC,
+			gc.NoopGCer{},
 			func(ctx context.Context, intents []roachpb.Intent) error {
 				return nil
 			},
@@ -769,8 +774,10 @@ func TestGCQueueTransactionTable(t *testing.T) {
 	testutils.SucceedsSoon(t, func() error {
 		for strKey, sp := range testCases {
 			txn := &roachpb.Transaction{}
-			key := keys.TransactionKey(roachpb.Key(strKey), txns[strKey].ID)
-			ok, err := engine.MVCCGetProto(ctx, tc.engine, key, hlc.Timestamp{}, txn,
+			txnKey := keys.TransactionKey(roachpb.Key(strKey), txns[strKey].ID)
+			txnTombstoneTSCacheKey := transactionTombstoneMarker(
+				roachpb.Key(strKey), txns[strKey].ID)
+			ok, err := engine.MVCCGetProto(ctx, tc.engine, txnKey, hlc.Timestamp{}, txn,
 				engine.MVCCGetOptions{})
 			if err != nil {
 				return err
@@ -780,14 +787,16 @@ func TestGCQueueTransactionTable(t *testing.T) {
 					return fmt.Errorf("%s: expected gc: %t, but found %s\n%s", strKey, expGC, txn, roachpb.Key(strKey))
 				}
 				// If the transaction record was GCed and didn't begin the test
-				// as finalized, verify that the write timestamp cache was
+				// as finalized, verify that the timestamp cache was
 				// updated (by the corresponding PushTxn that marked the record
 				// as ABORTED) to prevent it from being created again in the
 				// future.
 				if !sp.status.IsFinalized() {
-					wTS, _ := tc.store.tsCache.GetMaxWrite(key, nil /* end */)
-					if min := (hlc.Timestamp{WallTime: sp.orig}); wTS.Less(min) {
-						return fmt.Errorf("%s: expected write tscache entry for txn key to be >= %s, but found %s", strKey, min, wTS)
+					tombstoneTimestamp, _ := tc.store.tsCache.GetMax(
+						txnTombstoneTSCacheKey, nil /* end */)
+					if min := (hlc.Timestamp{WallTime: sp.orig}); tombstoneTimestamp.Less(min) {
+						return fmt.Errorf("%s: expected tscache entry for tombstone key to be >= %s, "+
+							"but found %s", strKey, min, tombstoneTimestamp)
 					}
 				}
 			} else if sp.newStatus != txn.Status {
@@ -858,7 +867,7 @@ func TestGCQueueIntentResolution(t *testing.T) {
 		newTransaction("txn1", roachpb.Key("0-0"), 1, tc.Clock()),
 		newTransaction("txn2", roachpb.Key("1-0"), 1, tc.Clock()),
 	}
-	intentResolveTS := makeTS(now-intentAgeThreshold.Nanoseconds(), 0)
+	intentResolveTS := makeTS(now-gc.IntentAgeThreshold.Nanoseconds(), 0)
 	txns[0].ReadTimestamp = intentResolveTS
 	txns[0].WriteTimestamp = intentResolveTS
 	txns[1].ReadTimestamp = intentResolveTS
@@ -987,12 +996,12 @@ func TestGCQueueChunkRequests(t *testing.T) {
 	tc.StartWithStoreConfig(t, stopper, tsc)
 
 	const keyCount = 100
-	if gcKeyVersionChunkBytes%keyCount != 0 {
+	if gc.KeyVersionChunkBytes%keyCount != 0 {
 		t.Fatalf("expected gcKeyVersionChunkBytes to be a multiple of %d", keyCount)
 	}
 	// Reduce the key size by MVCCVersionTimestampSize (13 bytes) to prevent batch overflow.
 	// This is due to MVCCKey.EncodedSize(), which returns the full size of the encoded key.
-	const keySize = (gcKeyVersionChunkBytes / keyCount) - 13
+	const keySize = (gc.KeyVersionChunkBytes / keyCount) - 13
 	// Create a format string for creating version keys of exactly
 	// length keySize.
 	fmtStr := fmt.Sprintf("%%0%dd", keySize)

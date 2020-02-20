@@ -22,6 +22,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/vm"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/vm/flagstub"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
@@ -76,8 +77,9 @@ type providerOpts struct {
 	EBSProvisionedIOPs int
 
 	// CreateZones stores the list of zones for used cluster creation.
-	// When specifying the geo flag, nodes will be placed over these zones.
-	// See defaultGeoZones.
+	// When > 1 zone specified, geo is automatically used, otherwise, geo depends
+	// on the geo flag being set. If no zones specified, defaultCreateZones are
+	// used. See defaultCreateZones.
 	CreateZones []string
 }
 
@@ -95,18 +97,12 @@ var defaultConfig = func() (cfg *awsConfig) {
 }()
 
 // defaultCreateZones is the list of availability zones used by default for
-// cluster creation. If the geo flag is specified, one zone from each region
-// is randomly chosen.
+// cluster creation. If the geo flag is specified, nodes are distributed between
+// zones.
 var defaultCreateZones = []string{
-	"us-east-2a",
 	"us-east-2b",
-	"us-east-2c",
-	"us-west-2a",
 	"us-west-2b",
-	"us-west-2c",
-	"eu-west-2a",
 	"eu-west-2b",
-	"eu-west-2c",
 }
 
 // ConfigureCreateFlags is part of the vm.ProviderFlags interface.
@@ -140,8 +136,11 @@ func (o *providerOpts) ConfigureCreateFlags(flags *pflag.FlagSet) {
 		1000, "Number of IOPs to provision, only used if "+ProviderName+
 			"-ebs-volume-type=io1")
 
-	flags.StringSliceVar(&o.CreateZones, ProviderName+"-zones", defaultCreateZones,
-		"aws availability zones to use for cluster creation, the cluster will be spread out evenly by region (if geo) and then by AZ within a region")
+	flags.StringSliceVar(&o.CreateZones, ProviderName+"-zones", nil,
+		fmt.Sprintf("aws availability zones to use for cluster creation. If zones are formatted\n"+
+			"as AZ:N where N is an integer, the zone will be repeated N times. If > 1\n"+
+			"zone specified, the cluster will be spread out evenly by zone regardless\n"+
+			"of geo (default [%s])", strings.Join(defaultCreateZones, ",")))
 }
 
 func (o *providerOpts) ConfigureClusterFlags(flags *pflag.FlagSet, _ vm.MultipleProjectsOption) {
@@ -213,7 +212,17 @@ func (p *Provider) Create(names []string, opts vm.CreateOpts) error {
 		return err
 	}
 
-	regions, err := p.allRegions(p.opts.CreateZones)
+	expandedZones, err := vm.ExpandZonesFlag(p.opts.CreateZones)
+	if err != nil {
+		return err
+	}
+
+	useDefaultZones := len(expandedZones) == 0
+	if useDefaultZones {
+		expandedZones = defaultCreateZones
+	}
+
+	regions, err := p.allRegions(expandedZones)
 	if err != nil {
 		return err
 	}
@@ -222,9 +231,9 @@ func (p *Provider) Create(names []string, opts vm.CreateOpts) error {
 	}
 
 	var zones []string // contains an az corresponding to each entry in names
-	if !opts.GeoDistributed {
+	if !opts.GeoDistributed && (useDefaultZones || len(expandedZones) == 1) {
 		// Only use one zone in the region if we're not creating a geo cluster.
-		regionZones, err := p.regionZones(regions[0], p.opts.CreateZones)
+		regionZones, err := p.regionZones(regions[0], expandedZones)
 		if err != nil {
 			return err
 		}
@@ -235,21 +244,10 @@ func (p *Provider) Create(names []string, opts vm.CreateOpts) error {
 		}
 	} else {
 		// Distribute the nodes amongst availability zones if geo distributed.
-		zonesPerRegion := len(names) / len(regions)
-		leftover := len(names) % len(regions)
-		for i, region := range regions {
-			regionZones, err := p.regionZones(region, p.opts.CreateZones)
-			if err != nil {
-				return err
-			}
-			totalZonesPerRegion := zonesPerRegion
-			if leftover > i {
-				totalZonesPerRegion++
-			}
-			for j := 0; j < totalZonesPerRegion; j++ {
-				zoneIndex := j % len(regionZones)
-				zones = append(zones, regionZones[zoneIndex])
-			}
+		nodeZones := vm.ZonePlacement(len(expandedZones), len(names))
+		zones = make([]string, len(nodeZones))
+		for i, z := range nodeZones {
+			zones[i] = expandedZones[z]
 		}
 	}
 	var g errgroup.Group
@@ -264,7 +262,46 @@ func (p *Provider) Create(names []string, opts vm.CreateOpts) error {
 			return p.runInstance(capName, placement, opts)
 		})
 	}
-	return g.Wait()
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	return p.waitForIPs(names, regions)
+}
+
+// waitForIPs waits until AWS reports both internal and external IP addresses
+// for all newly created VMs. If we did not wait for these IPs then attempts to
+// list the new VMs after the creation might find VMs without an external IP.
+// We do a bad job at higher layers detecting this lack of IP which can lead to
+// commands hanging indefinitely.
+func (p *Provider) waitForIPs(names []string, regions []string) error {
+	waitForIPRetry := retry.Start(retry.Options{
+		InitialBackoff: 100 * time.Millisecond,
+		MaxBackoff:     500 * time.Millisecond,
+		MaxRetries:     120, // wait a bit less than 90s for IPs
+	})
+	makeNameSet := func() map[string]struct{} {
+		m := make(map[string]struct{}, len(names))
+		for _, n := range names {
+			m[n] = struct{}{}
+		}
+		return m
+	}
+	for waitForIPRetry.Next() {
+		vms, err := p.listRegions(regions)
+		if err != nil {
+			return err
+		}
+		nameSet := makeNameSet()
+		for _, vm := range vms {
+			if vm.PublicIP != "" && vm.PrivateIP != "" {
+				delete(nameSet, vm.Name)
+			}
+		}
+		if len(nameSet) == 0 {
+			return nil
+		}
+	}
+	return fmt.Errorf("failed to retrieve IPs for all vms")
 }
 
 // Delete is part of vm.Provider.
@@ -397,7 +434,10 @@ func (p *Provider) List() (vm.List, error) {
 	if err != nil {
 		return nil, err
 	}
+	return p.listRegions(regions)
+}
 
+func (p *Provider) listRegions(regions []string) (vm.List, error) {
 	var ret vm.List
 	var mux syncutil.Mutex
 	var g errgroup.Group

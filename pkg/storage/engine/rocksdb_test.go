@@ -164,8 +164,8 @@ func TestBatchIterReadOwnWrite(t *testing.T) {
 		after.SeekGE(k)
 		t.Fatalf(`Seek on batch-backed iter after batched closed should panic.
 			iter.engine: %T, iter.engine.Closed: %v, batch.Closed %v`,
-			after.(*rocksDBIterator).engine,
-			after.(*rocksDBIterator).engine.Closed(),
+			after.(*rocksDBIterator).reader,
+			after.(*rocksDBIterator).reader.Closed(),
 			b.Closed(),
 		)
 	}()
@@ -372,7 +372,7 @@ func benchmarkIterOnBatch(ctx context.Context, b *testing.B, writes int) {
 }
 
 func benchmarkIterOnReadWriter(
-	ctx context.Context, b *testing.B, writes int, f func(Engine) ReadWriter, closeReadWriter bool,
+	b *testing.B, writes int, f func(Engine) ReadWriter, closeReadWriter bool,
 ) {
 	engine := createTestRocksDBEngine()
 	defer engine.Close()
@@ -1159,74 +1159,6 @@ func TestRocksDBOptions(t *testing.T) {
 	}
 }
 
-func TestRocksDBFileNotFoundError(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	dir, dirCleanup := testutils.TempDir(t)
-	defer dirCleanup()
-
-	db, err := NewRocksDB(
-		RocksDBConfig{
-			StorageConfig: base.StorageConfig{
-				Settings: cluster.MakeTestingClusterSettings(),
-				Dir:      dir,
-			},
-		},
-		RocksDBCache{},
-	)
-	if err != nil {
-		t.Fatalf("could not create new rocksdb db instance at %s: %+v", dir, err)
-	}
-	defer db.Close()
-
-	// Verify DeleteFile returns os.ErrNotExist if file does not exist.
-	if err := db.DeleteFile("/non/existent/file"); !os.IsNotExist(err) {
-		t.Fatalf("expected IsNotExist, but got %v (%T)", err, err)
-	}
-
-	// Verify DeleteDirAndFiles returns os.ErrNotExist if dir does not exist.
-	if err := db.DeleteDirAndFiles("/non/existent/file"); !os.IsNotExist(err) {
-		t.Fatalf("expected IsNotExist, but got %v (%T)", err, err)
-	}
-
-	fname := filepath.Join(dir, "random.file")
-	data := "random data"
-	if f, err := db.OpenFile(fname); err != nil {
-		t.Fatalf("unable to open file with filename %s, got err %v", fname, err)
-	} else {
-		// Write data to file so we can read it later.
-		if _, err := f.Write([]byte(data)); err != nil {
-			t.Fatalf("error writing data: '%s' to file %s, got err %v", data, fname, err)
-		}
-		if err := f.Sync(); err != nil {
-			t.Fatalf("error syncing data, got err %v", err)
-		}
-		if err := f.Close(); err != nil {
-			t.Fatalf("error closing file %s, got err %v", fname, err)
-		}
-	}
-
-	if b, err := db.ReadFile(fname); err != nil {
-		t.Errorf("unable to read file with filename %s, got err %v", fname, err)
-	} else if string(b) != data {
-		t.Errorf("expected content in %s is '%s', got '%s'", fname, data, string(b))
-	}
-
-	if err := db.DeleteFile(fname); err != nil {
-		t.Errorf("unable to delete file with filename %s, got err %v", fname, err)
-	}
-
-	// Verify ReadFile returns os.ErrNotExist if reading an already deleted file.
-	if _, err := db.ReadFile(fname); !os.IsNotExist(err) {
-		t.Fatalf("expected IsNotExist, but got %v (%T)", err, err)
-	}
-
-	// Verify DeleteFile returns os.ErrNotExist if deleting an already deleted file.
-	if err := db.DeleteFile(fname); !os.IsNotExist(err) {
-		t.Fatalf("expected IsNotExist, but got %v (%T)", err, err)
-	}
-}
-
 // Verify that range tombstones do not result in sstables that cover an
 // exessively large portion of the key space.
 func TestRocksDBDeleteRangeCompaction(t *testing.T) {
@@ -1615,14 +1547,14 @@ func TestRocksDBWALFileEmptyBatch(t *testing.T) {
 		batch := e.NewBatch()
 		defer batch.Close()
 
-		var writer ReadWriter = batch
+		var rw ReadWriter = batch
 		if distinct {
 			// NB: we can't actually close this distinct batch because it auto-
 			// closes when the batch commits.
-			writer = batch.Distinct()
+			rw = batch.Distinct()
 		}
 
-		if err := writer.LogData([]byte("foo")); err != nil {
+		if err := rw.LogData([]byte("foo")); err != nil {
 			t.Fatal(err)
 		}
 		if batch.Empty() {

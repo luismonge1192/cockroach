@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -211,8 +212,8 @@ func (b *Builder) buildScalar(
 		// select the right overload. The solution is to wrap any mismatched
 		// arguments with a CastExpr that preserves the static type.
 
-		left, _ := tree.ReType(t.TypedLeft(), t.ResolvedBinOp().LeftType)
-		right, _ := tree.ReType(t.TypedRight(), t.ResolvedBinOp().RightType)
+		left := tree.ReType(t.TypedLeft(), t.ResolvedBinOp().LeftType)
+		right := tree.ReType(t.TypedRight(), t.ResolvedBinOp().RightType)
 		out = b.constructBinary(t.Operator,
 			b.buildScalar(left, inScope, nil, nil, colRefs),
 			b.buildScalar(right, inScope, nil, nil, colRefs),
@@ -335,10 +336,11 @@ func (b *Builder) buildScalar(
 		}
 
 	case *tree.RangeCond:
-		input := b.buildScalar(t.TypedLeft(), inScope, nil, nil, colRefs)
+		inputFrom := b.buildScalar(t.TypedLeftFrom(), inScope, nil, nil, colRefs)
 		from := b.buildScalar(t.TypedFrom(), inScope, nil, nil, colRefs)
+		inputTo := b.buildScalar(t.TypedLeftTo(), inScope, nil, nil, colRefs)
 		to := b.buildScalar(t.TypedTo(), inScope, nil, nil, colRefs)
-		out = b.buildRangeCond(t.Not, t.Symmetric, input, from, to)
+		out = b.buildRangeCond(t.Not, t.Symmetric, inputFrom, from, inputTo, to)
 
 	case *srf:
 		if len(t.cols) == 1 {
@@ -402,7 +404,7 @@ func (b *Builder) buildScalar(
 		if b.AllowUnsupportedExpr {
 			out = b.factory.ConstructUnsupportedExpr(scalar)
 		} else {
-			panic(unimplementedWithIssueDetailf(34848, fmt.Sprintf("%T", scalar), "not yet implemented: scalar expression: %T", scalar))
+			panic(unimplemented.Newf(fmt.Sprintf("optbuilder.%T", scalar), "not yet implemented: scalar expression: %T", scalar))
 		}
 	}
 
@@ -479,8 +481,7 @@ func (b *Builder) buildFunction(
 	})
 
 	if isGenerator(def) {
-		columns := len(def.ReturnLabels)
-		return b.finishBuildGeneratorFunction(f, out, columns, inScope, outScope, outCol)
+		return b.finishBuildGeneratorFunction(f, out, inScope, outScope, outCol)
 	}
 
 	return b.finishBuildScalar(f, out, inScope, outScope, outCol)
@@ -492,24 +493,28 @@ func (b *Builder) buildFunction(
 // x BETWEEN SYMMETRIC a AND b      ->  (x >= a AND x <= b) OR (x >= b AND x <= a)
 // x NOT BETWEEN SYMMETRIC a AND b  ->  NOT ((x >= a AND x <= b) OR (x >= b AND x <= a))
 //
+// Note that x can be typed differently in the expressions (x >= a) and (x <= b)
+// because a and b can have different types; the function takes both "variants"
+// of x.
+//
 // Note that these expressions are subject to normalization rules (which can
 // push down the negation).
 // TODO(radu): this doesn't work when the expressions have side-effects.
 func (b *Builder) buildRangeCond(
-	not bool, symmetric bool, input, from, to opt.ScalarExpr,
+	not bool, symmetric bool, inputFrom, from, inputTo, to opt.ScalarExpr,
 ) opt.ScalarExpr {
 	// Build "input >= from AND input <= to".
 	out := b.factory.ConstructAnd(
-		b.factory.ConstructGe(input, from),
-		b.factory.ConstructLe(input, to),
+		b.factory.ConstructGe(inputFrom, from),
+		b.factory.ConstructLe(inputTo, to),
 	)
 
 	if symmetric {
 		// Build "(input >= from AND input <= to) OR (input >= to AND input <= from)".
 		lhs := out
 		rhs := b.factory.ConstructAnd(
-			b.factory.ConstructGe(input, to),
-			b.factory.ConstructLe(input, from),
+			b.factory.ConstructGe(inputTo, to),
+			b.factory.ConstructLe(inputFrom, from),
 		)
 		out = b.factory.ConstructOr(lhs, rhs)
 	}
@@ -742,7 +747,7 @@ func NewScalar(
 
 // Build a memo structure from a TypedExpr: the root group represents a scalar
 // expression equivalent to expr.
-func (sb *ScalarBuilder) Build(expr tree.TypedExpr) (err error) {
+func (sb *ScalarBuilder) Build(expr tree.Expr) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			// This code allows us to propagate errors without adding lots of checks
@@ -757,7 +762,8 @@ func (sb *ScalarBuilder) Build(expr tree.TypedExpr) (err error) {
 		}
 	}()
 
-	scalar := sb.buildScalar(expr, &sb.scope, nil, nil, nil)
+	typedExpr := sb.scope.resolveType(expr, types.Any)
+	scalar := sb.buildScalar(typedExpr, &sb.scope, nil, nil, nil)
 	sb.factory.Memo().SetScalarRoot(scalar)
 	return nil
 }

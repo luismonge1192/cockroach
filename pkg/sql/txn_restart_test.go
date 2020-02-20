@@ -44,6 +44,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/lib/pq"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
 )
 
 type failureRecord struct {
@@ -125,7 +126,7 @@ func injectErrors(
 			{counts: magicVals.restartCounts, errFn: func() error {
 				// Note we use a retry error that cannot be automatically retried
 				// by the transaction coord sender.
-				return roachpb.NewTransactionRetryError(roachpb.RETRY_POSSIBLE_REPLAY, "injected err")
+				return roachpb.NewTransactionRetryError(roachpb.RETRY_REASON_UNKNOWN, "injected err")
 			}},
 			{counts: magicVals.abortCounts, errFn: func() error {
 				return roachpb.NewTransactionAbortedError(roachpb.ABORT_REASON_ABORTED_RECORD_FOUND)
@@ -612,10 +613,7 @@ BEGIN;
 
 	// Continue the txn in a new request, which is not retriable.
 	_, err = sqlDB.Exec("INSERT INTO t.public.test(k, v, t) VALUES (4, 'hooly', cluster_logical_timestamp())")
-	if !testutils.IsError(
-		err, "RETRY_POSSIBLE_REPLAY") {
-		t.Errorf("didn't get expected injected error. Got: %v", err)
-	}
+	require.Error(t, err, "RETRY_REASON_UNKNOWN - injected err")
 }
 
 // Test that aborted txn are only retried once.
@@ -765,7 +763,7 @@ func TestTxnUserRestart(t *testing.T) {
 			magicVals: createFilterVals(
 				map[string]int{"boulanger": 2}, // restartCounts
 				nil),
-			expectedErr: "RETRY_POSSIBLE_REPLAY",
+			expectedErr: "RETRY_REASON_UNKNOWN",
 		},
 		{
 			magicVals: createFilterVals(
@@ -1072,7 +1070,7 @@ func TestUnexpectedStatementInRestartWait(t *testing.T) {
 	}
 
 	if _, err := tx.Exec("SELECT 1"); !testutils.IsError(err,
-		`pq: Expected "ROLLBACK TO SAVEPOINT COCKROACH_RESTART": `+
+		`pq: Expected "ROLLBACK TO SAVEPOINT cockroach_restart": `+
 			"current transaction is aborted, commands ignored until end of transaction block") {
 		t.Fatal(err)
 	}
@@ -1125,18 +1123,19 @@ SELECT * from t.test WHERE k = 'test_key';
 	}
 }
 
-// Verifies that an expired lease is released and a new lease is acquired on transaction
-// restart.
+// Verifies that an expired lease is released and a new lease is acquired on
+// transaction restart.
 //
-// This test triggers the above scenario by making ReadWithinUncertaintyIntervalError advance
-// the clock, so that the transaction timestamp exceeds the deadline of the EndTransactionRequest.
+// This test triggers the above scenario by making
+// ReadWithinUncertaintyIntervalError advance the clock, so that the transaction
+// timestamp exceeds the deadline of the EndTxnRequest.
 func TestReacquireLeaseOnRestart(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	advancement := 2 * base.DefaultTableDescriptorLeaseDuration
 
 	var cmdFilters tests.CommandFilters
-	cmdFilters.AppendFilter(tests.CheckEndTransactionTrigger, true)
+	cmdFilters.AppendFilter(tests.CheckEndTxnTrigger, true)
 
 	var clockUpdate int32
 	testKey := []byte("test_key")
@@ -1235,7 +1234,7 @@ func TestFlushUncommitedDescriptorCacheOnRestart(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	var cmdFilters tests.CommandFilters
-	cmdFilters.AppendFilter(tests.CheckEndTransactionTrigger, true)
+	cmdFilters.AppendFilter(tests.CheckEndTxnTrigger, true)
 	testKey := []byte("test_key")
 	testingKnobs := &storage.StoreTestingKnobs{
 		EvalKnobs: storagebase.BatchEvalTestingKnobs{

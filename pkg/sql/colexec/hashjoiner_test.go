@@ -32,34 +32,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type hjTestCase struct {
-	leftTypes  []coltypes.T
-	rightTypes []coltypes.T
-
-	leftTuples  tuples
-	rightTuples tuples
-
-	leftEqCols  []uint32
-	rightEqCols []uint32
-
-	leftOutCols  []uint32
-	rightOutCols []uint32
-
-	// The default joinType is sqlbase.JoinType_INNER if this value is not set.
-	joinType sqlbase.JoinType
-
-	leftEqColsAreKey  bool
-	rightEqColsAreKey bool
-
-	expectedTuples tuples
-
-	onExpr execinfrapb.Expression
-}
-
 var (
-	floats = []float64{0.314, 3.14, 31.4, 314}
-	decs   []apd.Decimal
-	tcs    []hjTestCase
+	floats      = []float64{0.314, 3.14, 31.4, 314}
+	decs        []apd.Decimal
+	hjTestCases []joinTestCase
 )
 
 func init() {
@@ -72,7 +48,7 @@ func init() {
 		}
 	}
 
-	tcs = []hjTestCase{
+	hjTestCases = []joinTestCase{
 		{
 			leftTypes:  []coltypes.T{coltypes.Int64},
 			rightTypes: []coltypes.T{coltypes.Int64},
@@ -99,7 +75,7 @@ func init() {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: true,
 
-			expectedTuples: tuples{
+			expected: tuples{
 				{nil, -1},
 				{1, 1},
 				{3, 3},
@@ -128,7 +104,7 @@ func init() {
 			joinType:         sqlbase.JoinType_FULL_OUTER,
 			leftEqColsAreKey: true,
 
-			expectedTuples: tuples{
+			expected: tuples{
 				{nil, -1},
 				{nil, 1},
 				{nil, 3},
@@ -160,7 +136,7 @@ func init() {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: true,
 
-			expectedTuples: tuples{
+			expected: tuples{
 				{1, 1},
 				{3, 3},
 				{0, nil},
@@ -191,7 +167,7 @@ func init() {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: true,
 
-			expectedTuples: tuples{
+			expected: tuples{
 				{1, 1},
 				{nil, 2},
 			},
@@ -222,7 +198,7 @@ func init() {
 			joinType:          sqlbase.JoinType_RIGHT_OUTER,
 			rightEqColsAreKey: true,
 
-			expectedTuples: tuples{
+			expected: tuples{
 				{nil, 1},
 				{2, 2},
 			},
@@ -248,7 +224,7 @@ func init() {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: false,
 
-			expectedTuples: tuples{
+			expected: tuples{
 				{0},
 			},
 		},
@@ -277,7 +253,7 @@ func init() {
 			leftEqColsAreKey:  false,
 			rightEqColsAreKey: false,
 
-			expectedTuples: tuples{
+			expected: tuples{
 				{1},
 				{0},
 			},
@@ -308,7 +284,7 @@ func init() {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: true,
 
-			expectedTuples: tuples{
+			expected: tuples{
 				{nil, 2},
 				{nil, nil},
 				{1, nil},
@@ -342,7 +318,7 @@ func init() {
 			leftEqColsAreKey:  false,
 			rightEqColsAreKey: false,
 
-			expectedTuples: tuples{
+			expected: tuples{
 				{2},
 				{3},
 				{1},
@@ -376,7 +352,7 @@ func init() {
 			leftEqColsAreKey:  false,
 			rightEqColsAreKey: false,
 
-			expectedTuples: tuples{
+			expected: tuples{
 				{3, 7},
 				{6, 8},
 				{1, 8},
@@ -393,22 +369,22 @@ func init() {
 
 			leftTuples: tuples{
 				{0},
-				{hashTableBucketSize},
-				{hashTableBucketSize},
-				{hashTableBucketSize},
+				{hashTableNumBuckets},
+				{hashTableNumBuckets},
+				{hashTableNumBuckets},
 				{0},
-				{hashTableBucketSize * 2},
+				{hashTableNumBuckets * 2},
 				{1},
 				{1},
-				{hashTableBucketSize + 1},
+				{hashTableNumBuckets + 1},
 			},
 			rightTuples: tuples{
-				{hashTableBucketSize},
-				{hashTableBucketSize * 2},
-				{hashTableBucketSize * 3},
+				{hashTableNumBuckets},
+				{hashTableNumBuckets * 2},
+				{hashTableNumBuckets * 3},
 				{0},
 				{1},
-				{hashTableBucketSize + 1},
+				{hashTableNumBuckets + 1},
 			},
 
 			leftEqCols:   []uint32{0},
@@ -420,16 +396,16 @@ func init() {
 			leftEqColsAreKey:  false,
 			rightEqColsAreKey: false,
 
-			expectedTuples: tuples{
-				{hashTableBucketSize, hashTableBucketSize},
-				{hashTableBucketSize, hashTableBucketSize},
-				{hashTableBucketSize, hashTableBucketSize},
-				{hashTableBucketSize * 2, hashTableBucketSize * 2},
+			expected: tuples{
+				{hashTableNumBuckets, hashTableNumBuckets},
+				{hashTableNumBuckets, hashTableNumBuckets},
+				{hashTableNumBuckets, hashTableNumBuckets},
+				{hashTableNumBuckets * 2, hashTableNumBuckets * 2},
 				{0, 0},
 				{0, 0},
 				{1, 1},
 				{1, 1},
-				{hashTableBucketSize + 1, hashTableBucketSize + 1},
+				{hashTableNumBuckets + 1, hashTableNumBuckets + 1},
 			},
 		},
 		{
@@ -460,7 +436,7 @@ func init() {
 			leftEqColsAreKey:  false,
 			rightEqColsAreKey: false,
 
-			expectedTuples: tuples{
+			expected: tuples{
 				{1},
 				{1},
 				{1},
@@ -497,7 +473,7 @@ func init() {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: true,
 
-			expectedTuples: tuples{
+			expected: tuples{
 				{2, "foo", 2, int32(2)},
 				{3, "b", 3, int32(4)},
 				{5, "a", 5, int32(16)},
@@ -511,14 +487,14 @@ func init() {
 			// hash to the same bucket.
 			leftTuples: tuples{
 				{0},
-				{hashTableBucketSize},
-				{hashTableBucketSize * 2},
-				{hashTableBucketSize * 3},
+				{hashTableNumBuckets},
+				{hashTableNumBuckets * 2},
+				{hashTableNumBuckets * 3},
 			},
 			rightTuples: tuples{
 				{0},
-				{hashTableBucketSize},
-				{hashTableBucketSize * 3},
+				{hashTableNumBuckets},
+				{hashTableNumBuckets * 3},
 			},
 
 			leftEqCols:   []uint32{0},
@@ -529,10 +505,10 @@ func init() {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: true,
 
-			expectedTuples: tuples{
+			expected: tuples{
 				{0},
-				{hashTableBucketSize},
-				{hashTableBucketSize * 3},
+				{hashTableNumBuckets},
+				{hashTableNumBuckets * 3},
 			},
 		},
 		{
@@ -563,7 +539,7 @@ func init() {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: false,
 
-			expectedTuples: tuples{
+			expected: tuples{
 				{1, 1},
 				{1, 1},
 				{1, 1},
@@ -600,7 +576,7 @@ func init() {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: true,
 
-			expectedTuples: tuples{
+			expected: tuples{
 				{0, 2, 30, 100},
 				{1, 1, 40, 200},
 				{2, 0, 60, 300},
@@ -614,17 +590,17 @@ func init() {
 			// Test multiple column with values that hash to the same bucket.
 			leftTuples: tuples{
 				{10, 0, 0},
-				{20, 0, hashTableBucketSize},
-				{40, hashTableBucketSize, 0},
-				{50, hashTableBucketSize, hashTableBucketSize},
-				{60, hashTableBucketSize * 2, 0},
-				{70, hashTableBucketSize * 2, hashTableBucketSize},
+				{20, 0, hashTableNumBuckets},
+				{40, hashTableNumBuckets, 0},
+				{50, hashTableNumBuckets, hashTableNumBuckets},
+				{60, hashTableNumBuckets * 2, 0},
+				{70, hashTableNumBuckets * 2, hashTableNumBuckets},
 			},
 			rightTuples: tuples{
-				{0, hashTableBucketSize},
-				{hashTableBucketSize * 2, hashTableBucketSize},
+				{0, hashTableNumBuckets},
+				{hashTableNumBuckets * 2, hashTableNumBuckets},
 				{0, 0},
-				{0, hashTableBucketSize * 2},
+				{0, hashTableNumBuckets * 2},
 			},
 
 			leftEqCols:   []uint32{1, 2},
@@ -635,9 +611,9 @@ func init() {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: true,
 
-			expectedTuples: tuples{
-				{20, 0, hashTableBucketSize},
-				{70, hashTableBucketSize * 2, hashTableBucketSize},
+			expected: tuples{
+				{20, 0, hashTableNumBuckets},
+				{70, hashTableNumBuckets * 2, hashTableNumBuckets},
 				{10, 0, 0},
 			},
 		},
@@ -671,7 +647,7 @@ func init() {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: true,
 
-			expectedTuples: tuples{
+			expected: tuples{
 				{"ccc"},
 				{"aaa"},
 				{"fff"},
@@ -703,7 +679,7 @@ func init() {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: true,
 
-			expectedTuples: tuples{
+			expected: tuples{
 				{float64(55.55555)},
 				{float64(44.4444)},
 				{float64(44.4444)},
@@ -735,7 +711,7 @@ func init() {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: true,
 
-			expectedTuples: tuples{
+			expected: tuples{
 				{3, 3, 2, 2, 1, 2, 3, 4},
 				{3, 7, 2, 1, 1, 2, 3, 4},
 				{5, 4, 3, 2, 1, 3, 5, 7},
@@ -765,7 +741,7 @@ func init() {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: true,
 
-			expectedTuples: tuples{
+			expected: tuples{
 				{decs[2]},
 				{decs[0]},
 			},
@@ -796,10 +772,40 @@ func init() {
 			leftEqColsAreKey:  false,
 			rightEqColsAreKey: false,
 
-			expectedTuples: tuples{
+			expected: tuples{
 				{0},
 				{0},
 				{1},
+			},
+		},
+		{
+			leftTypes:  []coltypes.T{coltypes.Int64},
+			rightTypes: []coltypes.T{coltypes.Int64},
+
+			joinType: sqlbase.JoinType_LEFT_ANTI,
+
+			leftTuples: tuples{
+				{0},
+				{0},
+				{1},
+				{2},
+			},
+			rightTuples: tuples{
+				{0},
+				{0},
+				{1},
+			},
+
+			leftEqCols:   []uint32{0},
+			rightEqCols:  []uint32{0},
+			leftOutCols:  []uint32{0},
+			rightOutCols: []uint32{},
+
+			leftEqColsAreKey:  false,
+			rightEqColsAreKey: false,
+
+			expected: tuples{
+				{2},
 			},
 		},
 		{
@@ -829,7 +835,7 @@ func init() {
 			rightEqColsAreKey: true,
 
 			onExpr: execinfrapb.Expression{Expr: "@1 + @3 > 2 AND @1 + @3 < 8"},
-			expectedTuples: tuples{
+			expected: tuples{
 				{nil, nil},
 				{1, nil},
 			},
@@ -861,7 +867,7 @@ func init() {
 			rightEqColsAreKey: true,
 
 			onExpr: execinfrapb.Expression{Expr: "@1 + @3 + @4 < 100"},
-			expectedTuples: tuples{
+			expected: tuples{
 				{nil, 2},
 				{2, 4},
 			},
@@ -869,7 +875,9 @@ func init() {
 	}
 }
 
-func createSpecForHashJoiner(tc hjTestCase) *execinfrapb.ProcessorSpec {
+// createSpecForHashJoiner creates a hash join processor spec based on a test
+// case.
+func createSpecForHashJoiner(tc joinTestCase) *execinfrapb.ProcessorSpec {
 	hjSpec := &execinfrapb.HashJoinerSpec{
 		LeftEqColumns:        tc.leftEqCols,
 		RightEqColumns:       tc.rightEqCols,
@@ -899,6 +907,31 @@ func createSpecForHashJoiner(tc hjTestCase) *execinfrapb.ProcessorSpec {
 	}
 }
 
+// runHashJoinTestCase is a helper function that runs a single test case
+// against a hash join operator (either in-memory or disk-backed one) which is
+// created by the provided constructor.
+func runHashJoinTestCase(
+	t *testing.T, tc joinTestCase, hjOpConstructor func(sources []Operator) (Operator, error),
+) {
+	tc.init()
+	if !tc.onExpr.Empty() && tc.joinType != sqlbase.JoinType_INNER {
+		// Currently, onExpr is supported only for INNER join, so we skip all
+		// other cases.
+		return
+	}
+	inputs := []tuples{tc.leftTuples, tc.rightTuples}
+	typs := [][]coltypes.T{tc.leftTypes, tc.rightTypes}
+	var runner testRunner
+	if tc.skipAllNullsInjection {
+		// We're omitting all nulls injection test. See comments for each such
+		// test case.
+		runner = runTestsWithoutAllNullsInjection
+	} else {
+		runner = runTestsWithTyps
+	}
+	runner(t, inputs, typs, tc.expected, unorderedVerifier, hjOpConstructor)
+}
+
 func TestHashJoiner(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -912,48 +945,33 @@ func TestHashJoiner(t *testing.T) {
 	}
 
 	for _, outputBatchSize := range []uint16{1, 17, coldata.BatchSize()} {
-		for _, tc := range tcs {
-			inputs := []tuples{tc.leftTuples, tc.rightTuples}
-			typs := [][]coltypes.T{tc.leftTypes, tc.rightTypes}
-			runTestsWithTyps(t, inputs, typs, tc.expectedTuples, unorderedVerifier, func(sources []Operator) (Operator, error) {
-				spec := createSpecForHashJoiner(tc)
-				result, err := NewColOperator(
-					ctx, flowCtx, spec, sources, testMemAcc,
-					true, /* useStreamingMemAccountForBuffering */
-				)
-				if err != nil {
-					return nil, err
-				}
-				if hj, ok := result.Op.(*hashJoinEqOp); ok {
-					hj.outputBatchSize = outputBatchSize
-				}
-				return result.Op, nil
-			})
+		if outputBatchSize > coldata.BatchSize() {
+			// It is possible for varied coldata.BatchSize() to be smaller than
+			// requested outputBatchSize. Such configuration is invalid, and we skip
+			// it.
+			continue
 		}
-	}
-}
-
-func TestHashJoinerOutputsOnlyRequestedColumns(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	for _, tc := range tcs {
-		leftSource := newOpTestInput(1, tc.leftTuples, tc.leftTypes)
-		rightSource := newOpTestInput(1, tc.rightTuples, tc.rightTypes)
-		hjOp, err := NewEqHashJoinerOp(
-			testAllocator,
-			leftSource, rightSource,
-			tc.leftEqCols, tc.rightEqCols,
-			tc.leftOutCols, tc.rightOutCols,
-			tc.leftTypes, tc.rightTypes,
-			tc.rightEqColsAreKey, tc.leftEqColsAreKey || tc.rightEqColsAreKey,
-			tc.joinType)
-		require.NoError(t, err)
-		hjOp.Init()
-		for {
-			b := hjOp.Next(context.Background())
-			if b.Length() == 0 {
-				break
+		for _, tcs := range [][]joinTestCase{hjTestCases, mjTestCases} {
+			for _, tc := range tcs {
+				runHashJoinTestCase(t, tc, func(sources []Operator) (Operator, error) {
+					spec := createSpecForHashJoiner(tc)
+					args := NewColOperatorArgs{
+						Spec:                spec,
+						Inputs:              sources,
+						StreamingMemAccount: testMemAcc,
+					}
+					args.TestingKnobs.UseStreamingMemAccountForBuffering = true
+					args.TestingKnobs.DiskSpillingDisabled = true
+					result, err := NewColOperator(ctx, flowCtx, args)
+					if err != nil {
+						return nil, err
+					}
+					if hj, ok := result.Op.(*hashJoiner); ok {
+						hj.outputBatchSize = outputBatchSize
+					}
+					return result.Op, nil
+				})
 			}
-			require.Equal(t, len(tc.leftOutCols)+(len(tc.rightOutCols)), b.Width())
 		}
 	}
 }
@@ -995,8 +1013,8 @@ func BenchmarkHashJoiner(b *testing.B) {
 
 			for _, fullOuter := range []bool{false, true} {
 				b.Run(fmt.Sprintf("fullOuter=%v", fullOuter), func(b *testing.B) {
-					for _, buildDistinct := range []bool{true, false} {
-						b.Run(fmt.Sprintf("distinct=%v", buildDistinct), func(b *testing.B) {
+					for _, rightDistinct := range []bool{true, false} {
+						b.Run(fmt.Sprintf("distinct=%v", rightDistinct), func(b *testing.B) {
 							for _, nBatches := range []int{1 << 1, 1 << 8, 1 << 12} {
 								b.Run(fmt.Sprintf("rows=%d", nBatches*int(coldata.BatchSize())), func(b *testing.B) {
 									// 8 (bytes / int64) * nBatches (number of batches) * col.BatchSize() (rows /
@@ -1004,35 +1022,23 @@ func BenchmarkHashJoiner(b *testing.B) {
 									b.SetBytes(int64(8 * nBatches * int(coldata.BatchSize()) * nCols * 2))
 									b.ResetTimer()
 									for i := 0; i < b.N; i++ {
-										leftSource := newFiniteBatchSource(batch, nBatches)
-										rightSource := NewRepeatableBatchSource(batch)
-
-										spec := hashJoinerSpec{
-											left: hashJoinerSourceSpec{
-												eqCols:      []uint32{0, 2},
-												outCols:     []uint32{0, 1},
-												sourceTypes: sourceTypes,
-												source:      leftSource,
-												outer:       fullOuter,
-											},
-
-											right: hashJoinerSourceSpec{
-												eqCols:      []uint32{1, 3},
-												outCols:     []uint32{2, 3},
-												sourceTypes: sourceTypes,
-												source:      rightSource,
-												outer:       fullOuter,
-											},
-
-											buildDistinct: buildDistinct,
+										leftSource := NewRepeatableBatchSource(testAllocator, batch)
+										rightSource := newFiniteBatchSource(batch, nBatches)
+										joinType := sqlbase.JoinType_INNER
+										if fullOuter {
+											joinType = sqlbase.JoinType_FULL_OUTER
 										}
-
-										hj := &hashJoinEqOp{
-											allocator:       testAllocator,
-											spec:            spec,
-											outputBatchSize: coldata.BatchSize(),
-										}
-
+										hjSpec, err := makeHashJoinerSpec(
+											joinType,
+											[]uint32{0, 1}, []uint32{2, 3},
+											sourceTypes, sourceTypes,
+											rightDistinct,
+										)
+										require.NoError(b, err)
+										hj := newHashJoiner(
+											testAllocator, hjSpec,
+											leftSource, rightSource,
+										)
 										hj.Init()
 
 										for i := 0; i < nBatches; i++ {
@@ -1131,10 +1137,14 @@ func TestHashJoinerProjection(t *testing.T) {
 
 	leftSource := newOpTestInput(1, leftTuples, leftColTypes)
 	rightSource := newOpTestInput(1, rightTuples, rightColTypes)
-	hjOp, err := NewColOperator(
-		ctx, flowCtx, spec, []Operator{leftSource, rightSource}, testMemAcc,
-		true, /* useStreamingMemAccountForBuffering */
-	)
+	args := NewColOperatorArgs{
+		Spec:                spec,
+		Inputs:              []Operator{leftSource, rightSource},
+		StreamingMemAccount: testMemAcc,
+	}
+	args.TestingKnobs.UseStreamingMemAccountForBuffering = true
+	args.TestingKnobs.DiskSpillingDisabled = true
+	hjOp, err := NewColOperator(ctx, flowCtx, args)
 	require.NoError(t, err)
 	hjOp.Op.Init()
 	for {

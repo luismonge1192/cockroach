@@ -364,9 +364,10 @@ DBStatus DBImpl::EnvWriteFile(DBSlice path, DBSlice contents) {
 }
 
 // EnvOpenFile opens a new file in the given engine.
-DBStatus DBImpl::EnvOpenFile(DBSlice path, rocksdb::WritableFile** file) {
+DBStatus DBImpl::EnvOpenFile(DBSlice path, uint64_t bytes_per_sync, rocksdb::WritableFile** file) {
   rocksdb::Status status;
-  const rocksdb::EnvOptions soptions;
+  rocksdb::EnvOptions soptions;
+  soptions.bytes_per_sync = bytes_per_sync;
   std::unique_ptr<rocksdb::WritableFile> rocksdb_file;
 
   // Create the file.
@@ -447,6 +448,69 @@ DBStatus DBImpl::EnvDeleteDirAndFiles(DBSlice dir) {
 // EnvLinkFile creates 'newname' as a hard link to 'oldname'.
 DBStatus DBImpl::EnvLinkFile(DBSlice oldname, DBSlice newname) {
   return ToDBStatus(this->rep->GetEnv()->LinkFile(ToString(oldname), ToString(newname)));
+}
+
+DBStatus DBImpl::EnvOpenReadableFile(DBSlice path, rocksdb::RandomAccessFile** file) {
+  rocksdb::Status status;
+  const rocksdb::EnvOptions soptions;
+  std::unique_ptr<rocksdb::RandomAccessFile> rocksdb_file;
+
+  status = this->rep->GetEnv()->NewRandomAccessFile(ToString(path), &rocksdb_file, soptions);
+  if (!status.ok()) {
+    return ToDBStatus(status);
+  }
+  *file = rocksdb_file.release();
+  return kSuccess;
+}
+
+DBStatus DBImpl::EnvCloseReadableFile(rocksdb::RandomAccessFile* file) {
+  delete file;
+  return kSuccess;
+}
+
+DBStatus DBImpl::EnvReadAtFile(rocksdb::RandomAccessFile* file, DBSlice buffer, int64_t offset,
+                               int* n) {
+  size_t max_bytes_to_read = buffer.len;
+  char* scratch = buffer.data;
+  rocksdb::Slice result;
+  auto status = file->Read(offset, max_bytes_to_read, &result, scratch);
+  *n = result.size();
+  return ToDBStatus(status);
+}
+
+DBStatus DBImpl::EnvOpenDirectory(DBSlice path, rocksdb::Directory** file) {
+  rocksdb::Status status;
+  std::unique_ptr<rocksdb::Directory> rocksdb_dir;
+
+  status = this->rep->GetEnv()->NewDirectory(ToString(path), &rocksdb_dir);
+  if (!status.ok()) {
+    return ToDBStatus(status);
+  }
+  *file = rocksdb_dir.release();
+  return kSuccess;
+}
+
+DBStatus DBImpl::EnvSyncDirectory(rocksdb::Directory* file) { return ToDBStatus(file->Fsync()); }
+
+DBStatus DBImpl::EnvCloseDirectory(rocksdb::Directory* file) {
+  delete file;
+  return kSuccess;
+}
+
+DBStatus DBImpl::EnvRenameFile(DBSlice oldname, DBSlice newname) {
+  return ToDBStatus(this->rep->GetEnv()->RenameFile(ToString(oldname), ToString(newname)));
+}
+
+DBStatus DBImpl::EnvCreateDir(DBSlice name) {
+  return ToDBStatus(this->rep->GetEnv()->CreateDirIfMissing(ToString(name)));
+}
+
+DBStatus DBImpl::EnvDeleteDir(DBSlice name) {
+  return ToDBStatus(this->rep->GetEnv()->DeleteDir(ToString(name)));
+}
+
+DBStatus DBImpl::EnvListDir(DBSlice name, std::vector<std::string>* result) {
+  return ToDBStatus(this->rep->GetEnv()->GetChildren(ToString(name), result));
 }
 
 }  // namespace cockroach

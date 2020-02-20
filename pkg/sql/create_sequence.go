@@ -15,11 +15,12 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
@@ -44,24 +45,24 @@ func (p *planner) CreateSequence(ctx context.Context, n *tree.CreateSequence) (p
 	}, nil
 }
 
+// ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
+// This is because CREATE SEQUENCE performs multiple KV operations on descriptors
+// and expects to see its own writes.
+func (n *createSequenceNode) ReadingOwnWrites() {}
+
 func (n *createSequenceNode) startExec(params runParams) error {
-	// TODO(arul): Allow temporary sequences once temp tables work for regular tables.
-	if n.n.Temporary {
-		return unimplemented.NewWithIssuef(5807,
-			"temporary sequences are unsupported")
-	}
-	tKey := sqlbase.NewTableKey(n.dbDesc.ID, n.n.Name.Table())
-	if exists, err := descExists(params.ctx, params.p.txn, tKey.Key()); err == nil && exists {
-		if n.n.IfNotExists {
-			// If the sequence exists but the user specified IF NOT EXISTS, return without doing anything.
+	telemetry.Inc(sqltelemetry.SchemaChangeCreate("sequence"))
+	isTemporary := n.n.Temporary
+
+	_, schemaID, err := getTableCreateParams(params, n.dbDesc.ID, isTemporary, n.n.Name.Table())
+	if err != nil {
+		if sqlbase.IsRelationAlreadyExistsError(err) && n.n.IfNotExists {
 			return nil
 		}
-		return sqlbase.NewRelationAlreadyExistsError(tKey.Name())
-	} else if err != nil {
 		return err
 	}
 
-	return doCreateSequence(params, n.n.String(), n.dbDesc, &n.n.Name, n.n.Options)
+	return doCreateSequence(params, n.n.String(), n.dbDesc, schemaID, &n.n.Name, isTemporary, n.n.Options)
 }
 
 // doCreateSequence performs the creation of a sequence in KV. The
@@ -70,7 +71,9 @@ func doCreateSequence(
 	params runParams,
 	context string,
 	dbDesc *DatabaseDescriptor,
+	schemaID sqlbase.ID,
 	name *ObjectName,
+	isTemporary bool,
 	opts tree.SequenceOptions,
 ) error {
 	id, err := GenerateUniqueDescID(params.ctx, params.p.ExecCfg().DB)
@@ -81,8 +84,21 @@ func doCreateSequence(
 	// Inherit permissions from the database descriptor.
 	privs := dbDesc.GetPrivileges()
 
-	desc, err := MakeSequenceTableDesc(name.Table(), opts,
-		dbDesc.ID, id, params.creationTimeForNewTableDescriptor(), privs, &params)
+	if isTemporary {
+		telemetry.Inc(sqltelemetry.CreateTempSequenceCounter)
+	}
+
+	desc, err := MakeSequenceTableDesc(
+		name.Table(),
+		opts,
+		dbDesc.ID,
+		schemaID,
+		id,
+		params.creationTimeForNewTableDescriptor(),
+		privs,
+		isTemporary,
+		&params,
+	)
 	if err != nil {
 		return err
 	}
@@ -90,7 +106,13 @@ func doCreateSequence(
 	// makeSequenceTableDesc already validates the table. No call to
 	// desc.ValidateTable() needed here.
 
-	key := sqlbase.NewTableKey(dbDesc.ID, name.Table()).Key()
+	key := sqlbase.MakeObjectNameKey(
+		params.ctx,
+		params.ExecCfg().Settings,
+		dbDesc.ID,
+		schemaID,
+		name.Table(),
+	).Key()
 	if err = params.p.createDescriptorWithID(params.ctx, key, id, &desc, params.EvalContext().Settings); err != nil {
 		return err
 	}
@@ -137,12 +159,22 @@ func MakeSequenceTableDesc(
 	sequenceName string,
 	sequenceOptions tree.SequenceOptions,
 	parentID sqlbase.ID,
+	schemaID sqlbase.ID,
 	id sqlbase.ID,
 	creationTime hlc.Timestamp,
 	privileges *sqlbase.PrivilegeDescriptor,
+	isTemporary bool,
 	params *runParams,
 ) (sqlbase.MutableTableDescriptor, error) {
-	desc := InitTableDescriptor(id, parentID, sequenceName, creationTime, privileges, false /* temporary */)
+	desc := InitTableDescriptor(
+		id,
+		parentID,
+		schemaID,
+		sequenceName,
+		creationTime,
+		privileges,
+		isTemporary,
+	)
 
 	// Mimic a table with one column, "value".
 	desc.Columns = []sqlbase.ColumnDescriptor{

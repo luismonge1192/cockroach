@@ -42,10 +42,7 @@ func TestTxnSnowballTrace(t *testing.T) {
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	db := NewDB(testutils.MakeAmbientCtx(), newTestTxnFactory(nil), clock)
 	tracer := tracing.NewTracer()
-	ctx, sp, err := tracing.StartSnowballTrace(context.Background(), tracer, "test-txn")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ctx, sp := tracing.StartSnowballTrace(context.Background(), tracer, "test-txn")
 
 	if err := db.Txn(ctx, func(ctx context.Context, txn *Txn) error {
 		log.Event(ctx, "inside txn")
@@ -108,8 +105,8 @@ func newTestTxnFactory(
 					union.MustSetInner(&testPutRespCopy)
 				}
 			}
-			if args, ok := ba.GetArg(roachpb.EndTransaction); ok {
-				et := args.(*roachpb.EndTransactionRequest)
+			if args, ok := ba.GetArg(roachpb.EndTxn); ok {
+				et := args.(*roachpb.EndTxnRequest)
 				if et.Commit {
 					status = roachpb.COMMITTED
 				} else {
@@ -142,7 +139,7 @@ func TestInitPut(t *testing.T) {
 			return br, nil
 		}), clock)
 
-	txn := NewTxn(ctx, db, 0 /* gatewayNodeID */, RootTxn)
+	txn := NewTxn(ctx, db, 0 /* gatewayNodeID */)
 	if pErr := txn.InitPut(ctx, "a", "b", false); pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -206,7 +203,7 @@ func TestAbortMutatingTransaction(t *testing.T) {
 		testutils.MakeAmbientCtx(),
 		newTestTxnFactory(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 			calls = append(calls, ba.Methods()...)
-			if et, ok := ba.GetArg(roachpb.EndTransaction); ok && et.(*roachpb.EndTransactionRequest).Commit {
+			if et, ok := ba.GetArg(roachpb.EndTxn); ok && et.(*roachpb.EndTxnRequest).Commit {
 				t.Errorf("expected commit to be false")
 			}
 			return ba.CreateReply(), nil
@@ -220,7 +217,7 @@ func TestAbortMutatingTransaction(t *testing.T) {
 	}); err == nil {
 		t.Error("expected error on abort")
 	}
-	expectedCalls := []roachpb.Method{roachpb.Put, roachpb.EndTransaction}
+	expectedCalls := []roachpb.Method{roachpb.Put, roachpb.EndTxn}
 	if !reflect.DeepEqual(expectedCalls, calls) {
 		t.Errorf("expected %s, got %s", expectedCalls, calls)
 	}
@@ -314,7 +311,7 @@ func TestTransactionStatus(t *testing.T) {
 	db := NewDB(testutils.MakeAmbientCtx(), newTestTxnFactory(nil), clock)
 	for _, write := range []bool{true, false} {
 		for _, commit := range []bool{true, false} {
-			txn := NewTxn(ctx, db, 0 /* gatewayNodeID */, RootTxn)
+			txn := NewTxn(ctx, db, 0 /* gatewayNodeID */)
 
 			if _, pErr := txn.Get(ctx, "a"); pErr != nil {
 				t.Fatal(pErr)
@@ -328,14 +325,14 @@ func TestTransactionStatus(t *testing.T) {
 				if pErr := txn.CommitOrCleanup(ctx); pErr != nil {
 					t.Fatal(pErr)
 				}
-				if a, e := txn.Serialize().Status, roachpb.COMMITTED; a != e {
+				if a, e := txn.TestingCloneTxn().Status, roachpb.COMMITTED; a != e {
 					t.Errorf("write: %t, commit: %t transaction expected to have status %q but had %q", write, commit, e, a)
 				}
 			} else {
 				if pErr := txn.Rollback(ctx); pErr != nil {
 					t.Fatal(pErr)
 				}
-				if a, e := txn.Serialize().Status, roachpb.ABORTED; a != e {
+				if a, e := txn.TestingCloneTxn().Status, roachpb.ABORTED; a != e {
 					t.Errorf("write: %t, commit: %t transaction expected to have status %q but had %q", write, commit, e, a)
 				}
 			}
@@ -349,10 +346,10 @@ func TestCommitInBatchWrongTxn(t *testing.T) {
 
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	db := NewDB(testutils.MakeAmbientCtx(), newTestTxnFactory(nil), clock)
-	txn := NewTxn(ctx, db, 0 /* gatewayNodeID */, RootTxn)
+	txn := NewTxn(ctx, db, 0 /* gatewayNodeID */)
 
 	b1 := &Batch{}
-	txn2 := NewTxn(ctx, db, 0 /* gatewayNodeID */, RootTxn)
+	txn2 := NewTxn(ctx, db, 0 /* gatewayNodeID */)
 	b2 := txn2.NewBatch()
 
 	for _, b := range []*Batch{b1, b2} {
@@ -387,7 +384,7 @@ func TestSetPriority(t *testing.T) {
 
 	// Verify the normal priority setting path.
 	expected = roachpb.NormalUserPriority
-	txn := NewTxn(ctx, db, 0 /* gatewayNodeID */, RootTxn)
+	txn := NewTxn(ctx, db, 0 /* gatewayNodeID */)
 	if err := txn.SetUserPriority(expected); err != nil {
 		t.Fatal(err)
 	}
@@ -397,8 +394,8 @@ func TestSetPriority(t *testing.T) {
 
 	// Verify the internal (fixed value) priority setting path.
 	expected = roachpb.UserPriority(-13)
-	txn = NewTxn(ctx, db, 0 /* gatewayNodeID */, RootTxn)
-	txn.InternalSetPriority(13)
+	txn = NewTxn(ctx, db, 0 /* gatewayNodeID */)
+	txn.TestingSetPriority(13)
 	if _, pErr := txn.Send(ctx, roachpb.BatchRequest{}); pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -437,7 +434,7 @@ func TestBatchMixRawRequest(t *testing.T) {
 	db := NewDB(testutils.MakeAmbientCtx(), newTestTxnFactory(nil), clock)
 
 	b := &Batch{}
-	b.AddRawRequest(&roachpb.EndTransactionRequest{})
+	b.AddRawRequest(&roachpb.EndTxnRequest{})
 	b.Put("x", "y")
 	if err := db.Run(context.TODO(), b); !testutils.IsError(err, "non-raw operations") {
 		t.Fatal(err)
@@ -458,7 +455,7 @@ func TestUpdateDeadlineMaybe(t *testing.T) {
 				return nil, nil
 			}),
 		clock)
-	txn := NewTxn(ctx, db, 0 /* gatewayNodeID */, RootTxn)
+	txn := NewTxn(ctx, db, 0 /* gatewayNodeID */)
 
 	if txn.deadline() != nil {
 		t.Errorf("unexpected initial deadline: %s", txn.deadline())
@@ -505,7 +502,7 @@ func TestAnchoringErrorNoTrigger(t *testing.T) {
 				return nil, nil
 			}),
 		clock)
-	txn := NewTxn(ctx, db, 0 /* gatewayNodeID */, RootTxn)
+	txn := NewTxn(ctx, db, 0 /* gatewayNodeID */)
 	require.Error(t, txn.SetSystemConfigTrigger(), "unimplemented")
 	require.False(t, txn.systemConfigTrigger)
 }

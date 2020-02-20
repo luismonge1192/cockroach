@@ -102,7 +102,7 @@ func benchmarkProjPlusInt64Int64ConstOp(b *testing.B, useSelectionVector bool, h
 			sel[i] = uint16(i)
 		}
 	}
-	source := NewRepeatableBatchSource(batch)
+	source := NewRepeatableBatchSource(testAllocator, batch)
 	source.Init()
 
 	plusOp := &projPlusInt64Int64ConstOp{
@@ -217,8 +217,8 @@ func TestRandomComparisons(t *testing.T) {
 		lVec := b.ColVec(0)
 		rVec := b.ColVec(1)
 		ret := b.ColVec(2)
-		RandomVec(rng, typ, bytesFixedLength, lVec, numTuples, 0)
-		RandomVec(rng, typ, bytesFixedLength, rVec, numTuples, 0)
+		coldata.RandomVec(rng, typ, bytesFixedLength, lVec, numTuples, 0)
+		coldata.RandomVec(rng, typ, bytesFixedLength, rVec, numTuples, 0)
 		for i := range lDatums {
 			lDatums[i] = PhysicalTypeColElemToDatum(lVec, uint16(i), da, ct)
 			rDatums[i] = PhysicalTypeColElemToDatum(rVec, uint16(i), da, ct)
@@ -336,7 +336,7 @@ func benchmarkProjOp(
 			sel[i] = i
 		}
 	}
-	source := NewRepeatableBatchSource(batch)
+	source := NewRepeatableBatchSource(testAllocator, batch)
 	source.Init()
 
 	op := makeProjOp(source, intType)

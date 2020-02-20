@@ -28,11 +28,12 @@ type tableRef struct {
 	Columns   []*tree.ColumnTableDef
 }
 
-type tableRefs []*tableRef
-
-func (t tableRefs) Pop() (*tableRef, tableRefs) {
-	return t[0], t[1:]
+type aliasedTableRef struct {
+	*tableRef
+	indexFlags *tree.IndexFlags
 }
+
+type tableRefs []*tableRef
 
 // ReloadSchemas loads tables from the database.
 func (s *Smither) ReloadSchemas() error {
@@ -57,25 +58,39 @@ func (s *Smither) ReloadSchemas() error {
 	return err
 }
 
-func (s *Smither) getRandTable() (*tableRef, bool) {
+func (s *Smither) getRandTable() (*aliasedTableRef, bool) {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
 	if len(s.tables) == 0 {
 		return nil, false
 	}
-	return s.tables[s.rnd.Intn(len(s.tables))], true
-}
-
-func (s *Smither) getIndexes(table tree.TableName) map[tree.Name]*tree.CreateIndex {
-	s.lock.RLock()
-	defer s.lock.RUnlock()
-	return s.indexes[table]
+	table := s.tables[s.rnd.Intn(len(s.tables))]
+	indexes := s.indexes[*table.TableName]
+	var indexFlags tree.IndexFlags
+	if s.coin() {
+		indexNames := make([]tree.Name, 0, len(indexes))
+		for _, index := range indexes {
+			if !index.Inverted {
+				indexNames = append(indexNames, index.Name)
+			}
+		}
+		if len(indexNames) > 0 {
+			indexFlags.Index = tree.UnrestrictedName(indexNames[s.rnd.Intn(len(indexNames))])
+		}
+	}
+	aliased := &aliasedTableRef{
+		tableRef:   table,
+		indexFlags: &indexFlags,
+	}
+	return aliased, true
 }
 
 func (s *Smither) getRandTableIndex(
 	table, alias tree.TableName,
 ) (*tree.TableIndexName, *tree.CreateIndex, colRefs, bool) {
-	indexes := s.getIndexes(table)
+	s.lock.RLock()
+	indexes := s.indexes[table]
+	s.lock.RUnlock()
 	if len(indexes) == 0 {
 		return nil, nil, nil, false
 	}
@@ -248,6 +263,23 @@ func extractIndexes(
 					Direction: dir,
 				})
 			}
+			row := db.QueryRow(fmt.Sprintf(`
+			SELECT
+			    is_inverted
+			FROM
+			    crdb_internal.table_indexes
+			WHERE
+			    descriptor_name = '%s' AND index_name = '%s'
+`, t.TableName.Table(), idx))
+			var isInverted bool
+			if err = row.Scan(&isInverted); err != nil {
+				// We got an error which likely indicates that 'is_inverted' column is
+				// not present in crdb_internal.table_indexes vtable (probably because
+				// we're running 19.2 version). We will use a heuristic to determine
+				// whether the index is inverted.
+				isInverted = strings.Contains(strings.ToLower(idx.String()), "jsonb")
+			}
+			indexes[idx].Inverted = isInverted
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {

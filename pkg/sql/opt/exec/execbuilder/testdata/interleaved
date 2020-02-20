@@ -31,6 +31,7 @@ CREATE TABLE level4 (
   k1 INT,
   k2 INT,
   k3 INT,
+  FAMILY (k1, k2, k3),
   PRIMARY KEY (k1, k2, k3),
   CONSTRAINT fk3 FOREIGN KEY (k1, k2, k3) REFERENCES level3
 ) INTERLEAVE IN PARENT level3 (k1, k2, k3)
@@ -166,7 +167,8 @@ CREATE TABLE b(
     b_id INT,
     a_id INT,
     FOREIGN KEY (a_id) REFERENCES a(a_id) ON UPDATE CASCADE ON DELETE CASCADE,
-    PRIMARY KEY(a_id, b_id)
+    PRIMARY KEY(a_id, b_id),
+    FAMILY "primary" (a_id, b_id)
 ) INTERLEAVE IN PARENT a(a_id)
 
 statement ok
@@ -175,7 +177,8 @@ CREATE TABLE c(
     a_id INT,
     b_id INT,
     FOREIGN KEY (a_id, b_id) REFERENCES b(a_id, b_id) ON UPDATE CASCADE ON DELETE CASCADE,
-    PRIMARY KEY(a_id, b_id, c_id)
+    PRIMARY KEY(a_id, b_id, c_id),
+    FAMILY "primary" (a_id, b_id, c_id)
 ) INTERLEAVE IN PARENT b(a_id, b_id)
 
 statement ok

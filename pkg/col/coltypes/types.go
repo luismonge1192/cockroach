@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/apd"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 )
 
 // T represents an exec physical type - a bytes representation of a particular
@@ -41,6 +42,8 @@ const (
 	Float64
 	// Timestamp is a column of type time.Time
 	Timestamp
+	// Interval is a column of type duration.Duration
+	Interval
 
 	// Unhandled is a temporary value that represents an unhandled type.
 	// TODO(jordan): this should be replaced by a panic once all types are
@@ -55,6 +58,10 @@ var AllTypes []T
 // type in a binary expression.
 var CompatibleTypes map[T][]T
 
+// ComparableTypes maps a type to a slice of types that can be used with that
+// type in a comparison expression.
+var ComparableTypes map[T][]T
+
 // NumberTypes is a slice containing all numeric types.
 var NumberTypes = []T{Int16, Int32, Int64, Float64, Decimal}
 
@@ -64,6 +71,9 @@ var IntTypes = []T{Int16, Int32, Int64}
 // FloatTypes is a slice containing all float types.
 var FloatTypes = []T{Float64}
 
+// TimeTypes is a slice containing all time-related types.
+var TimeTypes = []T{Timestamp, Interval}
+
 func init() {
 	for i := Bool; i < Unhandled; i++ {
 		AllTypes = append(AllTypes, i)
@@ -72,12 +82,24 @@ func init() {
 	CompatibleTypes = make(map[T][]T)
 	CompatibleTypes[Bool] = append(CompatibleTypes[Bool], Bool)
 	CompatibleTypes[Bytes] = append(CompatibleTypes[Bytes], Bytes)
-	CompatibleTypes[Decimal] = append(CompatibleTypes[Decimal], NumberTypes...)
-	CompatibleTypes[Int16] = append(CompatibleTypes[Int16], NumberTypes...)
-	CompatibleTypes[Int32] = append(CompatibleTypes[Int32], NumberTypes...)
-	CompatibleTypes[Int64] = append(CompatibleTypes[Int64], NumberTypes...)
-	CompatibleTypes[Float64] = append(CompatibleTypes[Float64], NumberTypes...)
-	CompatibleTypes[Timestamp] = append(CompatibleTypes[Timestamp], Timestamp)
+	CompatibleTypes[Decimal] = append(CompatibleTypes[Decimal], append(NumberTypes, Interval)...)
+	CompatibleTypes[Int16] = append(CompatibleTypes[Int16], append(NumberTypes, Interval)...)
+	CompatibleTypes[Int32] = append(CompatibleTypes[Int32], append(NumberTypes, Interval)...)
+	CompatibleTypes[Int64] = append(CompatibleTypes[Int64], append(NumberTypes, Interval)...)
+	CompatibleTypes[Float64] = append(CompatibleTypes[Float64], append(NumberTypes, Interval)...)
+	CompatibleTypes[Timestamp] = append(CompatibleTypes[Timestamp], TimeTypes...)
+	CompatibleTypes[Interval] = append(CompatibleTypes[Interval], append(NumberTypes, TimeTypes...)...)
+
+	ComparableTypes = make(map[T][]T)
+	ComparableTypes[Bool] = append(ComparableTypes[Bool], Bool)
+	ComparableTypes[Bytes] = append(ComparableTypes[Bytes], Bytes)
+	ComparableTypes[Decimal] = append(ComparableTypes[Decimal], NumberTypes...)
+	ComparableTypes[Int16] = append(ComparableTypes[Int16], NumberTypes...)
+	ComparableTypes[Int32] = append(ComparableTypes[Int32], NumberTypes...)
+	ComparableTypes[Int64] = append(ComparableTypes[Int64], NumberTypes...)
+	ComparableTypes[Float64] = append(ComparableTypes[Float64], NumberTypes...)
+	ComparableTypes[Timestamp] = append(ComparableTypes[Timestamp], Timestamp)
+	ComparableTypes[Interval] = append(ComparableTypes[Interval], Interval)
 }
 
 // FromGoType returns the type for a Go value, if applicable. Shouldn't be used at
@@ -102,6 +124,8 @@ func FromGoType(v interface{}) T {
 		return Decimal
 	case time.Time:
 		return Timestamp
+	case duration.Duration:
+		return Interval
 	default:
 		panic(fmt.Sprintf("type %T not supported yet", t))
 	}
@@ -126,6 +150,8 @@ func (t T) GoTypeName() string {
 		return "float64"
 	case Timestamp:
 		return "time.Time"
+	case Interval:
+		return "duration.Duration"
 	default:
 		panic(fmt.Sprintf("unhandled type %d", t))
 	}
@@ -143,7 +169,7 @@ var (
 	_ = Bool.AppendVal
 	_ = Bool.Len
 	_ = Bool.Range
-	_ = Bool.Zero
+	_ = Bool.Window
 )
 
 // GoTypeSliceName returns how a slice of the receiver type is represented.
@@ -188,7 +214,11 @@ func (t T) Set(target, i, new string) string {
 // Slice is a function that should only be used in templates.
 func (t T) Slice(target, start, end string) string {
 	if t == Bytes {
-		return fmt.Sprintf("%s.Slice(%s, %s)", target, start, end)
+		// Slice is a noop for Bytes. We also add a few lines to address "unused
+		// variable" compiler errors.
+		return fmt.Sprintf(`%s
+_ = %s
+_ = %s`, target, start, end)
 	}
 	return fmt.Sprintf("%s[%s:%s]", target, start, end)
 }
@@ -236,8 +266,13 @@ func (t T) AppendSlice(target, src, destIdx, srcStartIdx, srcEndIdx string) stri
   if cap({{.Tgt}}) >= __desiredCap {
   	{{.Tgt}} = {{.Tgt}}[:__desiredCap]
   } else {
-    __new_slice := make([]apd.Decimal, __desiredCap)
-    copy(__new_slice, {{.Tgt}})
+    __prevCap := cap({{.Tgt}})
+    __capToAllocate := __desiredCap
+    if __capToAllocate < 2 * __prevCap {
+      __capToAllocate = 2 * __prevCap
+    }
+    __new_slice := make([]apd.Decimal, __desiredCap, __capToAllocate)
+    copy(__new_slice, {{.Tgt}}[:{{.TgtIdx}}])
     {{.Tgt}} = __new_slice
   }
   __src_slice := {{.Src}}[{{.SrcStart}}:{{.SrcEnd}}]
@@ -276,6 +311,8 @@ func (t T) AppendVal(target, v string) string {
 }
 
 // Len is a function that should only be used in templates.
+// WARNING: combination of Slice and Len might not work correctly for Bytes
+// type.
 func (t T) Len(target string) string {
 	if t == Bytes {
 		return fmt.Sprintf("%s.Len()", target)
@@ -284,22 +321,17 @@ func (t T) Len(target string) string {
 }
 
 // Range is a function that should only be used in templates.
-func (t T) Range(loopVariableIdent string, target string) string {
+func (t T) Range(loopVariableIdent, target, start, end string) string {
 	if t == Bytes {
-		return fmt.Sprintf("%[1]s := 0; %[1]s < %[2]s.Len(); %[1]s++", loopVariableIdent, target)
+		return fmt.Sprintf("%[1]s := %[2]s; %[1]s < %[3]s; %[1]s++", loopVariableIdent, start, end)
 	}
 	return fmt.Sprintf("%[1]s := range %[2]s", loopVariableIdent, target)
 }
 
-// Zero is a function that should only be used in templates.
-func (t T) Zero(target string) string {
-	switch t {
-	case Bytes:
-		return fmt.Sprintf("%s.Zero()", target)
-	case Decimal:
-		return fmt.Sprintf(`for n := 0; n < len(%[1]s); n++ {
-    %[1]s[n].SetInt64(0)
-}`, target)
+// Window is a function that should only be used in templates.
+func (t T) Window(target, start, end string) string {
+	if t == Bytes {
+		return fmt.Sprintf(`%s.Window(%s, %s)`, target, start, end)
 	}
-	return fmt.Sprintf("for n := 0; n < len(%[1]s); n += copy(%[1]s[n:], zero%sColumn) {}", target, t.String())
+	return fmt.Sprintf("%s[%s:%s]", target, start, end)
 }

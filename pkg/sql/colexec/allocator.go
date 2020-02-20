@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 )
 
@@ -30,6 +31,18 @@ import (
 type Allocator struct {
 	ctx context.Context
 	acc *mon.BoundAccount
+}
+
+func getVecsSize(vecs []coldata.Vec) int64 {
+	var size int64
+	for _, dest := range vecs {
+		if dest.Type() == coltypes.Bytes {
+			size += int64(dest.Bytes().Size())
+		} else {
+			size += int64(estimateBatchSizeBytes([]coltypes.T{dest.Type()}, dest.Capacity()))
+		}
+	}
+	return size
 }
 
 // NewAllocator constructs a new Allocator instance.
@@ -53,6 +66,24 @@ func (a *Allocator) NewMemBatchWithSize(types []coltypes.T, size int) coldata.Ba
 	return coldata.NewMemBatchWithSize(types, size)
 }
 
+// RetainBatch adds the size of the batch to the memory account. This shouldn't
+// need to be used regularly, since most memory accounting necessary is done
+// through PerformOperation. Use this if you want to explicitly manage the
+// memory accounted for.
+func (a *Allocator) RetainBatch(b coldata.Batch) {
+	if err := a.acc.Grow(a.ctx, getVecsSize(b.ColVecs())); err != nil {
+		execerror.VectorizedInternalPanic(err)
+	}
+}
+
+// ReleaseBatch releases the size of the batch from the memory account. This
+// shouldn't need to be used regularly, since all accounts are closed by
+// Flow.Cleanup. Use this if you want to explicitly manage the memory used. An
+// example of a use case is releasing a batch before writing it to disk.
+func (a *Allocator) ReleaseBatch(b coldata.Batch) {
+	a.acc.Shrink(a.ctx, getVecsSize(b.ColVecs()))
+}
+
 // NewMemColumn returns a new coldata.Vec, initialized with a length.
 func (a *Allocator) NewMemColumn(t coltypes.T, n int) coldata.Vec {
 	estimatedStaticMemoryUsage := int64(estimateBatchSizeBytes([]coltypes.T{t}, n))
@@ -62,41 +93,52 @@ func (a *Allocator) NewMemColumn(t coltypes.T, n int) coldata.Vec {
 	return coldata.NewMemColumn(t, n)
 }
 
-// AppendColumn appends a newly allocated coldata.Vec of the given type to b.
-func (a *Allocator) AppendColumn(b coldata.Batch, t coltypes.T) {
+// MaybeAddColumn might add a newly allocated coldata.Vec of the given type to
+// b at position colIdx. It will do so if either
+// 1. the width of the batch is not greater than colIdx, or
+// 2. there is already an "unknown" vector in position colIdx in the batch.
+// If the first condition is true, then "unknown" vectors of zero length will
+// be appended to the batch before appending the requested column.
+// If the second condition is true, then the "unknown" column is replaced with
+// the newly created typed column.
+// NOTE: b must be non-zero length batch.
+func (a *Allocator) MaybeAddColumn(b coldata.Batch, t coltypes.T, colIdx int) {
+	if b.Length() == 0 {
+		execerror.VectorizedInternalPanic("trying to add a column to zero length batch")
+	}
+	if b.Width() > colIdx && b.ColVec(colIdx).Type() != coltypes.Unhandled {
+		// Neither of the two conditions mentioned in the comment above are true,
+		// so there is nothing to do.
+		return
+	}
+	for b.Width() < colIdx {
+		b.AppendCol(a.NewMemColumn(coltypes.Unhandled, 0))
+	}
 	estimatedStaticMemoryUsage := int64(estimateBatchSizeBytes([]coltypes.T{t}, int(coldata.BatchSize())))
 	if err := a.acc.Grow(a.ctx, estimatedStaticMemoryUsage); err != nil {
 		execerror.VectorizedInternalPanic(err)
 	}
 	col := a.NewMemColumn(t, int(coldata.BatchSize()))
-	b.AppendCol(col)
+	if b.Width() == colIdx {
+		b.AppendCol(col)
+	} else {
+		b.ReplaceCol(col, colIdx)
+	}
 }
 
-// performOperation executes 'operation' (that somehow modifies 'destVecs') and
+// PerformOperation executes 'operation' (that somehow modifies 'destVecs') and
 // updates the memory account accordingly.
-func (a *Allocator) performOperation(destVecs []coldata.Vec, operation func()) {
-	var before, after, delta int64
-	for _, dest := range destVecs {
-		// To simplify the accounting, we perform the operation first and then will
-		// update the memory account. The minor "drift" in accounting that is
-		// caused by this approach is ok.
-		if dest.Type() == coltypes.Bytes {
-			before += int64(dest.Bytes().Size())
-		} else {
-			before += int64(estimateBatchSizeBytes([]coltypes.T{dest.Type()}, dest.Capacity()))
-		}
-	}
-
+// NOTE: if some columnar vectors are not modified, they should not be included
+// in 'destVecs' to reduce the performance hit of memory accounting.
+func (a *Allocator) PerformOperation(destVecs []coldata.Vec, operation func()) {
+	before := getVecsSize(destVecs)
+	// To simplify the accounting, we perform the operation first and then will
+	// update the memory account. The minor "drift" in accounting that is
+	// caused by this approach is ok.
 	operation()
+	after := getVecsSize(destVecs)
 
-	for _, dest := range destVecs {
-		if dest.Type() == coltypes.Bytes {
-			after += int64(dest.Bytes().Size())
-		} else {
-			after += int64(estimateBatchSizeBytes([]coltypes.T{dest.Type()}, dest.Capacity()))
-		}
-	}
-	delta = after - before
+	delta := after - before
 	if delta >= 0 {
 		if err := a.acc.Grow(a.ctx, delta); err != nil {
 			execerror.VectorizedInternalPanic(err)
@@ -106,30 +148,25 @@ func (a *Allocator) performOperation(destVecs []coldata.Vec, operation func()) {
 	}
 }
 
-// Append appends elements of a source coldata.Vec into dest according to
-// coldata.SliceArgs.
-func (a *Allocator) Append(dest coldata.Vec, args coldata.SliceArgs) {
-	a.performOperation([]coldata.Vec{dest}, func() { dest.Append(args) })
+// Used returns the number of bytes currently allocated through this allocator.
+func (a *Allocator) Used() int64 {
+	return a.acc.Used()
 }
 
-// Copy copies elements of a source coldata.Vec into dest according to
-// coldata.CopySliceArgs.
-func (a *Allocator) Copy(dest coldata.Vec, args coldata.CopySliceArgs) {
-	a.performOperation([]coldata.Vec{dest}, func() { dest.Copy(args) })
+// Clear clears up the memory account of the allocator.
+func (a *Allocator) Clear() {
+	a.acc.Clear(a.ctx)
 }
-
-// TODO(yuzefovich): extend Allocator so that it could free up the memory (and
-// resize the memory account accordingly) when the caller is done with the
-// batches.
 
 const (
-	sizeOfBool    = int(unsafe.Sizeof(true))
-	sizeOfInt16   = int(unsafe.Sizeof(int16(0)))
-	sizeOfInt32   = int(unsafe.Sizeof(int32(0)))
-	sizeOfInt64   = int(unsafe.Sizeof(int64(0)))
-	sizeOfFloat64 = int(unsafe.Sizeof(float64(0)))
-	sizeOfTime    = int(unsafe.Sizeof(time.Time{}))
-	sizeOfUint16  = int(unsafe.Sizeof(uint16(0)))
+	sizeOfBool     = int(unsafe.Sizeof(true))
+	sizeOfInt16    = int(unsafe.Sizeof(int16(0)))
+	sizeOfInt32    = int(unsafe.Sizeof(int32(0)))
+	sizeOfInt64    = int(unsafe.Sizeof(int64(0)))
+	sizeOfFloat64  = int(unsafe.Sizeof(float64(0)))
+	sizeOfTime     = int(unsafe.Sizeof(time.Time{}))
+	sizeOfDuration = int(unsafe.Sizeof(duration.Duration{}))
+	sizeOfUint16   = int(unsafe.Sizeof(uint16(0)))
 )
 
 // sizeOfBatchSizeSelVector is the size (in bytes) of a selection vector of
@@ -177,6 +214,10 @@ func estimateBatchSizeBytes(vecTypes []coltypes.T, batchLength int) int {
 			// significantly overestimate.
 			// TODO(yuzefovich): figure out whether the caching does take place.
 			acc += sizeOfTime
+		case coltypes.Interval:
+			acc += sizeOfDuration
+		case coltypes.Unhandled:
+			// Placeholder coldata.Vecs of unknown types are allowed.
 		default:
 			execerror.VectorizedInternalPanic(fmt.Sprintf("unhandled type %s", t))
 		}

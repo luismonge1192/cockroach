@@ -49,7 +49,7 @@ func (m *txnMetricRecorder) SendLocked(
 	}
 
 	if length := len(br.Responses); length > 0 {
-		if et := br.Responses[length-1].GetEndTransaction(); et != nil {
+		if et := br.Responses[length-1].GetEndTxn(); et != nil {
 			// Check for 1-phase commit.
 			m.onePCCommit = et.OnePhaseCommit
 
@@ -63,11 +63,14 @@ func (m *txnMetricRecorder) SendLocked(
 // setWrapped is part of the txnInterceptor interface.
 func (m *txnMetricRecorder) setWrapped(wrapped lockedSender) { m.wrapped = wrapped }
 
-// populateMetaLocked is part of the txnInterceptor interface.
-func (*txnMetricRecorder) populateMetaLocked(*roachpb.TxnCoordMeta) {}
+// populateLeafInputState is part of the txnInterceptor interface.
+func (*txnMetricRecorder) populateLeafInputState(*roachpb.LeafTxnInputState) {}
 
-// augmentMetaLocked is part of the txnInterceptor interface.
-func (*txnMetricRecorder) augmentMetaLocked(roachpb.TxnCoordMeta) {}
+// populateLeafFinalState is part of the txnInterceptor interface.
+func (*txnMetricRecorder) populateLeafFinalState(*roachpb.LeafTxnFinalState) {}
+
+// importLeafFinalState is part of the txnInterceptor interface.
+func (*txnMetricRecorder) importLeafFinalState(*roachpb.LeafTxnFinalState) {}
 
 // epochBumpedLocked is part of the txnInterceptor interface.
 func (*txnMetricRecorder) epochBumpedLocked() {}

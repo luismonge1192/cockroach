@@ -97,6 +97,9 @@ type PlanHookState interface {
 	ResolveMutableTableDescriptor(
 		ctx context.Context, tn *ObjectName, required bool, requiredType ResolveRequiredType,
 	) (table *MutableTableDescriptor, err error)
+	ShowCreate(
+		ctx context.Context, dbPrefix string, allDescs []sqlbase.Descriptor, desc *sqlbase.TableDescriptor, ignoreFKs shouldOmitFKClausesFromCreate,
+	) (string, error)
 }
 
 // AddPlanHook adds a hook used to short-circuit creating a planNode from a
@@ -106,6 +109,12 @@ type PlanHookState interface {
 // See PlanHookState comments for information about why plan hooks are needed.
 func AddPlanHook(f planHookFn) {
 	planHooks = append(planHooks, f)
+}
+
+// ClearPlanHooks is used by tests to clear out any mocked out plan hooks that
+// were registered.
+func ClearPlanHooks() {
+	planHooks = nil
 }
 
 // AddWrappedPlanHook adds a hook used to short-circuit creating a planNode from a

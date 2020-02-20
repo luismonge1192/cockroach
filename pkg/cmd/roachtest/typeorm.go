@@ -63,7 +63,7 @@ func registerTypeORM(r *testRegistry) {
 			c,
 			node,
 			"add nodesource repository",
-			`curl -sL https://deb.nodesource.com/setup_11.x | sudo -E bash -`,
+			`curl -sL https://deb.nodesource.com/setup_12.x | sudo -E bash -`,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -153,6 +153,7 @@ func registerTypeORM(r *testRegistry) {
 
 	r.Add(testSpec{
 		Name:       "typeorm",
+		Owner:      OwnerAppDev,
 		Cluster:    makeClusterSpec(1),
 		MinVersion: "v19.1.0",
 		Tags:       []string{`default`, `orm`},

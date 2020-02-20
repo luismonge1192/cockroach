@@ -28,10 +28,7 @@ import (
 	// {{/*
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	// */}}
-	// HACK: crlfmt removes the "*/}}" comment if it's the last line in the import
-	// block. This was picked because it sorts after "pkg/sql/exec/execgen" and
-	// has no deps.
-	_ "github.com/cockroachdb/cockroach/pkg/util/bufalloc"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 )
 
 // {{/*
@@ -49,6 +46,9 @@ var _ apd.Decimal
 // Dummy import to pull in "time" package.
 var _ time.Time
 
+// Dummy import to pull in "duration" package.
+var _ duration.Duration
+
 // */}}
 
 func (m *memColumn) Append(args SliceArgs) {
@@ -57,14 +57,32 @@ func (m *memColumn) Append(args SliceArgs) {
 	case _TYPES_T:
 		fromCol := args.Src._TemplateType()
 		toCol := m._TemplateType()
+		// NOTE: it is unfortunate that we always append whole slice without paying
+		// attention to whether the values are NULL. However, if we do start paying
+		// attention, the performance suffers dramatically, so we choose to copy
+		// over "actual" as well as "garbage" values.
 		if args.Sel == nil {
 			execgen.APPENDSLICE(toCol, fromCol, int(args.DestIdx), int(args.SrcStartIdx), int(args.SrcEndIdx))
 		} else {
 			sel := args.Sel[args.SrcStartIdx:args.SrcEndIdx]
-			// TODO(asubiotto): We could be more efficient for fixed width types by
-			// preallocating a destination slice (not so for variable length types).
-			// Improve this.
+			// {{if eq .LTyp.String "Bytes"}}
+			// We need to truncate toCol before appending to it, so in case of Bytes,
+			// we append an empty slice.
+			execgen.APPENDSLICE(toCol, toCol, int(args.DestIdx), 0, 0)
+			// We will be getting all values below to be appended, regardless of
+			// whether the value is NULL. It is possible that Bytes' invariant of
+			// non-decreasing offsets on the source is currently not maintained, so
+			// we explicitly enforce it.
+			maxIdx := uint16(0)
+			for _, selIdx := range sel {
+				if selIdx > maxIdx {
+					maxIdx = selIdx
+				}
+			}
+			fromCol.UpdateOffsetsToBeNonDecreasing(uint64(maxIdx + 1))
+			// {{else}}
 			toCol = execgen.SLICE(toCol, 0, int(args.DestIdx))
+			// {{end}}
 			for _, selIdx := range sel {
 				val := execgen.UNSAFEGET(fromCol, int(selIdx))
 				execgen.APPENDVAL(toCol, val)
@@ -163,14 +181,14 @@ func (m *memColumn) Copy(args CopySliceArgs) {
 	}
 }
 
-func (m *memColumn) Slice(colType coltypes.T, start uint64, end uint64) Vec {
+func (m *memColumn) Window(colType coltypes.T, start uint64, end uint64) Vec {
 	switch colType {
 	// {{range .}}
 	case _TYPES_T:
 		col := m._TemplateType()
 		return &memColumn{
 			t:     colType,
-			col:   execgen.SLICE(col, int(start), int(end)),
+			col:   execgen.WINDOW(col, int(start), int(end)),
 			nulls: m.nulls.Slice(start, end),
 		}
 	// {{end}}

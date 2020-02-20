@@ -38,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -441,7 +442,6 @@ func (sc *SchemaChanger) truncateTable(
 	ctx context.Context,
 	lease *sqlbase.TableDescriptor_SchemaChangeLease,
 	table *sqlbase.TableDescriptor,
-	evalCtx *extendedEvalContext,
 ) error {
 	// If DropTime isn't set, assume this drop request is from a version
 	// 1.1 server and invoke legacy code that uses DeleteRange and range GC.
@@ -519,7 +519,7 @@ func (sc *SchemaChanger) truncateTable(
 
 // maybe Drop a table. Return nil if successfully dropped.
 func (sc *SchemaChanger) maybeDropTable(
-	ctx context.Context, inSession bool, table *sqlbase.TableDescriptor, evalCtx *extendedEvalContext,
+	ctx context.Context, inSession bool, table *sqlbase.TableDescriptor,
 ) error {
 	if !table.Dropped() || inSession {
 		return nil
@@ -567,7 +567,7 @@ func (sc *SchemaChanger) maybeDropTable(
 	}()
 
 	// Do all the hard work of deleting the table data and the table ID.
-	if err := sc.truncateTable(ctx, &lease, table, evalCtx); err != nil {
+	if err := sc.truncateTable(ctx, &lease, table); err != nil {
 		return err
 	}
 
@@ -581,98 +581,142 @@ func (sc *SchemaChanger) maybeDropTable(
 
 // maybe backfill a created table by executing the AS query. Return nil if
 // successfully backfilled.
+//
+// Note that this does not connect to the tracing settings of the
+// surrounding SQL transaction. This should be OK as (at the time of
+// this writing) this code path is only used for standalone CREATE
+// TABLE AS statements, which cannot be traced.
 func (sc *SchemaChanger) maybeBackfillCreateTableAs(
-	ctx context.Context, table *sqlbase.TableDescriptor, evalCtx *extendedEvalContext,
+	ctx context.Context, table *sqlbase.TableDescriptor,
 ) error {
 	if table.Adding() && table.IsAs() {
-		if err := sc.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
-			txn.SetFixedTimestamp(ctx, table.CreateAsOfTime)
-
-			// Create an internal planner as the planner used to serve the user query
-			// would have committed by this point.
-			p, cleanup := NewInternalPlanner("ctasBackfill", txn, security.RootUser, &MemoryMetrics{}, sc.execCfg)
-			defer cleanup()
-			localPlanner := p.(*planner)
-			stmt, err := parser.ParseOne(table.CreateQuery)
-			if err != nil {
-				return err
-			}
-
-			// Construct an optimized logical plan of the AS source stmt.
-			localPlanner.stmt = &Statement{Statement: stmt}
-			localPlanner.optPlanningCtx.init(localPlanner)
-
-			localPlanner.runWithOptions(resolveFlags{skipCache: true}, func() {
-				err = localPlanner.makeOptimizerPlan(ctx)
-			})
-
-			if err != nil {
-				return err
-			}
-			defer localPlanner.curPlan.close(ctx)
-
-			res := roachpb.BulkOpSummary{}
-			rw := newCallbackResultWriter(func(ctx context.Context, row tree.Datums) error {
-				// TODO(adityamaru): Use the BulkOpSummary for either telemetry or to
-				// return to user.
-				var counts roachpb.BulkOpSummary
-				if err := protoutil.Unmarshal([]byte(*row[0].(*tree.DBytes)), &counts); err != nil {
-					return err
-				}
-				res.Add(counts)
-				return nil
-			})
-			recv := MakeDistSQLReceiver(
-				ctx,
-				rw,
-				tree.Rows,
-				sc.execCfg.RangeDescriptorCache,
-				sc.execCfg.LeaseHolderCache,
-				txn,
-				func(ts hlc.Timestamp) {
-					_ = sc.clock.Update(ts)
-				},
-				evalCtx.Tracing,
-			)
-			defer recv.Release()
-
-			rec, err := sc.distSQLPlanner.checkSupportForNode(localPlanner.curPlan.plan)
-			var planAndRunErr error
-			localPlanner.runWithOptions(resolveFlags{skipCache: true}, func() {
-				// Resolve subqueries before running the queries' physical plan.
-				if len(localPlanner.curPlan.subqueryPlans) != 0 {
-					if !sc.distSQLPlanner.PlanAndRunSubqueries(
-						ctx, localPlanner, localPlanner.ExtendedEvalContextCopy,
-						localPlanner.curPlan.subqueryPlans, recv, rec == canDistribute,
-					) {
-						if planAndRunErr = rw.Err(); planAndRunErr != nil {
-							return
-						}
-						if planAndRunErr = recv.commErr; planAndRunErr != nil {
-							return
-						}
-					}
-				}
-
-				isLocal := err != nil || rec == cannotDistribute
-				out := execinfrapb.ProcessorCoreUnion{BulkRowWriter: &execinfrapb.BulkRowWriterSpec{
-					Table: *table,
-				}}
-
-				PlanAndRunCTAS(ctx, sc.distSQLPlanner, localPlanner,
-					txn, isLocal, localPlanner.curPlan.plan, out, recv)
-				if planAndRunErr = rw.Err(); planAndRunErr != nil {
-					return
-				}
-				if planAndRunErr = recv.commErr; planAndRunErr != nil {
-					return
-				}
-			})
-
-			return planAndRunErr
-		}); err != nil {
+		// Acquire lease.
+		lease, err := sc.AcquireLease(ctx)
+		if err != nil {
 			return err
 		}
+		// Always try to release lease.
+		defer func() {
+			if err := sc.ReleaseLease(ctx, lease); err != nil {
+				log.Warning(ctx, err)
+			}
+		}()
+
+		// We need to maintain our lease *while* our backfill runs.
+		maintainLease := make(chan struct{})
+		g := ctxgroup.WithContext(ctx)
+		g.GoCtx(func(ctx context.Context) error {
+			done := ctx.Done()
+			ticker := time.NewTicker(time.Minute)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-done:
+					return nil
+				case <-maintainLease:
+					return nil
+				case <-ticker.C:
+					if err := sc.ExtendLease(ctx, &lease); err != nil {
+						return err
+					}
+				}
+			}
+		})
+
+		g.GoCtx(func(ctx context.Context) error {
+			defer close(maintainLease)
+			return sc.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+				txn.SetFixedTimestamp(ctx, table.CreateAsOfTime)
+
+				// Create an internal planner as the planner used to serve the user query
+				// would have committed by this point.
+				p, cleanup := NewInternalPlanner("ctasBackfill", txn, security.RootUser, &MemoryMetrics{}, sc.execCfg)
+				defer cleanup()
+				localPlanner := p.(*planner)
+				stmt, err := parser.ParseOne(table.CreateQuery)
+				if err != nil {
+					return err
+				}
+
+				// Construct an optimized logical plan of the AS source stmt.
+				localPlanner.stmt = &Statement{Statement: stmt}
+				localPlanner.optPlanningCtx.init(localPlanner)
+
+				localPlanner.runWithOptions(resolveFlags{skipCache: true}, func() {
+					err = localPlanner.makeOptimizerPlan(ctx)
+				})
+
+				if err != nil {
+					return err
+				}
+				defer localPlanner.curPlan.close(ctx)
+
+				res := roachpb.BulkOpSummary{}
+				rw := newCallbackResultWriter(func(ctx context.Context, row tree.Datums) error {
+					// TODO(adityamaru): Use the BulkOpSummary for either telemetry or to
+					// return to user.
+					var counts roachpb.BulkOpSummary
+					if err := protoutil.Unmarshal([]byte(*row[0].(*tree.DBytes)), &counts); err != nil {
+						return err
+					}
+					res.Add(counts)
+					return nil
+				})
+				recv := MakeDistSQLReceiver(
+					ctx,
+					rw,
+					tree.Rows,
+					sc.execCfg.RangeDescriptorCache,
+					sc.execCfg.LeaseHolderCache,
+					txn,
+					func(ts hlc.Timestamp) {
+						_ = sc.clock.Update(ts)
+					},
+					// Make a session tracing object on-the-fly. This is OK
+					// because it sets "enabled: false" and thus none of the
+					// other fields are used.
+					&SessionTracing{},
+				)
+				defer recv.Release()
+
+				rec, err := sc.distSQLPlanner.checkSupportForNode(localPlanner.curPlan.plan)
+				var planAndRunErr error
+				localPlanner.runWithOptions(resolveFlags{skipCache: true}, func() {
+					// Resolve subqueries before running the queries' physical plan.
+					if len(localPlanner.curPlan.subqueryPlans) != 0 {
+						if !sc.distSQLPlanner.PlanAndRunSubqueries(
+							ctx, localPlanner, localPlanner.ExtendedEvalContextCopy,
+							localPlanner.curPlan.subqueryPlans, recv, rec == canDistribute,
+						) {
+							if planAndRunErr = rw.Err(); planAndRunErr != nil {
+								return
+							}
+							if planAndRunErr = recv.commErr; planAndRunErr != nil {
+								return
+							}
+						}
+					}
+
+					isLocal := err != nil || rec == cannotDistribute
+					out := execinfrapb.ProcessorCoreUnion{BulkRowWriter: &execinfrapb.BulkRowWriterSpec{
+						Table: *table,
+					}}
+
+					PlanAndRunCTAS(ctx, sc.distSQLPlanner, localPlanner,
+						txn, isLocal, localPlanner.curPlan.plan, out, recv)
+					if planAndRunErr = rw.Err(); planAndRunErr != nil {
+						return
+					}
+					if planAndRunErr = recv.commErr; planAndRunErr != nil {
+						return
+					}
+				})
+
+				return planAndRunErr
+			})
+		})
+		return g.Wait()
 	}
 	return nil
 }
@@ -788,9 +832,10 @@ func (sc *SchemaChanger) maybeGCMutations(
 		func(txn *client.Txn) error {
 			job, err := sc.jobRegistry.LoadJobWithTxn(ctx, mutation.JobID, txn)
 			if err != nil {
-				return err
+				log.Warningf(ctx, "ignoring error during logEvent while GCing mutations: %+v", err)
+				return nil
 			}
-			return job.WithTxn(txn).Succeeded(ctx, jobs.NoopFn)
+			return job.WithTxn(txn).Succeeded(ctx, nil)
 		},
 	)
 
@@ -875,8 +920,11 @@ func (sc *SchemaChanger) drainNames(ctx context.Context) error {
 		func(txn *client.Txn) error {
 			b := txn.NewBatch()
 			for _, drain := range namesToReclaim {
-				tbKey := sqlbase.NewTableKey(drain.ParentID, drain.Name).Key()
-				b.Del(tbKey)
+				err := sqlbase.RemoveObjectNamespaceEntry(ctx, txn, drain.ParentID, drain.ParentSchemaID,
+					drain.Name, false /* KVTrace */)
+				if err != nil {
+					return err
+				}
 			}
 
 			if dropJobID != 0 {
@@ -901,20 +949,18 @@ func (sc *SchemaChanger) drainNames(ctx context.Context) error {
 //
 // If the txn that queued the schema changer did not commit, this will be a
 // no-op, as we'll fail to find the job for our mutation in the jobs registry.
-func (sc *SchemaChanger) exec(
-	ctx context.Context, inSession bool, evalCtx *extendedEvalContext,
-) error {
+func (sc *SchemaChanger) exec(ctx context.Context, inSession bool) error {
 	ctx = logtags.AddTag(ctx, "scExec", nil)
-	if log.V(2) {
-		log.Infof(ctx, "exec pending schema change; table: %d, mutation: %d",
-			sc.tableID, sc.mutationID)
-	}
 
 	tableDesc, notFirst, err := sc.notFirstInLine(ctx)
 	if err != nil {
 		return err
 	}
 	if notFirst {
+		log.Infof(ctx,
+			"schema change on %s (%d v%d) mutation %d: another change is still in progress",
+			tableDesc.Name, sc.tableID, tableDesc.Version, sc.mutationID,
+		)
 		return errSchemaChangeNotFirstInLine
 	}
 
@@ -924,12 +970,17 @@ func (sc *SchemaChanger) exec(
 		}
 	}
 
+	log.Infof(ctx,
+		"schema change on %s (%d v%d) mutation %d starting execution...",
+		tableDesc.Name, sc.tableID, tableDesc.Version, sc.mutationID,
+	)
+
 	// Delete dropped table data if possible.
-	if err := sc.maybeDropTable(ctx, inSession, tableDesc, evalCtx); err != nil {
+	if err := sc.maybeDropTable(ctx, inSession, tableDesc); err != nil {
 		return err
 	}
 
-	if err := sc.maybeBackfillCreateTableAs(ctx, tableDesc, evalCtx); err != nil {
+	if err := sc.maybeBackfillCreateTableAs(ctx, tableDesc); err != nil {
 		return err
 	}
 
@@ -971,12 +1022,16 @@ func (sc *SchemaChanger) exec(
 	// Acquire lease.
 	lease, err := sc.AcquireLease(ctx)
 	if err != nil {
+		log.Infof(ctx,
+			"schema change on %s (%d v%d) mutation %d: another node is currently operating on this table",
+			tableDesc.Name, sc.tableID, tableDesc.Version, sc.mutationID,
+		)
 		return err
 	}
 	// Always try to release lease.
 	defer func() {
 		if err := sc.ReleaseLease(ctx, lease); err != nil {
-			log.Warningf(ctx, "while reasing schema change lease: %+v", err)
+			log.Warningf(ctx, "while releasing schema change lease: %+v", err)
 			// Go through the recording motions. See comment above.
 			sqltelemetry.RecordError(ctx, err, &sc.settings.SV)
 		}
@@ -1019,7 +1074,7 @@ func (sc *SchemaChanger) exec(
 	}
 
 	// Run through mutation state machine and backfill.
-	err = sc.runStateMachineAndBackfill(ctx, &lease, evalCtx)
+	err = sc.runStateMachineAndBackfill(ctx, &lease)
 
 	defer func() {
 		if err := waitToUpdateLeases(err == nil /* refreshStats */); err != nil && !errors.Is(err, sqlbase.ErrDescriptorNotFound) {
@@ -1037,7 +1092,7 @@ func (sc *SchemaChanger) exec(
 	// a permanent error. All other errors are transient errors that are
 	// resolved by retrying the backfill.
 	if isPermanentSchemaChangeError(err) {
-		if rollbackErr := sc.rollbackSchemaChange(ctx, err, &lease, evalCtx); rollbackErr != nil {
+		if rollbackErr := sc.rollbackSchemaChange(ctx, err, &lease); rollbackErr != nil {
 			// Note: the "err" object is captured by rollbackSchemaChange(), so
 			// it does not simply disappear.
 			return errors.Wrap(rollbackErr, "while rolling back schema change")
@@ -1091,10 +1146,7 @@ func (sc *SchemaChanger) initJobRunningStatus(ctx context.Context) error {
 }
 
 func (sc *SchemaChanger) rollbackSchemaChange(
-	ctx context.Context,
-	err error,
-	lease *sqlbase.TableDescriptor_SchemaChangeLease,
-	evalCtx *extendedEvalContext,
+	ctx context.Context, err error, lease *sqlbase.TableDescriptor_SchemaChangeLease,
 ) error {
 	log.Warningf(ctx, "reversing schema change %d due to irrecoverable error: %s", *sc.job.ID(), err)
 	if errReverse := sc.reverseMutations(ctx, err); errReverse != nil {
@@ -1116,7 +1168,7 @@ func (sc *SchemaChanger) rollbackSchemaChange(
 
 	// After this point the schema change has been reversed and any retry
 	// of the schema change will act upon the reversed schema change.
-	if errPurge := sc.runStateMachineAndBackfill(ctx, lease, evalCtx); errPurge != nil {
+	if errPurge := sc.runStateMachineAndBackfill(ctx, lease); errPurge != nil {
 		// Don't return this error because we do want the caller to know
 		// that an integrity constraint was violated with the original
 		// schema change. The reversed schema change will be
@@ -1208,13 +1260,9 @@ func (sc *SchemaChanger) waitToUpdateLeases(ctx context.Context, tableID sqlbase
 		MaxBackoff:     200 * time.Millisecond,
 		Multiplier:     2,
 	}
-	if log.V(2) {
-		log.Infof(ctx, "waiting for a single version of table %d...", tableID)
-	}
-	_, err := sc.leaseMgr.WaitForOneVersion(ctx, tableID, retryOpts)
-	if log.V(2) {
-		log.Infof(ctx, "waiting for a single version of table %d... done", tableID)
-	}
+	log.Infof(ctx, "waiting for a single version of table %d...", tableID)
+	version, err := sc.leaseMgr.WaitForOneVersion(ctx, tableID, retryOpts)
+	log.Infof(ctx, "waiting for a single version of table %d... done (at v %d)", tableID, version)
 	return err
 }
 
@@ -1230,8 +1278,10 @@ func (sc *SchemaChanger) done(ctx context.Context) (*sqlbase.ImmutableTableDescr
 	// Get the other tables whose foreign key backreferences need to be removed.
 	// We make a call to PublishMultiple to handle the situation to add Foreign Key backreferences.
 	var fksByBackrefTable map[sqlbase.ID][]*sqlbase.ConstraintToUpdate
+	var interleaveParents map[sqlbase.ID]struct{}
 	err := sc.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
 		fksByBackrefTable = make(map[sqlbase.ID][]*sqlbase.ConstraintToUpdate)
+		interleaveParents = make(map[sqlbase.ID]struct{})
 
 		desc, err := sqlbase.GetTableDescFromID(ctx, txn, sc.tableID)
 		if err != nil {
@@ -1250,6 +1300,23 @@ func (sc *SchemaChanger) done(ctx context.Context) (*sqlbase.ImmutableTableDescr
 				if fk.ReferencedTableID != desc.ID {
 					fksByBackrefTable[constraint.ForeignKey.ReferencedTableID] = append(fksByBackrefTable[constraint.ForeignKey.ReferencedTableID], constraint)
 				}
+			} else if swap := mutation.GetPrimaryKeySwap(); swap != nil {
+				// If any old indexes (including the old primary index) being rewritten are interleaved
+				// children, we will have to update their parents as well.
+				for _, idxID := range append([]sqlbase.IndexID{swap.OldPrimaryIndexId}, swap.OldIndexes...) {
+					oldIndex, err := desc.FindIndexByID(idxID)
+					if err != nil {
+						return err
+					}
+					if len(oldIndex.Interleave.Ancestors) != 0 {
+						ancestor := oldIndex.Interleave.Ancestors[len(oldIndex.Interleave.Ancestors)-1]
+						if ancestor.TableID != desc.ID {
+							interleaveParents[ancestor.TableID] = struct{}{}
+						}
+					}
+				}
+				// Because we are not currently supporting primary key changes on tables/indexes
+				// that are interleaved parents, we don't check oldPrimaryIndex.InterleavedBy.
 			}
 		}
 		return nil
@@ -1261,6 +1328,11 @@ func (sc *SchemaChanger) done(ctx context.Context) (*sqlbase.ImmutableTableDescr
 	tableIDsToUpdate = append(tableIDsToUpdate, sc.tableID)
 	for id := range fksByBackrefTable {
 		tableIDsToUpdate = append(tableIDsToUpdate, id)
+	}
+	for id := range interleaveParents {
+		if _, ok := fksByBackrefTable[id]; !ok {
+			tableIDsToUpdate = append(tableIDsToUpdate, id)
+		}
 	}
 
 	update := func(descs map[sqlbase.ID]*sqlbase.MutableTableDescriptor) error {
@@ -1307,6 +1379,68 @@ func (sc *SchemaChanger) done(ctx context.Context) (*sqlbase.ImmutableTableDescr
 			if err := scDesc.MakeMutationComplete(mutation); err != nil {
 				return err
 			}
+			if pkSwap := mutation.GetPrimaryKeySwap(); pkSwap != nil {
+				if fn := sc.testingKnobs.RunBeforePrimaryKeySwap; fn != nil {
+					fn()
+				}
+				// If any old index had an interleaved parent, remove the backreference from the parent.
+				for _, idxID := range append(
+					[]sqlbase.IndexID{pkSwap.OldPrimaryIndexId}, pkSwap.OldIndexes...) {
+					oldIndex, err := scDesc.FindIndexByID(idxID)
+					if err != nil {
+						return err
+					}
+					if len(oldIndex.Interleave.Ancestors) != 0 {
+						ancestorInfo := oldIndex.Interleave.Ancestors[len(oldIndex.Interleave.Ancestors)-1]
+						ancestor := descs[ancestorInfo.TableID]
+						ancestorIdx, err := ancestor.FindIndexByID(ancestorInfo.IndexID)
+						if err != nil {
+							return err
+						}
+						foundAncestor := false
+						for k, ref := range ancestorIdx.InterleavedBy {
+							if ref.Table == scDesc.ID && ref.Index == oldIndex.ID {
+								if foundAncestor {
+									return errors.AssertionFailedf(
+										"ancestor entry in %s for %s@%s found more than once",
+										ancestor.Name, scDesc.Name, oldIndex.Name)
+								}
+								ancestorIdx.InterleavedBy = append(
+									ancestorIdx.InterleavedBy[:k], ancestorIdx.InterleavedBy[k+1:]...)
+								foundAncestor = true
+							}
+						}
+					}
+				}
+
+				// If we performed MakeMutationComplete on a PrimaryKeySwap mutation, then we need to start
+				// a job for the index deletion mutations that the primary key swap mutation added, if any.
+				mutationID := scDesc.ClusterVersion.NextMutationID
+				span := scDesc.PrimaryIndexSpan()
+				var spanList []jobspb.ResumeSpanList
+				for j := len(scDesc.ClusterVersion.Mutations); j < len(scDesc.Mutations); j++ {
+					spanList = append(spanList,
+						jobspb.ResumeSpanList{
+							ResumeSpans: roachpb.Spans{span},
+						},
+					)
+				}
+				jobRecord := jobs.Record{
+					Description:   fmt.Sprintf("Cleanup job for '%s'", sc.job.Payload().Description),
+					Username:      sc.job.Payload().Username,
+					DescriptorIDs: sqlbase.IDs{scDesc.GetID()},
+					Details:       jobspb.SchemaChangeDetails{ResumeSpanList: spanList},
+					Progress:      jobspb.SchemaChangeProgress{},
+				}
+				job := sc.jobRegistry.NewJob(jobRecord)
+				if err := job.Created(ctx); err != nil {
+					return err
+				}
+				scDesc.MutationJobs = append(scDesc.MutationJobs, sqlbase.TableDescriptor_MutationJob{
+					MutationID: mutationID,
+					JobID:      *job.ID(),
+				})
+			}
 			i++
 		}
 		if i == 0 {
@@ -1335,7 +1469,7 @@ func (sc *SchemaChanger) done(ctx context.Context) (*sqlbase.ImmutableTableDescr
 		// already be successful. These jobs don't need their status to be updated.
 		if !sc.job.WithTxn(txn).CheckTerminalStatus(ctx) {
 			if jobSucceeded {
-				if err := sc.job.WithTxn(txn).Succeeded(ctx, jobs.NoopFn); err != nil {
+				if err := sc.job.WithTxn(txn).Succeeded(ctx, nil); err != nil {
 					return errors.Wrapf(err,
 						"failed to mark job %d as successful", errors.Safe(*sc.job.ID()))
 				}
@@ -1403,9 +1537,7 @@ func (sc *SchemaChanger) notFirstInLine(
 // runStateMachineAndBackfill runs the schema change state machine followed by
 // the backfill.
 func (sc *SchemaChanger) runStateMachineAndBackfill(
-	ctx context.Context,
-	lease *sqlbase.TableDescriptor_SchemaChangeLease,
-	evalCtx *extendedEvalContext,
+	ctx context.Context, lease *sqlbase.TableDescriptor_SchemaChangeLease,
 ) error {
 	if fn := sc.testingKnobs.RunBeforePublishWriteAndDelete; fn != nil {
 		fn()
@@ -1416,7 +1548,7 @@ func (sc *SchemaChanger) runStateMachineAndBackfill(
 	}
 
 	// Run backfill(s).
-	if err := sc.runBackfill(ctx, lease, evalCtx); err != nil {
+	if err := sc.runBackfill(ctx, lease); err != nil {
 		return err
 	}
 
@@ -1620,7 +1752,7 @@ func markJobFailed(
 	if err != nil {
 		return nil, err
 	}
-	err = job.WithTxn(txn).Failed(ctx, causingError, jobs.NoopFn)
+	err = job.WithTxn(txn).Failed(ctx, causingError, nil)
 	return job, err
 }
 
@@ -1799,6 +1931,10 @@ func (sc *SchemaChanger) reverseMutation(
 		if col := mutation.GetColumn(); col != nil {
 			columns[col.Name] = struct{}{}
 		}
+		// PrimaryKeySwap doesn't have a concept of the state machine.
+		if pkSwap := mutation.GetPrimaryKeySwap(); pkSwap != nil {
+			return mutation, columns
+		}
 		if notStarted && mutation.State != sqlbase.DescriptorMutation_DELETE_ONLY {
 			panic(fmt.Sprintf("mutation in bad state: %+v", mutation))
 		}
@@ -1853,6 +1989,9 @@ type SchemaChangerTestingKnobs struct {
 	// RunBeforeIndexBackfill is called just before starting the index backfill, after
 	// fixing the index backfill scan timestamp.
 	RunBeforeIndexBackfill func()
+
+	// RunBeforePrimaryKeySwap is called just before the primary key swap is committed.
+	RunBeforePrimaryKeySwap func()
 
 	// RunBeforeIndexValidation is called just before starting the index validation,
 	// after setting the job status to validating.
@@ -1975,10 +2114,8 @@ func (s *SchemaChangeManager) Start(stopper *stop.Stopper) {
 		execOneSchemaChange := func(schemaChangers map[sqlbase.ID]SchemaChanger) {
 			for tableID, sc := range schemaChangers {
 				if timeutil.Since(sc.execAfter) > 0 {
-					evalCtx := createSchemaChangeEvalCtx(ctx, s.execCfg.Clock.Now(), &SessionTracing{}, s.ieFactory)
-
 					execCtx, cleanup := tracing.EnsureContext(ctx, s.ambientCtx.Tracer, "schema change [async]")
-					err := sc.exec(execCtx, false /* inSession */, &evalCtx)
+					err := sc.exec(execCtx, false /* inSession */)
 					cleanup()
 
 					// Advance the execAfter time so that this schema
@@ -2258,11 +2395,11 @@ func (s *SchemaChangeManager) Start(stopper *stop.Stopper) {
 //
 // TODO(andrei): This EvalContext() will be broken for backfills trying to use
 // functions marked with distsqlBlacklist.
+// Also, the SessionTracing inside the context is unrelated to the one
+// used in the surrounding SQL session, so session tracing is unable
+// to capture schema change activity.
 func createSchemaChangeEvalCtx(
-	ctx context.Context,
-	ts hlc.Timestamp,
-	tracing *SessionTracing,
-	ieFactory sqlutil.SessionBoundInternalExecutorFactory,
+	ctx context.Context, ts hlc.Timestamp, ieFactory sqlutil.SessionBoundInternalExecutorFactory,
 ) extendedEvalContext {
 	dummyLocation := time.UTC
 
@@ -2285,7 +2422,10 @@ func createSchemaChangeEvalCtx(
 	}
 
 	evalCtx := extendedEvalContext{
-		Tracing: tracing,
+		// Make a session tracing object on-the-fly. This is OK
+		// because it sets "enabled: false" and thus none of the
+		// other fields are used.
+		Tracing: &SessionTracing{},
 		EvalContext: tree.EvalContext{
 			SessionData:      sd,
 			InternalExecutor: ieFactory(ctx, sd),

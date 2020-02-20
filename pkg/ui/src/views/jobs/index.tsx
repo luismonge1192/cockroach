@@ -12,13 +12,16 @@ import succeededIcon from "!!raw-loader!assets/jobStatusIcons/checkMark.svg";
 import failedIcon from "!!raw-loader!assets/jobStatusIcons/exclamationPoint.svg";
 import _ from "lodash";
 import moment from "moment";
+import { DATE_FORMAT } from "src/util/format";
 import { Line } from "rc-progress";
 import React from "react";
 import { Helmet } from "react-helmet";
 import { connect } from "react-redux";
-import { bindActionCreators, Dispatch } from "redux";
+import { withRouter } from "react-router-dom";
+
 import { cockroach } from "src/js/protos";
 import { jobsKey, refreshJobs } from "src/redux/apiReducers";
+import { CachedDataReducerState } from "src/redux/cachedDataReducer";
 import { LocalSetting } from "src/redux/localsettings";
 import { AdminUIState } from "src/redux/state";
 import { TimestampToMoment } from "src/util/convert";
@@ -36,7 +39,6 @@ import Job = cockroach.server.serverpb.JobsResponse.IJob;
 import JobType = cockroach.sql.jobs.jobspb.Type;
 import JobsRequest = cockroach.server.serverpb.JobsRequest;
 import JobsResponse = cockroach.server.serverpb.JobsResponse;
-import { CachedDataReducerState } from "src/redux/cachedDataReducer";
 
 const statusOptions = [
   { value: "", label: "All" },
@@ -169,7 +171,7 @@ class JobStatusCell extends React.Component<{ job: Job }, {}> {
     }
     return (
       <ToolTipWrapper text={`System Time: ${tooltip}`}>
-        High-water Timestamp: {highwaterMoment.fromNow()}
+        High-water Timestamp: {highwaterMoment.format(DATE_FORMAT)}
       </ToolTipWrapper>
     );
   }
@@ -208,7 +210,7 @@ const jobsTableColumns: ColumnDescriptor<Job>[] = [
   },
   {
     title: "Creation Time",
-    cell: job => TimestampToMoment(job.created).fromNow(),
+    cell: job => TimestampToMoment(job.created).format(DATE_FORMAT),
     sort: job => TimestampToMoment(job.created).valueOf(),
   },
   {
@@ -246,7 +248,7 @@ const titleTooltip = (
   </span>
 );
 
-class JobsTable extends React.Component<JobsTableProps> {
+export class JobsTable extends React.Component<JobsTableProps> {
   refresh(props = this.props) {
     props.refreshJobs(new JobsRequest({
       status: props.status,
@@ -294,7 +296,7 @@ class JobsTable extends React.Component<JobsTableProps> {
   renderTable = () => {
     const jobs = this.props.jobs.data.jobs;
     if (_.isEmpty(jobs)) {
-      return <div className="no-results"><h2>No Results</h2></div>;
+      return <div className="no-results"><h2 className="base-heading">No Results</h2></div>;
     }
     return (
       <JobsSortedTable
@@ -315,11 +317,9 @@ class JobsTable extends React.Component<JobsTableProps> {
   render() {
     return (
       <div className="jobs-page">
-        <Helmet>
-          <title>Jobs</title>
-        </Helmet>
+        <Helmet title="Jobs" />
         <section className="section">
-          <h1>
+          <h1 className="base-heading page-title">
             Jobs
             <div className="section-heading__tooltip">
               <ToolTipWrapper text={titleTooltip}>
@@ -382,16 +382,12 @@ const mapStateToProps = (state: AdminUIState) => {
   };
 };
 
-const mapDispatchToProps = (dispatch: Dispatch<AdminUIState>) =>
-  bindActionCreators(
-    {
-      setSort: sortSetting.set,
-      setStatus: statusSetting.set,
-      setShow: showSetting.set,
-      setType: typeSetting.set,
-      refreshJobs,
-    },
-    dispatch,
-  );
+const mapDispatchToProps = {
+  setSort: sortSetting.set,
+  setStatus: statusSetting.set,
+  setShow: showSetting.set,
+  setType: typeSetting.set,
+  refreshJobs,
+};
 
-export default connect(mapStateToProps, mapDispatchToProps)(JobsTable as any);
+export default withRouter(connect(mapStateToProps, mapDispatchToProps)(JobsTable));

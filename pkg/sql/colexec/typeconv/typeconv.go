@@ -24,7 +24,7 @@ import (
 
 // FromColumnType returns the T that corresponds to the input ColumnType.
 // Note: if you're adding a new type here, add it to
-// colexec.AllSupportedSQLTypes as well.
+// colexec.allSupportedSQLTypes as well.
 func FromColumnType(ct *types.T) coltypes.T {
 	switch ct.Family() {
 	case types.BoolFamily:
@@ -49,6 +49,10 @@ func FromColumnType(ct *types.T) coltypes.T {
 		return coltypes.Float64
 	case types.TimestampFamily:
 		return coltypes.Timestamp
+	case types.TimestampTZFamily:
+		return coltypes.Timestamp
+	case types.IntervalFamily:
+		return coltypes.Interval
 	}
 	return coltypes.Unhandled
 }
@@ -86,6 +90,10 @@ func ToColumnType(t coltypes.T) *types.T {
 		return types.Int
 	case coltypes.Float64:
 		return types.Float
+	case coltypes.Timestamp:
+		return types.Timestamp
+	case coltypes.Interval:
+		return types.Interval
 	}
 	execerror.VectorizedInternalPanic(fmt.Sprintf("unexpected coltype %s", t.String()))
 	return nil
@@ -124,14 +132,6 @@ func GetDatumToPhysicalFn(ct *types.T) func(tree.Datum) (interface{}, error) {
 		}
 	case types.IntFamily:
 		switch ct.Width() {
-		case 8:
-			return func(datum tree.Datum) (interface{}, error) {
-				d, ok := datum.(*tree.DInt)
-				if !ok {
-					return nil, errors.Errorf("expected *tree.DInt, found %s", reflect.TypeOf(datum))
-				}
-				return int8(*d), nil
-			}
 		case 16:
 			return func(datum tree.Datum) (interface{}, error) {
 				d, ok := datum.(*tree.DInt)
@@ -219,6 +219,22 @@ func GetDatumToPhysicalFn(ct *types.T) func(tree.Datum) (interface{}, error) {
 				return nil, errors.Errorf("expected *tree.DTimestamp, found %s", reflect.TypeOf(datum))
 			}
 			return d.Time, nil
+		}
+	case types.TimestampTZFamily:
+		return func(datum tree.Datum) (interface{}, error) {
+			d, ok := datum.(*tree.DTimestampTZ)
+			if !ok {
+				return nil, errors.Errorf("expected *tree.DTimestampTZ, found %s", reflect.TypeOf(datum))
+			}
+			return d.Time, nil
+		}
+	case types.IntervalFamily:
+		return func(datum tree.Datum) (interface{}, error) {
+			d, ok := datum.(*tree.DInterval)
+			if !ok {
+				return nil, errors.Errorf("expected *tree.DInterval, found %s", reflect.TypeOf(datum))
+			}
+			return d.Duration, nil
 		}
 	}
 	// It would probably be more correct to return an error here, rather than a

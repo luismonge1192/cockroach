@@ -27,6 +27,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -46,6 +47,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/idalloc"
 	"github.com/cockroachdb/cockroach/pkg/storage/intentresolver"
+	"github.com/cockroachdb/cockroach/pkg/storage/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/storage/raftentry"
 	"github.com/cockroachdb/cockroach/pkg/storage/tscache"
 	"github.com/cockroachdb/cockroach/pkg/storage/txnrecovery"
@@ -53,7 +55,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/limit"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
@@ -150,8 +151,8 @@ func TestStoreConfig(clock *hlc.Clock) StoreConfig {
 	}
 	st := cluster.MakeTestingClusterSettings()
 	sc := StoreConfig{
-		DefaultZoneConfig:           config.DefaultZoneConfigRef(),
-		DefaultSystemZoneConfig:     config.DefaultSystemZoneConfigRef(),
+		DefaultZoneConfig:           zonepb.DefaultZoneConfigRef(),
+		DefaultSystemZoneConfig:     zonepb.DefaultSystemZoneConfigRef(),
 		Settings:                    st,
 		AmbientCtx:                  log.AmbientContext{Tracer: st.Tracer},
 		Clock:                       clock,
@@ -162,6 +163,7 @@ func TestStoreConfig(clock *hlc.Clock) StoreConfig {
 		HistogramWindowInterval:     metric.TestSampleInterval,
 		EnableEpochRangeLeases:      true,
 		ClosedTimestamp:             container.NoopContainer(),
+		ProtectedTimestampCache:     protectedts.EmptyCache(clock),
 	}
 
 	// Use shorter Raft tick settings in order to minimize start up and failover
@@ -385,7 +387,8 @@ type Store struct {
 	raftEntryCache     *raftentry.Cache
 	limiters           batcheval.Limiters
 	txnWaitMetrics     *txnwait.Metrics
-	sss                SSTSnapshotStorage
+	sstSnapshotStorage SSTSnapshotStorage
+	protectedtsCache   protectedts.Cache
 
 	// gossipRangeCountdown and leaseRangeCountdown are countdowns of
 	// changes to range and leaseholder counts, after which the store
@@ -596,8 +599,8 @@ type StoreConfig struct {
 	AmbientCtx log.AmbientContext
 	base.RaftConfig
 
-	DefaultZoneConfig       *config.ZoneConfig
-	DefaultSystemZoneConfig *config.ZoneConfig
+	DefaultZoneConfig       *zonepb.ZoneConfig
+	DefaultSystemZoneConfig *zonepb.ZoneConfig
 	Settings                *cluster.Settings
 	Clock                   *hlc.Clock
 	DB                      *client.DB
@@ -692,6 +695,11 @@ type StoreConfig struct {
 	// ExternalStorage creates ExternalStorage objects which allows access to external files
 	ExternalStorage        cloud.ExternalStorageFactory
 	ExternalStorageFromURI cloud.ExternalStorageFromURIFactory
+
+	// ProtectedTimestampCache maintains the state of the protected timestamp
+	// subsystem. It is queried during the GC process and in the handling of
+	// AdminVerifyProtectedTimestampRequest.
+	ProtectedTimestampCache protectedts.Cache
 }
 
 // ConsistencyTestingKnobs is a BatchEvalTestingKnobs struct used to control the
@@ -750,10 +758,6 @@ func (sc *StoreConfig) LeaseExpiration() int64 {
 	// the sum of the offset (=length of stasis period) and the active
 	// duration, but definitely not by 2x.
 	maxOffset := sc.Clock.MaxOffset()
-	if maxOffset == timeutil.ClocklessMaxOffset {
-		// Don't do shady math on clockless reads.
-		maxOffset = 0
-	}
 	return 2 * (sc.RangeLeaseActiveDuration() + maxOffset).Nanoseconds()
 }
 
@@ -848,10 +852,11 @@ func NewStore(
 	// after each snapshot application, except when the node crashed right before
 	// it can clean it up. If this fails it's not a correctness issue since the
 	// storage is also cleared before receiving a snapshot.
-	s.sss = NewSSTSnapshotStorage(s.engine, s.limiters.BulkIOWriteRate)
-	if err := s.sss.Clear(); err != nil {
+	s.sstSnapshotStorage = NewSSTSnapshotStorage(s.engine, s.limiters.BulkIOWriteRate)
+	if err := s.sstSnapshotStorage.Clear(); err != nil {
 		log.Warningf(ctx, "failed to clear snapshot storage: %v", err)
 	}
+	s.protectedtsCache = cfg.ProtectedTimestampCache
 
 	// On low-CPU instances, a default limit value may still allow ExportRequests
 	// to tie up all cores so cap limiter at cores-1 when setting value is higher.
@@ -1114,22 +1119,22 @@ func (s *Store) IsStarted() bool {
 	return atomic.LoadInt32(&s.started) == 1
 }
 
-// IterateIDPrefixKeys helps visit system keys that use RangeID prefixing (such as
-// RaftHardStateKey, RaftTombstoneKey, and many others). Such keys could in principle exist at any
-// RangeID, and this helper efficiently discovers all the keys of the desired type (as specified by
-// the supplied `keyFn`) and, for each key-value pair discovered, unmarshals it into `msg` and then
-// invokes `f`.
+// IterateIDPrefixKeys helps visit system keys that use RangeID prefixing (such
+// as RaftHardStateKey, RangeTombstoneKey, and many others). Such keys could in
+// principle exist at any RangeID, and this helper efficiently discovers all the
+// keys of the desired type (as specified by the supplied `keyFn`) and, for each
+// key-value pair discovered, unmarshals it into `msg` and then invokes `f`.
 //
 // Iteration stops on the first error (and will pass through that error).
 func IterateIDPrefixKeys(
 	ctx context.Context,
-	eng engine.Reader,
+	reader engine.Reader,
 	keyFn func(roachpb.RangeID) roachpb.Key,
 	msg protoutil.Message,
 	f func(_ roachpb.RangeID) (more bool, _ error),
 ) error {
 	rangeID := roachpb.RangeID(1)
-	iter := eng.NewIterator(engine.IterOptions{
+	iter := reader.NewIterator(engine.IterOptions{
 		UpperBound: keys.LocalRangeIDPrefix.PrefixEnd().AsRawKey(),
 	})
 	defer iter.Close()
@@ -1175,7 +1180,7 @@ func IterateIDPrefixKeys(
 		}
 
 		ok, err := engine.MVCCGetProto(
-			ctx, eng, unsafeKey.Key, hlc.Timestamp{}, msg, engine.MVCCGetOptions{})
+			ctx, reader, unsafeKey.Key, hlc.Timestamp{}, msg, engine.MVCCGetOptions{})
 		if err != nil {
 			return err
 		}
@@ -1195,7 +1200,9 @@ func IterateIDPrefixKeys(
 // from the provided Engine. The return values of this method and fn have
 // semantics similar to engine.MVCCIterate.
 func IterateRangeDescriptors(
-	ctx context.Context, eng engine.Reader, fn func(desc roachpb.RangeDescriptor) (bool, error),
+	ctx context.Context,
+	reader engine.Reader,
+	fn func(desc roachpb.RangeDescriptor) (done bool, err error),
 ) error {
 	log.Event(ctx, "beginning range descriptor iteration")
 	// Iterator over all range-local key-based data.
@@ -1224,7 +1231,7 @@ func IterateRangeDescriptors(
 		return fn(desc)
 	}
 
-	_, err := engine.MVCCIterate(ctx, eng, start, end, hlc.MaxTimestamp,
+	_, err := engine.MVCCIterate(ctx, reader, start, end, hlc.MaxTimestamp,
 		engine.MVCCScanOptions{Inconsistent: true}, kvToDesc)
 	log.Eventf(ctx, "iterated over %d keys to find %d range descriptors (by suffix: %v)",
 		allCount, matchCount, bySuffix)
@@ -1327,8 +1334,21 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 			if !desc.IsInitialized() {
 				return false, errors.Errorf("found uninitialized RangeDescriptor: %+v", desc)
 			}
+			replicaDesc, found := desc.GetReplicaDescriptor(s.StoreID())
+			if !found {
+				// This is a pre-emptive snapshot. It's also possible that this is a
+				// range which has processed a raft command to remove itself (which is
+				// possible prior to 19.2 or if the DisableEagerReplicaRemoval is
+				// enabled) and has not yet been removed by the replica gc queue.
+				// We treat both cases the same way.
+				//
+				// TODO(ajwerner): Remove this migration in 20.2. It exists in 20.1 to
+				// find and remove any pre-emptive snapshots which may have been sent by
+				// a 19.1 or older node to this node while it was running 19.2.
+				return false /* done */, removePreemptiveSnapshot(ctx, s, &desc)
+			}
 
-			rep, err := NewReplica(&desc, s, 0)
+			rep, err := newReplica(ctx, &desc, s, replicaDesc.ReplicaID)
 			if err != nil {
 				return false, err
 			}
@@ -2153,6 +2173,14 @@ func (s *Store) Metrics() *StoreMetrics {
 	return s.metrics
 }
 
+// NodeDescriptor returns the NodeDescriptor of the node that holds the Store.
+func (s *Store) NodeDescriptor() *roachpb.NodeDescriptor {
+	return s.nodeDesc
+}
+
+// Silence unused warning.
+var _ = (*Store).NodeDescriptor
+
 // Descriptor returns a StoreDescriptor including current store
 // capacity information.
 func (s *Store) Descriptor(useCached bool) (*roachpb.StoreDescriptor, error) {
@@ -2358,8 +2386,7 @@ func (s *Store) ComputeMetrics(ctx context.Context, tick int) error {
 	// stats.
 	if tick%logSSTInfoTicks == 1 /* every 10m */ {
 		log.Infof(ctx, "sstables (read amplification = %d):\n%s", readAmp, sstables)
-		log.Infof(ctx, "%sestimated_pending_compaction_bytes: %s",
-			s.engine.GetCompactionStats(), humanizeutil.IBytes(stats.PendingCompactionBytesEstimate))
+		log.Infof(ctx, "%s", s.engine.GetCompactionStats())
 	}
 	return nil
 }

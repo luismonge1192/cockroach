@@ -32,7 +32,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -49,6 +48,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
 	"golang.org/x/net/trace"
 )
 
@@ -382,8 +382,10 @@ func (s *Server) SetupConn(
 	clientComm ClientComm,
 	memMetrics MemoryMetrics,
 ) (ConnectionHandler, error) {
-	sd, sdMut := s.newSessionDataAndMutator(args)
-	ex, err := s.newConnExecutor(ctx, sd, sdMut, stmtBuf, clientComm, memMetrics, &s.Metrics)
+	sd := s.newSessionData(args)
+	sdMut := s.makeSessionDataMutator(sd, args.SessionDefaults)
+	ex, err := s.newConnExecutor(
+		ctx, sd, &sdMut, stmtBuf, clientComm, memMetrics, &s.Metrics, resetSessionDataToDefaults)
 	return ConnectionHandler{ex}, err
 }
 
@@ -450,34 +452,57 @@ func (s *Server) ServeConn(
 	return h.ex.run(ctx, s.pool, reserved, cancel)
 }
 
-// newSessionDataAndMutator creates a SessionData and sessionDataMutator that
-// can be passed to newConnExecutor.
-func (s *Server) newSessionDataAndMutator(
-	args SessionArgs,
-) (*sessiondata.SessionData, *sessionDataMutator) {
+// newSessionData a SessionData that can be passed to newConnExecutor.
+func (s *Server) newSessionData(args SessionArgs) *sessiondata.SessionData {
 	sd := &sessiondata.SessionData{
-		User:          args.User,
-		RemoteAddr:    args.RemoteAddr,
-		SequenceState: sessiondata.NewSequenceState(),
-		DataConversion: sessiondata.DataConversionConfig{
-			Location: time.UTC,
-		},
+		User:              args.User,
+		RemoteAddr:        args.RemoteAddr,
 		ResultsBufferSize: args.ConnResultsBufferSize,
 	}
+	s.populateMinimalSessionData(sd)
+	return sd
+}
 
-	m := &sessionDataMutator{
+func (s *Server) makeSessionDataMutator(
+	sd *sessiondata.SessionData, defaults SessionDefaults,
+) sessionDataMutator {
+	return sessionDataMutator{
 		data:     sd,
-		defaults: args.SessionDefaults,
+		defaults: defaults,
 		settings: s.cfg.Settings,
 	}
-
-	return sd, m
 }
+
+// populateMinimalSessionData populates sd with some minimal values needed for
+// not crashing. Fields of sd that are already set are not overwritten.
+func (s *Server) populateMinimalSessionData(sd *sessiondata.SessionData) {
+	if sd.SequenceState == nil {
+		sd.SequenceState = sessiondata.NewSequenceState()
+	}
+	if sd.DataConversion == (sessiondata.DataConversionConfig{}) {
+		sd.DataConversion = sessiondata.DataConversionConfig{
+			Location: time.UTC,
+		}
+	}
+	if len(sd.SearchPath.GetPathArray()) == 0 {
+		sd.SearchPath = sqlbase.DefaultSearchPath
+	}
+}
+
+type sdResetOption bool
+
+const (
+	resetSessionDataToDefaults     sdResetOption = true
+	dontResetSessionDataToDefaults               = false
+)
 
 // newConnExecutor creates a new connExecutor.
 //
-// sdMutator can be nil if SET statements are not going to be executed; this is
-// appropriate for session-bound internal executors.
+// resetOpt controls whether sd is to be reset to the default values.
+// TODO(andrei): resetOpt is a hack needed by the InternalExecutor, which
+// doesn't want this resetting. Figure out a better API where the responsibility
+// of assigning default values is either entirely inside or outside of this
+// ctor.
 func (s *Server) newConnExecutor(
 	ctx context.Context,
 	sd *sessiondata.SessionData,
@@ -486,6 +511,7 @@ func (s *Server) newConnExecutor(
 	clientComm ClientComm,
 	memMetrics MemoryMetrics,
 	srvMetrics *Metrics,
+	resetOpt sdResetOption,
 ) (*connExecutor, error) {
 	// Create the various monitors.
 	// The session monitors are started in activate().
@@ -539,22 +565,26 @@ func (s *Server) newConnExecutor(
 
 		// ctxHolder will be reset at the start of run(). We only define
 		// it here so that an early call to close() doesn't panic.
-		ctxHolder:    ctxHolder{connCtx: ctx},
-		executorType: executorTypeExec,
+		ctxHolder:                 ctxHolder{connCtx: ctx},
+		executorType:              executorTypeExec,
+		hasCreatedTemporarySchema: false,
 	}
 
 	ex.state.txnAbortCount = ex.metrics.EngineMetrics.TxnAbortCount
 
-	if sdMutator != nil {
-		sdMutator.setCurTxnReadOnly = func(val bool) {
-			ex.state.readOnly = val
-		}
-		sdMutator.RegisterOnSessionDataChange("application_name", func(newName string) {
-			ex.appStats = ex.server.sqlStats.getStatsForApplication(newName)
-			ex.applicationName.Store(newName)
-		})
-		// Initialize the session data from provided defaults. We need to do this early
-		// because other initializations below use the configured values.
+	sdMutator.setCurTxnReadOnly = func(val bool) {
+		ex.state.readOnly = val
+	}
+	sdMutator.onTempSchemaCreation = func() {
+		ex.hasCreatedTemporarySchema = true
+	}
+	sdMutator.RegisterOnSessionDataChange("application_name", func(newName string) {
+		ex.appStats = ex.server.sqlStats.getStatsForApplication(newName)
+		ex.applicationName.Store(newName)
+	})
+	// Initialize the session data from provided defaults. We need to do this early
+	// because other initializations below use the configured values.
+	if resetOpt == resetSessionDataToDefaults {
 		if err := resetSessionVars(ctx, sdMutator); err != nil {
 			log.Errorf(ctx, "error setting up client session: %v", err)
 			return nil, err
@@ -573,7 +603,13 @@ func (s *Server) newConnExecutor(
 		// we can measure their respective "pressure" on internal queries.
 		// Hence the choice here to add the delegate prefix
 		// to the current app name.
-		appStatsBucketName := sqlbase.DelegatedAppNamePrefix + ex.sessionData.ApplicationName
+		var appStatsBucketName string
+		if !strings.HasPrefix(ex.sessionData.ApplicationName, sqlbase.InternalAppNamePrefix) {
+			appStatsBucketName = sqlbase.DelegatedAppNamePrefix + ex.sessionData.ApplicationName
+		} else {
+			// If this is already an "internal app", don't put more prefix.
+			appStatsBucketName = ex.sessionData.ApplicationName
+		}
 		ex.appStats = s.sqlStats.getStatsForApplication(appStatsBucketName)
 	}
 
@@ -590,6 +626,7 @@ func (s *Server) newConnExecutor(
 		leaseMgr:          s.cfg.LeaseManager,
 		databaseCache:     s.dbCache.getDatabaseCache(),
 		dbCacheSubscriber: s.dbCache,
+		settings:          s.cfg.Settings,
 	}
 	ex.extraTxnState.txnRewindPos = -1
 	ex.mu.ActiveQueries = make(map[ClusterWideID]*queryMeta)
@@ -624,8 +661,10 @@ func (s *Server) newConnExecutorWithTxn(
 	srvMetrics *Metrics,
 	txn *client.Txn,
 	tcModifier tableCollectionModifier,
+	resetOpt sdResetOption,
 ) (*connExecutor, error) {
-	ex, err := s.newConnExecutor(ctx, sd, sdMutator, stmtBuf, clientComm, memMetrics, srvMetrics)
+	ex, err := s.newConnExecutor(
+		ctx, sd, sdMutator, stmtBuf, clientComm, memMetrics, srvMetrics, resetOpt)
 	if err != nil {
 		return nil, err
 	}
@@ -736,11 +775,25 @@ func (ex *connExecutor) closeWrapper(ctx context.Context, recovered interface{})
 		// panic or safeErr. I'm propagating safeErr to be on the safe side.
 		panic(safeErr)
 	}
-	ex.close(ctx, normalClose)
+	// Closing is not cancelable.
+	closeCtx := logtags.WithTags(context.Background(), logtags.FromContext(ctx))
+	ex.close(closeCtx, normalClose)
 }
 
 func (ex *connExecutor) close(ctx context.Context, closeType closeType) {
 	ex.sessionEventf(ctx, "finishing connExecutor")
+
+	if ex.hasCreatedTemporarySchema {
+		err := cleanupSessionTempObjects(ctx, ex.server, ex.sessionID)
+		if err != nil {
+			log.Errorf(
+				ctx,
+				"error deleting temporary objects at session close, "+
+					"the temp tables deletion job will retry periodically: %s",
+				err,
+			)
+		}
+	}
 
 	ev := noEvent
 	if _, noTxn := ex.machine.CurState().(stateNoTxn); !noTxn {
@@ -854,6 +907,13 @@ type connExecutor struct {
 		// is done if the statement was executed in an implicit txn).
 		schemaChangers schemaChangerCollection
 
+		// jobs accumulates jobs staged for execution inside the transaction.
+		// Staging happens when executing statements that are implemented with a
+		// job. The jobs are staged via the function QueueJob in
+		// pkg/sql/planner.go. The staged jobs are executed once the transaction
+		// that staged them commits.
+		jobs jobsCollection
+
 		// autoRetryCounter keeps track of the which iteration of a transaction
 		// auto-retry we're currently in. It's 0 whenever the transaction state is not
 		// stateOpen.
@@ -964,6 +1024,10 @@ type connExecutor struct {
 	// executorType is set to whether this executor is an ordinary executor which
 	// responds to user queries or an internal one.
 	executorType executorType
+
+	// hasCreatedTemporarySchema is set if the executor has created a
+	// temporary schema, which requires special cleanup on close.
+	hasCreatedTemporarySchema bool
 }
 
 // ctxHolder contains a connection's context and, while session tracing is
@@ -1046,6 +1110,8 @@ func (ns *prepStmtNamespace) resetTo(ctx context.Context, to prepStmtNamespace) 
 func (ex *connExecutor) resetExtraTxnState(
 	ctx context.Context, dbCacheHolder *databaseCacheHolder, ev txnEvent,
 ) error {
+	ex.extraTxnState.jobs = nil
+
 	ex.extraTxnState.schemaChangers.reset()
 
 	ex.extraTxnState.tables.releaseTables(ctx)
@@ -1343,7 +1409,7 @@ func (ex *connExecutor) execCmd(ctx context.Context) error {
 			if ex.idleConn() {
 				// If we're about to close the connection, close res in order to flush
 				// now, as we won't have an opportunity to do it later.
-				res.Close(stateToTxnStatusIndicator(ex.machine.CurState()))
+				res.Close(ctx, stateToTxnStatusIndicator(ex.machine.CurState()))
 				return errDrainingComplete
 			}
 		}
@@ -1398,15 +1464,11 @@ func (ex *connExecutor) execCmd(ctx context.Context) error {
 		pe, ok := payload.(payloadWithError)
 		if ok {
 			ex.sessionEventf(ctx, "execution error: %s", pe.errorCause())
+			if resErr == nil {
+				res.SetError(pe.errorCause())
+			}
 		}
-		if resErr == nil && ok {
-			// Depending on whether the result has the error already or not, we have
-			// to call either Close or CloseWithErr.
-			res.CloseWithErr(pe.errorCause())
-		} else {
-			ex.recordError(ctx, resErr)
-			res.Close(stateToTxnStatusIndicator(ex.machine.CurState()))
-		}
+		res.Close(ctx, stateToTxnStatusIndicator(ex.machine.CurState()))
 	} else {
 		res.Discard()
 	}
@@ -1632,28 +1694,31 @@ func (ex *connExecutor) execCopyIn(
 		ex.state.mon.Start(ctx, ex.sessionMon, mon.BoundAccount{} /* reserved */)
 		monToStop = ex.state.mon
 	}
-	cm, err := newCopyMachine(
-		ctx, cmd.Conn, cmd.Stmt, txnOpt, ex.server.cfg,
-
-		// resetPlanner
-		func(p *planner, txn *client.Txn, txnTS time.Time, stmtTS time.Time) {
-			// HACK: We're reaching inside ex.state and changing sqlTimestamp by hand.
-			// It is used by resetPlanner. Normally sqlTimestamp is updated by the
-			// state machine, but the copyMachine manages its own transactions without
-			// going through the state machine.
-			ex.state.sqlTimestamp = txnTS
-			ex.statsCollector = ex.newStatsCollector()
-			ex.statsCollector.reset(&ex.server.sqlStats, ex.appStats, &ex.phaseTimes)
-			ex.initPlanner(ctx, p)
-			ex.resetPlanner(ctx, p, txn, stmtTS, 0 /* numAnnotations */)
-		},
-
-		// execInsertPlan
-		func(ctx context.Context, p *planner, res RestrictedCommandResult) error {
-			_, _, err := ex.execWithDistSQLEngine(ctx, p, tree.RowsAffected, res, false /* distribute */)
-			return err
-		},
-	)
+	var cm copyMachineInterface
+	var err error
+	resetPlanner := func(p *planner, txn *client.Txn, txnTS time.Time, stmtTS time.Time) {
+		// HACK: We're reaching inside ex.state and changing sqlTimestamp by hand.
+		// It is used by resetPlanner. Normally sqlTimestamp is updated by the
+		// state machine, but the copyMachine manages its own transactions without
+		// going through the state machine.
+		ex.state.sqlTimestamp = txnTS
+		ex.statsCollector = ex.newStatsCollector()
+		ex.statsCollector.reset(&ex.server.sqlStats, ex.appStats, &ex.phaseTimes)
+		ex.initPlanner(ctx, p)
+		ex.resetPlanner(ctx, p, txn, stmtTS, 0 /* numAnnotations */)
+	}
+	if table := cmd.Stmt.Table; table.Table() == fileUploadTable && table.Schema() == crdbInternalName {
+		cm, err = newFileUploadMachine(cmd.Conn, cmd.Stmt, ex.server.cfg, resetPlanner)
+	} else {
+		cm, err = newCopyMachine(
+			ctx, cmd.Conn, cmd.Stmt, txnOpt, ex.server.cfg, resetPlanner,
+			// execInsertPlan
+			func(ctx context.Context, p *planner, res RestrictedCommandResult) error {
+				_, _, err := ex.execWithDistSQLEngine(ctx, p, tree.RowsAffected, res, false /* distribute */, nil /* progressAtomic */)
+				return err
+			},
+		)
+	}
 	if err != nil {
 		ev := eventNonRetriableErr{IsCommit: fsm.False}
 		payload := eventNonRetriableErrPayload{err: err}
@@ -1833,29 +1898,30 @@ func (ex *connExecutor) readWriteModeWithSessionDefault(
 func (ex *connExecutor) initEvalCtx(ctx context.Context, evalCtx *extendedEvalContext, p *planner) {
 	scInterface := newSchemaInterface(&ex.extraTxnState.tables, ex.server.cfg.VirtualSchemas)
 
-	ie := NewSessionBoundInternalExecutor(
+	ie := MakeInternalExecutor(
 		ctx,
-		ex.sessionData,
 		ex.server,
 		ex.memMetrics,
 		ex.server.cfg.Settings,
 	)
+	ie.SetSessionData(ex.sessionData)
 
 	*evalCtx = extendedEvalContext{
 		EvalContext: tree.EvalContext{
-			Planner:          p,
-			Sequence:         p,
-			SessionData:      ex.sessionData,
-			SessionAccessor:  p,
-			Settings:         ex.server.cfg.Settings,
-			TestingKnobs:     ex.server.cfg.EvalContextTestingKnobs,
-			ClusterID:        ex.server.cfg.ClusterID(),
-			ClusterName:      ex.server.cfg.RPCContext.ClusterName(),
-			NodeID:           ex.server.cfg.NodeID.Get(),
-			Locality:         ex.server.cfg.Locality,
-			ReCache:          ex.server.reCache,
-			InternalExecutor: ie,
-			DB:               ex.server.cfg.DB,
+			Planner:            p,
+			Sequence:           p,
+			SessionData:        ex.sessionData,
+			SessionAccessor:    p,
+			PrivilegedAccessor: p,
+			Settings:           ex.server.cfg.Settings,
+			TestingKnobs:       ex.server.cfg.EvalContextTestingKnobs,
+			ClusterID:          ex.server.cfg.ClusterID(),
+			ClusterName:        ex.server.cfg.RPCContext.ClusterName(),
+			NodeID:             ex.server.cfg.NodeID.Get(),
+			Locality:           ex.server.cfg.Locality,
+			ReCache:            ex.server.reCache,
+			InternalExecutor:   &ie,
+			DB:                 ex.server.cfg.DB,
 		},
 		SessionMutator:    ex.dataMutator,
 		VirtualSchemas:    ex.server.cfg.VirtualSchemas,
@@ -1867,6 +1933,7 @@ func (ex *connExecutor) initEvalCtx(ctx context.Context, evalCtx *extendedEvalCo
 		DistSQLPlanner:    ex.server.cfg.DistSQLPlanner,
 		TxnModesSetter:    ex,
 		SchemaChangers:    &ex.extraTxnState.schemaChangers,
+		Jobs:              &ex.extraTxnState.jobs,
 		schemaAccessors:   scInterface,
 		sqlStatsCollector: ex.statsCollector,
 	}
@@ -1999,52 +2066,64 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 			errorutil.SendReport(ex.Ctx(), &ex.server.cfg.Settings.SV, err)
 			return advanceInfo{}, err
 		}
+
+		handleErr := func(err error) {
+			if implicitTxn {
+				// The schema change/job failed but it was also the only
+				// operation in the transaction. In this case, the transaction's
+				// error is the schema change error.
+				res.SetError(err)
+			} else {
+				// The schema change/job failed but everything else in the
+				// transaction was actually committed successfully already. At
+				// this point, it is too late to cancel the transaction. In
+				// effect, we have violated the "A" of ACID.
+				//
+				// This situation is sufficiently serious that we cannot let the
+				// error that caused the schema change to fail flow back to the
+				// client as-is. We replace it by a custom code dedicated to
+				// this situation. Replacement occurs because this error code is
+				// a "serious error" and the code computation logic will give it
+				// a higher priority.
+				//
+				// We also print out the original error code as prefix of the
+				// error message, in case it was a serious error.
+				newErr := pgerror.Wrapf(err,
+					pgcode.TransactionCommittedWithSchemaChangeFailure,
+					"transaction committed but schema change aborted with error: (%s)",
+					pgerror.GetPGCode(err))
+				newErr = errors.WithHint(newErr,
+					"Some of the non-DDL statements may have committed successfully, "+
+						"but some of the DDL statement(s) failed.\nManual inspection may be "+
+						"required to determine the actual state of the database.")
+				newErr = errors.WithIssueLink(newErr,
+					errors.IssueLink{IssueURL: "https://github.com/cockroachdb/cockroach/issues/42061"})
+				res.SetError(newErr)
+			}
+		}
+		if err := ex.server.cfg.JobRegistry.Run(
+			ex.ctxHolder.connCtx,
+			ex.server.cfg.InternalExecutor,
+			ex.extraTxnState.jobs); err != nil {
+			handleErr(err)
+		}
+
 		scc := &ex.extraTxnState.schemaChangers
 		if len(scc.schemaChangers) != 0 {
 			ieFactory := func(ctx context.Context, sd *sessiondata.SessionData) sqlutil.InternalExecutor {
-				ie := NewSessionBoundInternalExecutor(
+				ie := MakeInternalExecutor(
 					ctx,
-					sd,
 					ex.server,
 					ex.memMetrics,
 					ex.server.cfg.Settings,
 				)
-				return ie
+				ie.SetSessionData(sd)
+				return &ie
 			}
 			if schemaChangeErr := scc.execSchemaChanges(
 				ex.Ctx(), ex.server.cfg, &ex.sessionTracing, ieFactory,
 			); schemaChangeErr != nil {
-				if implicitTxn {
-					// The schema change failed but it was also the only
-					// operation in the transaction. In this case, the
-					// transaction's error is the schema change error.
-					res.SetError(schemaChangeErr)
-				} else {
-					// The schema change failed but everything else in the transaction
-					// was actually committed successfully already. At this point,
-					// it is too late to cancel the transaction. In effect, we have
-					// violated the "A" of ACID.
-					//
-					// This situation is sufficiently serious that we cannot let
-					// the error that caused the schema change to fail flow back
-					// to the client as-is. We replace it by a custom code
-					// dedicated to this situation. Replacement occurs
-					// because this error code is a "serious error" and the code
-					// computation logic will give it a higher priority.
-					//
-					// We also print out the original error code as prefix of
-					// the error message, in case it was a serious error.
-					newErr := pgerror.Wrapf(schemaChangeErr,
-						pgcode.TransactionCommittedWithSchemaChangeFailure,
-						"transaction committed but schema change aborted with error: (%s)",
-						pgerror.GetPGCode(schemaChangeErr))
-					newErr = errors.WithHint(newErr,
-						"Some of the non-DDL statements may have committed successfully, but some of the DDL statement(s) failed.\n"+
-							"Manual inspection may be required to determine the actual state of the database.")
-					newErr = errors.WithIssueLink(newErr,
-						errors.IssueLink{IssueURL: "https://github.com/cockroachdb/cockroach/issues/42061"})
-					res.SetError(newErr)
-				}
+				handleErr(schemaChangeErr)
 			}
 		}
 
@@ -2083,13 +2162,6 @@ func (ex *connExecutor) initStatementResult(
 		res.SetColumns(ctx, cols)
 	}
 	return nil
-}
-
-// recordError processes an error at the end of query execution.
-// This triggers telemetry and, if the error is an internal error,
-// triggers the emission of a sentry report.
-func (ex *connExecutor) recordError(ctx context.Context, err error) {
-	sqltelemetry.RecordError(ctx, err, &ex.server.cfg.Settings.SV)
 }
 
 // newStatsCollector returns a sqlStatsCollector that will record stats in the
@@ -2158,12 +2230,14 @@ func (ex *connExecutor) serialize() serverpb.Session {
 			continue
 		}
 		sql := truncateSQL(query.stmt.String())
+		progress := math.Float64frombits(atomic.LoadUint64(&query.progressAtomic))
 		activeQueries = append(activeQueries, serverpb.ActiveQuery{
 			ID:            id.String(),
 			Start:         query.start.UTC(),
 			Sql:           sql,
 			IsDistributed: query.isDistributed,
 			Phase:         (serverpb.ActiveQuery_Phase)(query.phase),
+			Progress:      float32(progress),
 		})
 	}
 	lastActiveQuery := ""

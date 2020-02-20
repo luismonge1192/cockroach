@@ -34,6 +34,7 @@ type fkExistenceCheckForDelete struct {
 
 // makeFkExistenceCheckHelperForDelete instantiates a delete helper.
 func makeFkExistenceCheckHelperForDelete(
+	ctx context.Context,
 	txn *client.Txn,
 	table *sqlbase.ImmutableTableDescriptor,
 	otherTables FkTableMetadata,
@@ -72,15 +73,15 @@ func makeFkExistenceCheckHelperForDelete(
 			OnDelete: ref.OnDelete,
 			OnUpdate: ref.OnUpdate,
 		}
-		searchIdx, err := originTable.Desc.TableDesc().FindIndexByID(ref.LegacyOriginIndex)
+		searchIdx, err := sqlbase.FindFKOriginIndex(originTable.Desc.TableDesc(), ref.OriginColumnIDs)
 		if err != nil {
 			return fkExistenceCheckForDelete{}, errors.NewAssertionErrorWithWrappedErrf(
-				err, "failed to find index %d (table %d) for deletion", ref.LegacyOriginIndex, ref.OriginTableID)
+				err, "failed to find a suitable index on table %d for deletion", ref.OriginTableID)
 		}
-		mutatedIdx, err := table.TableDesc().FindIndexByID(ref.LegacyReferencedIndex)
+		mutatedIdx, err := sqlbase.FindFKReferencedIndex(table.TableDesc(), ref.ReferencedColumnIDs)
 		if err != nil {
 			return fkExistenceCheckForDelete{}, errors.NewAssertionErrorWithWrappedErrf(
-				err, "failed to find available index %d (table %d) for deletion", ref.LegacyReferencedIndex, ref.ReferencedTableID)
+				err, "failed to find a suitable index on table %d for deletion", ref.ReferencedTableID)
 		}
 		fk, err := makeFkExistenceCheckBaseHelper(txn, otherTables, fakeRef, searchIdx, mutatedIdx, colMap, alloc,
 			CheckDeletes)
@@ -94,6 +95,26 @@ func makeFkExistenceCheckHelperForDelete(
 			h.fks = make(map[sqlbase.IndexID][]fkExistenceCheckBaseHelper)
 		}
 		h.fks[mutatedIdx.ID] = append(h.fks[mutatedIdx.ID], fk)
+	}
+
+	if len(h.fks) > 0 {
+		// TODO(knz,radu): FK existence checks need to see the writes
+		// performed by the mutation.
+		//
+		// In order to make this true, we need to split the existence
+		// checks into a separate sequencing step, and have the first
+		// check happen no early than the end of all the "main" part of
+		// the statement. Unfortunately, the organization of the code does
+		// not allow this today.
+		//
+		// See: https://github.com/cockroachdb/cockroach/issues/33475
+		//
+		// In order to "make do" and preserve a modicum of FK semantics we
+		// thus need to disable step-wise execution here. The result is that
+		// it will also enable any interleaved read part to observe the
+		// mutation, and thus introduce the risk of a Halloween problem for
+		// any mutation that uses FK relationships.
+		_ = txn.ConfigureStepping(ctx, client.SteppingDisabled)
 	}
 
 	return h, nil

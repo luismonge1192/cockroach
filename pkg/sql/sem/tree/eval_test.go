@@ -58,19 +58,13 @@ func TestEval(t *testing.T) {
 		})
 	}
 
-	walkExpr := func(t *testing.T, getExpr func(tree.TypedExpr) (tree.TypedExpr, error)) {
+	walkExpr := func(t *testing.T, getExpr func(tree.Expr) (tree.TypedExpr, error)) {
 		walk(t, func(t *testing.T, d *datadriven.TestData) string {
 			expr, err := parser.ParseExpr(d.Input)
 			if err != nil {
 				t.Fatalf("%s: %v", d.Input, err)
 			}
-			// expr.TypeCheck to avoid constant folding.
-			typedExpr, err := expr.TypeCheck(nil, types.Any)
-			if err != nil {
-				return fmt.Sprint(err)
-			}
-
-			e, err := getExpr(typedExpr)
+			e, err := getExpr(expr)
 			if err != nil {
 				return fmt.Sprint(err)
 			}
@@ -83,14 +77,19 @@ func TestEval(t *testing.T) {
 	}
 
 	t.Run("opt", func(t *testing.T) {
-		walkExpr(t, func(e tree.TypedExpr) (tree.TypedExpr, error) {
+		walkExpr(t, func(e tree.Expr) (tree.TypedExpr, error) {
 			return optBuildScalar(evalCtx, e)
 		})
 	})
 
 	t.Run("no-opt", func(t *testing.T) {
-		walkExpr(t, func(e tree.TypedExpr) (tree.TypedExpr, error) {
-			return evalCtx.NormalizeExpr(e)
+		walkExpr(t, func(e tree.Expr) (tree.TypedExpr, error) {
+			// expr.TypeCheck to avoid constant folding.
+			typedExpr, err := e.TypeCheck(nil, types.Any)
+			if err != nil {
+				return nil, err
+			}
+			return evalCtx.NormalizeExpr(typedExpr)
 		})
 	})
 
@@ -132,7 +131,7 @@ func TestEval(t *testing.T) {
 
 			switch typedExpr.ResolvedType().Family() {
 			case types.TupleFamily:
-				// ParseDatumStringAs doesn't handle tuples, so we have to convert them ourselves.
+				// ParseAndRequireString doesn't handle tuples, so we have to convert them ourselves.
 				var datums tree.Datums
 				// Fetch the original expression's tuple values.
 				tuple := typedExpr.(*tree.Tuple)
@@ -146,7 +145,7 @@ func TestEval(t *testing.T) {
 						t.Fatal(err)
 					}
 					// Now parse the new string as the expected type.
-					datum, err := tree.ParseDatumStringAs(expr.ResolvedType(), s, evalCtx)
+					datum, err := tree.ParseAndRequireString(expr.ResolvedType(), s, evalCtx)
 					if err != nil {
 						t.Errorf("%s: %s", err, s)
 						return err.Error()
@@ -155,7 +154,7 @@ func TestEval(t *testing.T) {
 				}
 				return tree.NewDTuple(typedExpr.ResolvedType(), datums...).String()
 			}
-			datum, err := tree.ParseDatumStringAs(typedExpr.ResolvedType(), res.String, evalCtx)
+			datum, err := tree.ParseAndRequireString(typedExpr.ResolvedType(), res.String, evalCtx)
 			if err != nil {
 				t.Errorf("%s: %s", err, res.String)
 				return err.Error()
@@ -194,10 +193,8 @@ func TestEval(t *testing.T) {
 			require.NoError(t, err)
 
 			batchesReturned := 0
-			result, err := colexec.NewColOperator(
-				ctx,
-				flowCtx,
-				&execinfrapb.ProcessorSpec{
+			args := colexec.NewColOperatorArgs{
+				Spec: &execinfrapb.ProcessorSpec{
 					Input: []execinfrapb.InputSyncSpec{{
 						Type:        execinfrapb.InputSyncSpec_UNORDERED,
 						ColumnTypes: inputTyps,
@@ -209,24 +206,24 @@ func TestEval(t *testing.T) {
 						RenderExprs: []execinfrapb.Expression{{Expr: d.Input}},
 					},
 				},
-				[]colexec.Operator{
+				Inputs: []colexec.Operator{
 					&colexec.CallbackOperator{
 						NextCb: func(_ context.Context) coldata.Batch {
+							if batchesReturned > 0 {
+								return coldata.ZeroBatch
+							}
 							// It doesn't matter what types we create the input batch with.
 							batch := coldata.NewMemBatch(inputColTyps)
-							if batchesReturned > 0 {
-								batch.SetLength(0)
-								return batch
-							}
 							batch.SetLength(1)
 							batchesReturned++
 							return batch
 						},
 					},
 				},
-				&acc,
-				true, /* useStreamingMemAccountForBuffering */
-			)
+				StreamingMemAccount: &acc,
+			}
+			args.TestingKnobs.UseStreamingMemAccountForBuffering = true
+			result, err := colexec.NewColOperator(ctx, flowCtx, args)
 			if testutils.IsError(err, "unable to columnarize") {
 				// Skip this test as execution is not supported by the vectorized
 				// engine.
@@ -267,9 +264,9 @@ func TestEval(t *testing.T) {
 	})
 }
 
-func optBuildScalar(evalCtx *tree.EvalContext, e tree.TypedExpr) (tree.TypedExpr, error) {
+func optBuildScalar(evalCtx *tree.EvalContext, e tree.Expr) (tree.TypedExpr, error) {
 	var o xform.Optimizer
-	o.Init(evalCtx)
+	o.Init(evalCtx, nil /* catalog */)
 	b := optbuilder.NewScalar(context.TODO(), &tree.SemaContext{}, evalCtx, o.Factory())
 	b.AllowUnsupportedExpr = true
 	if err := b.Build(e); err != nil {

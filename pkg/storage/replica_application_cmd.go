@@ -147,17 +147,17 @@ func (c *replicatedCmd) AckSuccess() error {
 	reply := *c.proposal.Local.Reply
 	reply.Responses = append([]roachpb.ResponseUnion(nil), reply.Responses...)
 	resp.Reply = &reply
-	resp.Intents = c.proposal.Local.DetachIntents()
+	resp.EncounteredIntents = c.proposal.Local.DetachEncounteredIntents()
 	resp.EndTxns = c.proposal.Local.DetachEndTxns(false /* alwaysOnly */)
 	c.proposal.signalProposalResult(resp)
 	return nil
 }
 
 // FinishAndAckOutcome implements the apply.AppliedCommand interface.
-func (c *replicatedCmd) FinishAndAckOutcome() error {
+func (c *replicatedCmd) FinishAndAckOutcome(ctx context.Context) error {
 	tracing.FinishSpan(c.sp)
 	if c.IsLocal() {
-		c.proposal.finishApplication(c.response)
+		c.proposal.finishApplication(ctx, c.response)
 	}
 	return nil
 }

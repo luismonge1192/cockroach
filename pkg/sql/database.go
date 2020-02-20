@@ -17,7 +17,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -72,17 +71,6 @@ func makeDatabaseDesc(p *tree.CreateDatabase) sqlbase.DatabaseDescriptor {
 	}
 }
 
-// getKeysForDatabaseDescriptor retrieves the KV keys corresponding to
-// the zone, name and descriptor of a database.
-func getKeysForDatabaseDescriptor(
-	dbDesc *sqlbase.DatabaseDescriptor,
-) (zoneKey roachpb.Key, nameKey roachpb.Key, descKey roachpb.Key) {
-	zoneKey = config.MakeZoneKey(uint32(dbDesc.ID))
-	nameKey = sqlbase.NewDatabaseKey(dbDesc.GetName()).Key()
-	descKey = sqlbase.MakeDescMetadataKey(dbDesc.ID)
-	return
-}
-
 // getDatabaseID resolves a database name into a database ID.
 // Returns InvalidID on failure.
 func getDatabaseID(
@@ -91,11 +79,11 @@ func getDatabaseID(
 	if name == sqlbase.SystemDB.Name {
 		return sqlbase.SystemDB.ID, nil
 	}
-	dbID, err := getDescriptorID(ctx, txn, sqlbase.NewDatabaseKey(name))
+	found, dbID, err := sqlbase.LookupDatabaseID(ctx, txn, name)
 	if err != nil {
 		return sqlbase.InvalidID, err
 	}
-	if dbID == sqlbase.InvalidID && required {
+	if !found && required {
 		return dbID, sqlbase.NewUndefinedDatabaseError(name)
 	}
 	return dbID, nil
@@ -258,10 +246,16 @@ func (dc *databaseCache) getCachedDatabaseID(name string) (sqlbase.ID, error) {
 		return sqlbase.SystemDB.ID, nil
 	}
 
-	nameKey := sqlbase.NewDatabaseKey(name)
+	var nameKey sqlbase.DescriptorKey = sqlbase.NewDatabaseKey(name)
 	nameVal := dc.systemConfig.GetValue(nameKey.Key())
 	if nameVal == nil {
-		return sqlbase.InvalidID, nil
+		// Try the deprecated system.namespace before returning InvalidID.
+		// TODO(solon): This can be removed in 20.2.
+		nameKey = sqlbase.NewDeprecatedDatabaseKey(name)
+		nameVal = dc.systemConfig.GetValue(nameKey.Key())
+		if nameVal == nil {
+			return sqlbase.InvalidID, nil
+		}
 	}
 
 	id, err := nameVal.GetInt()
@@ -278,8 +272,15 @@ func (p *planner) renameDatabase(
 		return err
 	}
 
-	oldKey := sqlbase.NewDatabaseKey(oldName).Key()
-	newKey := sqlbase.NewDatabaseKey(newName).Key()
+	if exists, _, err := sqlbase.LookupDatabaseID(ctx, p.txn, newName); err == nil && exists {
+		return pgerror.Newf(pgcode.DuplicateDatabase,
+			"the new database name %q already exists", newName)
+	} else if err != nil {
+		return err
+	}
+
+	newKey := sqlbase.MakeDatabaseNameKey(ctx, p.ExecCfg().Settings, newName).Key()
+
 	descID := oldDesc.GetID()
 	descKey := sqlbase.MakeDescMetadataKey(descID)
 	descDesc := sqlbase.WrapDescriptor(oldDesc)
@@ -288,22 +289,18 @@ func (p *planner) renameDatabase(
 	if p.ExtendedEvalContext().Tracing.KVTracingEnabled() {
 		log.VEventf(ctx, 2, "CPut %s -> %d", newKey, descID)
 		log.VEventf(ctx, 2, "Put %s -> %s", descKey, descDesc)
-		log.VEventf(ctx, 2, "Del %s", oldKey)
 	}
 	b.CPut(newKey, descID, nil)
 	b.Put(descKey, descDesc)
-	b.Del(oldKey)
+	err := sqlbase.RemoveDatabaseNamespaceEntry(
+		ctx, p.txn, oldName, p.ExtendedEvalContext().Tracing.KVTracingEnabled(),
+	)
+	if err != nil {
+		return err
+	}
 
 	p.Tables().addUncommittedDatabase(oldName, descID, dbDropped)
 	p.Tables().addUncommittedDatabase(newName, descID, dbCreated)
 
-	if err := p.txn.Run(ctx, b); err != nil {
-		if _, ok := err.(*roachpb.ConditionFailedError); ok {
-			return pgerror.Newf(pgcode.DuplicateDatabase,
-				"the new database name %q already exists", newName)
-		}
-		return err
-	}
-
-	return nil
+	return p.txn.Run(ctx, b)
 }

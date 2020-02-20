@@ -41,7 +41,7 @@ func setTimestampCacheLowWaterMark(
 // mark for the timestamp at which mutations to keys overlapping the provided
 // request can write, such that they don't re-write history.
 func (r *Replica) updateTimestampCache(
-	ba *roachpb.BatchRequest, br *roachpb.BatchResponse, pErr *roachpb.Error,
+	ctx context.Context, ba *roachpb.BatchRequest, br *roachpb.BatchResponse, pErr *roachpb.Error,
 ) {
 	addToTSCache := r.store.tsCache.Add
 	if util.RaceEnabled {
@@ -74,79 +74,83 @@ func (r *Replica) updateTimestampCache(
 		header := args.Header()
 		start, end := header.Key, header.EndKey
 		switch t := args.(type) {
-		case *roachpb.EndTransactionRequest:
-			// EndTransaction requests that finalize their transaction add the
-			// transaction key to the write timestamp cache as a tombstone to
-			// ensure replays and concurrent requests aren't able to recreate
-			// the transaction record.
+		case *roachpb.EndTxnRequest:
+			// EndTxn requests that finalize their transaction record a
+			// tombstone in the timestamp cache to ensure replays and concurrent
+			// requests aren't able to recreate the transaction record.
 			//
 			// It inserts the timestamp of the final batch in the transaction.
 			// This timestamp must necessarily be equal to or greater than the
 			// transaction's MinTimestamp, which is consulted in
 			// CanCreateTxnRecord.
 			if br.Txn.Status.IsFinalized() {
-				key := keys.TransactionKey(start, txnID)
-				addToTSCache(key, nil, ts, txnID, false /* readCache */)
+				key := transactionTombstoneMarker(start, txnID)
+				addToTSCache(key, nil, ts, txnID)
 			}
 		case *roachpb.RecoverTxnRequest:
 			// A successful RecoverTxn request may or may not have finalized the
-			// transaction that it was trying to recover. If so, then we add the
-			// transaction's key to the write timestamp cache as a tombstone to
-			// ensure that replays and concurrent requests aren't able to
-			// recreate the transaction record. This parallels what we do in the
-			// EndTransaction request case.
+			// transaction that it was trying to recover. If so, then we record
+			// a tombstone to the timestamp cache to ensure that replays and
+			// concurrent requests aren't able to recreate the transaction record.
+			// This parallels what we do in the EndTxn request case.
 			//
 			// Insert the timestamp of the batch, which we asserted during
 			// command evaluation was equal to or greater than the transaction's
 			// MinTimestamp.
 			recovered := br.Responses[i].GetInner().(*roachpb.RecoverTxnResponse).RecoveredTxn
 			if recovered.Status.IsFinalized() {
-				key := keys.TransactionKey(start, recovered.ID)
-				addToTSCache(key, nil, ts, recovered.ID, false /* readCache */)
+				key := transactionTombstoneMarker(start, recovered.ID)
+				addToTSCache(key, nil, ts, recovered.ID)
 			}
 		case *roachpb.PushTxnRequest:
 			// A successful PushTxn request bumps the timestamp cache for
 			// the pushee's transaction key. The pushee will consult the
 			// timestamp cache when creating its record. If the push left
 			// the transaction in a PENDING state (PUSH_TIMESTAMP) then we
-			// update the read timestamp cache. This will cause the creator
+			// update the timestamp cache. This will cause the creator
 			// of the transaction record to forward its provisional commit
 			// timestamp to honor the result of this push. If the push left
 			// the transaction in an ABORTED state (PUSH_ABORT) then we
-			// update the write timestamp cache. This will prevent the
-			// creation of the transaction record entirely.
+			// update the a special record in the timestamp cache. This will prevent
+			// the creation of the transaction record entirely.
 			pushee := br.Responses[i].GetInner().(*roachpb.PushTxnResponse).PusheeTxn
 
-			var readCache bool
+			var tombstone bool
 			switch pushee.Status {
 			case roachpb.PENDING:
-				readCache = true
+				tombstone = false
 			case roachpb.ABORTED:
-				readCache = false
+				tombstone = true
 			case roachpb.STAGING:
 				// No need to update the timestamp cache. If a transaction
 				// is in this state then it must have a transaction record.
 				continue
 			case roachpb.COMMITTED:
 				// No need to update the timestamp cache. It was already
-				// updated by the corresponding EndTransaction request.
+				// updated by the corresponding EndTxn request.
 				continue
 			}
-			key := keys.TransactionKey(start, pushee.ID)
-			addToTSCache(key, nil, pushee.WriteTimestamp, t.PusherTxn.ID, readCache)
+
+			var key roachpb.Key
+			if tombstone {
+				key = transactionTombstoneMarker(start, pushee.ID)
+			} else {
+				key = transactionPushMarker(start, pushee.ID)
+			}
+			addToTSCache(key, nil, pushee.WriteTimestamp, t.PusherTxn.ID)
 		case *roachpb.ConditionalPutRequest:
 			// ConditionalPut only updates on ConditionFailedErrors. On other
 			// errors, no information is returned. On successful writes, the
 			// intent already protects against writes underneath the read.
 			if _, ok := pErr.GetDetail().(*roachpb.ConditionFailedError); ok {
-				addToTSCache(start, end, ts, txnID, true /* readCache */)
+				addToTSCache(start, end, ts, txnID)
 			}
 		case *roachpb.InitPutRequest:
 			// InitPut only updates on ConditionFailedErrors. On other errors,
 			// no information is returned. On successful writes, the intent
 			// already protects against writes underneath the read.
 			if _, ok := pErr.GetDetail().(*roachpb.ConditionFailedError); ok {
-				addToTSCache(start, end, ts, txnID, true /* readCache */)
+				addToTSCache(start, end, ts, txnID)
 			}
 		case *roachpb.ScanRequest:
 			resp := br.Responses[i].GetInner().(*roachpb.ScanResponse)
@@ -156,7 +160,7 @@ func (r *Replica) updateTimestampCache(
 				// end key for the span to update the timestamp cache.
 				end = resp.ResumeSpan.Key
 			}
-			addToTSCache(start, end, ts, txnID, true /* readCache */)
+			addToTSCache(start, end, ts, txnID)
 		case *roachpb.ReverseScanRequest:
 			resp := br.Responses[i].GetInner().(*roachpb.ReverseScanResponse)
 			if resp.ResumeSpan != nil {
@@ -166,7 +170,7 @@ func (r *Replica) updateTimestampCache(
 				// the span to update the timestamp cache.
 				start = resp.ResumeSpan.EndKey
 			}
-			addToTSCache(start, end, ts, txnID, true /* readCache */)
+			addToTSCache(start, end, ts, txnID)
 		case *roachpb.QueryIntentRequest:
 			missing := false
 			if pErr != nil {
@@ -196,10 +200,10 @@ func (r *Replica) updateTimestampCache(
 				// an empty transaction ID so that we block the intent
 				// regardless of whether it is part of the current batch's
 				// transaction or not.
-				addToTSCache(start, end, t.Txn.WriteTimestamp, uuid.UUID{}, true /* readCache */)
+				addToTSCache(start, end, t.Txn.WriteTimestamp, uuid.UUID{})
 			}
 		default:
-			addToTSCache(start, end, ts, txnID, !roachpb.UpdatesWriteTimestampCache(args))
+			addToTSCache(start, end, ts, txnID)
 		}
 	}
 }
@@ -212,14 +216,14 @@ func checkedTSCacheUpdate(
 	ba *roachpb.BatchRequest,
 	br *roachpb.BatchResponse,
 	pErr *roachpb.Error,
-) func(roachpb.Key, roachpb.Key, hlc.Timestamp, uuid.UUID, bool) {
-	return func(start, end roachpb.Key, ts hlc.Timestamp, txnID uuid.UUID, readCache bool) {
+) func(roachpb.Key, roachpb.Key, hlc.Timestamp, uuid.UUID) {
+	return func(start, end roachpb.Key, ts hlc.Timestamp, txnID uuid.UUID) {
 		if now.Less(ts) {
 			panic(fmt.Sprintf("Unsafe timestamp cache update! Cannot add timestamp %s to timestamp "+
 				"cache after evaluating %v (resp=%v; err=%v) with local hlc clock at timestamp %s. "+
 				"The timestamp cache update could be lost on a lease transfer.", ts, ba, br, pErr, now))
 		}
-		tc.Add(start, end, ts, txnID, readCache)
+		tc.Add(start, end, ts, txnID)
 	}
 }
 
@@ -247,9 +251,9 @@ func init() {
 // timestamp.
 //
 // minReadTS is used as a per-request low water mark for the value returned from
-// the read timestamp cache. That is, if the read timestamp cache returns a
-// value below minReadTS, minReadTS (without an associated txn id) will be used
-// instead to adjust the batch's timestamp.
+// the timestamp cache. That is, if the timestamp cache returns a value below
+// minReadTS, minReadTS (without an associated txn id) will be used instead to
+// adjust the batch's timestamp.
 func (r *Replica) applyTimestampCache(
 	ctx context.Context, ba *roachpb.BatchRequest, minReadTS hlc.Timestamp,
 ) bool {
@@ -264,7 +268,7 @@ func (r *Replica) applyTimestampCache(
 			header := args.Header()
 
 			// Forward the timestamp if there's been a more recent read (by someone else).
-			rTS, rTxnID := r.store.tsCache.GetMaxRead(header.Key, header.EndKey)
+			rTS, rTxnID := r.store.tsCache.GetMax(header.Key, header.EndKey)
 			var forwardedToMinReadTS bool
 			if rTS.Forward(minReadTS) {
 				forwardedToMinReadTS = true
@@ -287,28 +291,6 @@ func (r *Replica) applyTimestampCache(
 			// appropriately if we did.
 			bumpedDueToMinReadTS = (!bumpedCurReq && bumpedDueToMinReadTS) || (bumpedCurReq && forwardedToMinReadTS)
 			bumped, bumpedCurReq = bumped || bumpedCurReq, false
-
-			// On more recent writes, forward the timestamp and set the
-			// write too old boolean for transactions. Note that currently
-			// only EndTransaction and DeleteRange requests update the
-			// write timestamp cache.
-			wTS, wTxnID := r.store.tsCache.GetMaxWrite(header.Key, header.EndKey)
-			nextWTS := wTS.Next()
-			if ba.Txn != nil {
-				if ba.Txn.ID != wTxnID {
-					if ba.Txn.WriteTimestamp.Less(nextWTS) {
-						txn := ba.Txn.Clone()
-						bumpedCurReq = txn.WriteTimestamp.Forward(nextWTS)
-						txn.WriteTooOld = true
-						ba.Txn = txn
-					}
-				}
-			} else {
-				bumpedCurReq = ba.Timestamp.Forward(nextWTS)
-			}
-			// Clear bumpedDueToMinReadTS if we just bumped due to the write tscache.
-			bumpedDueToMinReadTS = !bumpedCurReq && bumpedDueToMinReadTS
-			bumped = bumped || bumpedCurReq
 		}
 	}
 	if bumpedDueToMinReadTS {
@@ -328,59 +310,63 @@ func (r *Replica) applyTimestampCache(
 // to reject that transaction going forwards.
 //
 // The method performs two critical roles:
-// 1. It protects against replayed requests or new requests from a transaction's
-//    coordinator that could otherwise cause a transaction record to be created
-//    after the transaction has already been finalized and its record cleaned up.
-// 2. It serves as the mechanism by which successful push requests convey
-//    information to transactions who have not yet written their transaction
-//    record. In doing so, it ensures that transaction records are created with a
-//    sufficiently high timestamp after a successful PushTxn(TIMESTAMP) and ensures
-//    that transactions records are never created at all after a successful
-//    PushTxn(ABORT). As a result of this mechanism, a transaction never needs to
-//    explicitly create the transaction record for contending transactions.
+//
+//  1. It protects against replayed requests or new requests from a
+//     transaction's coordinator that could otherwise cause a transaction record
+//     to be created after the transaction has already been finalized and its
+//     record cleaned up.
+//
+//  2. It serves as the mechanism by which successful push requests convey
+//     information to transactions who have not yet written their transaction
+//     record. In doing so, it ensures that transaction records are created
+//     with a sufficiently high timestamp after a successful PushTxn(TIMESTAMP)
+//     and ensures that transactions records are never created at all after a
+//     successful PushTxn(ABORT). As a result of this mechanism, a transaction
+//     never needs to explicitly create the transaction record for contending
+//     transactions.
 //
 // This is detailed in the transaction record state machine below:
 //
-// +-----------------------------------+
-// | vars                              |
-// |-----------------------------------|
-// | v1 = rTSCache[txn.id] = timestamp |
-// | v2 = wTSCache[txn.id] = timestamp |
-// +-----------------------------------+
-// | operations                        |
-// |-----------------------------------|
-// | v -> t = forward v by timestamp t |
-// +-----------------------------------+
+//  +----------------------------------------------------+
+//  | vars                                               |
+//  |----------------------------------------------------|
+//  | v1 = tsCache[push_marker(txn.id)]      = timestamp |
+//  | v2 = tsCache[tombstone_marker(txn.id)] = timestamp |
+//  +----------------------------------------------------+
+//  | operations                                         |
+//  |----------------------------------------------------|
+//  | v -> t = forward v by timestamp t                  |
+//  +----------------------------------------------------+
 //
-//                  PushTxn(TIMESTAMP)                                HeartbeatTxn
-//                  then: v1 -> push.ts                             then: update record
-//                      +------+                                        +------+
-//    PushTxn(ABORT)    |      |        BeginTxn or HeartbeatTxn        |      |   PushTxn(TIMESTAMP)
-//   then: v2 -> txn.ts |      v        if: v2 < txn.orig               |      v  then: update record
-//                 +-----------------+  then: txn.ts -> v1      +--------------------+
-//            +----|                 |  else: fail              |                    |----+
-//            |    |                 |------------------------->|                    |    |
-//            |    |  no txn record  |                          | txn record written |    |
-//            +--->|                 |  EndTxn(STAGING)         |     [pending]      |<---+
-//                 |                 |__  if: v2 < txn.orig     |                    |
-//                 +-----------------+  \__ then: v2 -> txn.ts  +--------------------+
-//                    |            ^       \__ else: fail       _/   |            ^
-//                    |            |          \__             _/     |            |
-// EndTxn(!STAGING)   |            |             \__        _/       | EndTxn(STAGING)
-// if: v2 < txn.orig  |   Eager GC |                \____ _/______   |            |
-// then: v2 -> txn.ts |      or    |                    _/        \  |            | HeartbeatTxn
-// else: fail         |   GC queue |  /----------------/          |  |            | if: epoch update
-//                    v            | v    EndTxn(!STAGING)        v  v            |
-//                +--------------------+  or PushTxn(ABORT)     +--------------------+
-//                |                    |  then: v2 -> txn.ts    |                    |
-//           +--->|                    |<-----------------------|                    |----+
-//           |    | txn record written |                        | txn record written |    |
-//           |    |     [finalized]    |                        |      [staging]     |    |
-//           +----|                    |                        |                    |<---+
-//   PushTxn(*)   +--------------------+                        +--------------------+
-//   then: no-op                    ^   PushTxn(*) + RecoverTxn    |              EndTxn(STAGING)
-//                                  |     then: v2 -> txn.ts       |              or HeartbeatTxn
-//                                  +------------------------------+            then: update record
+//                   PushTxn(TIMESTAMP)                                HeartbeatTxn
+//                   then: v1 -> push.ts                             then: update record
+//                       +------+                                        +------+
+//     PushTxn(ABORT)    |      |        HeartbeatTxn                    |      |   PushTxn(TIMESTAMP)
+//    then: v2 -> txn.ts |      v        if: v2 < txn.orig               |      v  then: update record
+//                  +-----------------+  then: txn.ts -> v1      +--------------------+
+//             +----|                 |  else: fail              |                    |----+
+//             |    |                 |------------------------->|                    |    |
+//             |    |  no txn record  |                          | txn record written |    |
+//             +--->|                 |  EndTxn(STAGING)         |     [pending]      |<---+
+//                  |                 |__  if: v2 < txn.orig     |                    |
+//                  +-----------------+  \__ then: txn.ts -> v1  +--------------------+
+//                     |            ^       \__ else: fail       _/   |            ^
+//                     |            |          \__             _/     |            |
+//  EndTxn(!STAGING)   |            |             \__        _/       | EndTxn(STAGING)
+//  if: v2 < txn.orig  |   Eager GC |                \____ _/______   |            |
+//  then: v2 -> txn.ts |      or    |                    _/        \  |            | HeartbeatTxn
+//  else: fail         |   GC queue |  /----------------/          |  |            | if: epoch update
+//                     v            | v    EndTxn(!STAGING)        v  v            |
+//                 +--------------------+  or PushTxn(ABORT)     +--------------------+
+//                 |                    |  then: v2 -> txn.ts    |                    |
+//            +--->|                    |<-----------------------|                    |----+
+//            |    | txn record written |                        | txn record written |    |
+//            |    |     [finalized]    |                        |      [staging]     |    |
+//            +----|                    |                        |                    |<---+
+//    PushTxn(*)   +--------------------+                        +--------------------+
+//    then: no-op                    ^   PushTxn(*) + RecoverTxn    |              EndTxn(STAGING)
+//                                   |     then: v2 -> txn.ts       |              or HeartbeatTxn
+//                                   +------------------------------+            then: update record
 //
 //
 // In the diagram, CanCreateTxnRecord is consulted in all three of the
@@ -390,47 +376,49 @@ func (r *Replica) applyTimestampCache(
 // The are three separate simplifications to the transaction model that would
 // allow us to simplify this state machine:
 //
-// 1. as discussed on the comment on txnHeartbeater, it is reasonable to expect
-//    that we will eventually move away from tracking transaction liveness on a
-//    per-transaction basis. This means that we would no longer need transaction
-//    heartbeats and would never need to write a transaction record until a
-//    transaction is ready to complete.
+//  1. as discussed on the comment on txnHeartbeater, it is reasonable to expect
+//     that we will eventually move away from tracking transaction liveness on
+//     a per-transaction basis. This means that we would no longer need
+//     transaction heartbeats and would never need to write a transaction record
+//     until a transaction is ready to complete.
 //
-// 2. one of the two possibilities for the "txn record written [finalized]" state
-//    is that the transaction record is aborted. There used to be two reasons to
-//    persist transaction records with the ABORTED status. The first was because
-//    doing so was the only way for concurrent actors to prevent the record from
-//    being re-written by the transaction going forward. The concurrent actor would
-//    write an aborted transaction record and then wait for the GC to clean it up
-//    later. The other reasons for writing the transaction records with the ABORTED
-//    status was because these records could point at intents, which assisted the
-//    cleanup process for these intents. However, this only held for ABORTED
-//    records written on behalf of the transaction coordinator itself. If a
-//    transaction was aborted by a concurrent actor, its record would not
-//    immediately contain any of the transaction's intents.
+//  2. one of the two possibilities for the "txn record written [finalized]"
+//     state is that the transaction record is aborted. There used to be two
+//     reasons to persist transaction records with the ABORTED status. The first
+//     was because doing so was the only way for concurrent actors to prevent
+//     the record from being re-written by the transaction going forward. The
+//     concurrent actor would write an aborted transaction record and then wait
+//     for the GC to clean it up later. The other reasons for writing the
+//     transaction records with the ABORTED status was because these records
+//     could point at intents, which assisted the cleanup process for these
+//     intents. However, this only held for ABORTED records written on behalf
+//     of the transaction coordinator itself. If a transaction was aborted by a
+//     concurrent actor, its record would not immediately contain any of the
+//     transaction's intents.
 //
-//    The first reason here no longer holds. Concurrent actors now bump the write
-//    timestamp cache when aborting a transaction, which has the same effect as
-//    writing an ABORTED transaction record. The second reason still holds but is
-//    fairly weak. A transaction coordinator can kick off intent resolution for an
-//    aborted transaction without needing to write these intents into the record
-//    itself. In the worst case, this intent resolution fails and each intent is
-//    cleaned up individually as it is discovered. All in all, neither
-//    justification for this state holds much weight anymore.
+//     The first reason here no longer holds. Concurrent actors now bump the
+//     timestamp cache when aborting a transaction, which has the same
+//     effect as writing an ABORTED transaction record. See the "tombstone
+//     marker". The second reason still holds but is fairly weak. A transaction
+//     coordinator can kick off intent resolution for an aborted transaction
+//     without needing to write these intents into the record itself. In the
+//     worst case, this intent resolution fails and each intent is cleaned up
+//     individually as it is discovered. All in all, neither justification for
+//     this state holds much weight anymore.
 //
-// 3. the other possibility for the "txn record written [finalized]" state is that
-//    the transaction record is committed. This state is currently critical for the
-//    transaction model because intent resolution cannot begin before a transaction
-//    record enters this state. However, this doesn't need to be the case forever.
-//    There are proposals to modify the state of committed key-value writes
-//    slightly such that intent resolution could be run for implicitly committed
-//    transactions while their transaction record remains in the  "txn record
-//    written [staging]" state. For this to work, the recovery mechanism for
-//    indeterminate commit errors would need to be able to determine whether an
-//    intent or a **committed value** indicated the success of a write that was
-//    in-flight at the time the transaction record was staged. This poses
-//    challenges migration and garbage collection, but it would have a number of
-//    performance benefits.
+//  3. the other possibility for the "txn record written [finalized]" state is
+//     that the transaction record is committed. This state is currently
+//     critical for the transaction model because intent resolution cannot begin
+//     before a transaction record enters this state. However, this doesn't need
+//     to be the case forever. There are proposals to modify the state of
+//     committed key-value writes slightly such that intent resolution could be
+//     run for implicitly committed transactions while their transaction record
+//     remains in the  "txn record written [staging]" state. For this to work,
+//     the recovery mechanism for indeterminate commit errors would need to be
+//     able to determine whether an intent or a **committed value** indicated
+//     the success of a write that was in-flight at the time the transaction
+//     record was staged. This poses challenges migration and garbage
+//     collection, but it would have a number of performance benefits.
 //
 // If we were to perform change #1, we could remove the "txn record written
 // [pending]" state. If we were to perform change #2 and #3, we could remove the
@@ -444,57 +432,76 @@ func (r *Replica) CanCreateTxnRecord(
 ) (ok bool, minCommitTS hlc.Timestamp, reason roachpb.TransactionAbortedReason) {
 	// Consult the timestamp cache with the transaction's key. The timestamp
 	// cache is used in two ways for transactions without transaction records.
-	// The read timestamp cache is used to push the timestamp of transactions
-	// that don't have transaction records. The write timestamp cache is used
+	// The timestamp cache is used to push the timestamp of transactions
+	// that don't have transaction records. The timestamp cache is used
 	// to abort transactions entirely that don't have transaction records.
 	//
 	// Using this strategy, we enforce the invariant that only requests sent
 	// from a transaction's own coordinator can create its transaction record.
 	// However, once a transaction record is written, other concurrent actors
 	// can modify it. This is reflected in the diagram above.
-	key := keys.TransactionKey(txnKey, txnID)
+	tombstoneKey := transactionTombstoneMarker(txnKey, txnID)
+	pushKey := transactionPushMarker(txnKey, txnID)
 
-	// Look in the read timestamp cache to see if there is an entry for this
+	// Look in the timestamp cache to see if there is an entry for this
 	// transaction, which indicates the minimum timestamp that the transaction
 	// can commit at. This is used by pushers to push the timestamp of a
 	// transaction that hasn't yet written its transaction record.
-	minCommitTS, _ = r.store.tsCache.GetMaxRead(key, nil /* end */)
+	minCommitTS, _ = r.store.tsCache.GetMax(pushKey, nil /* end */)
 
-	// Also look in the write timestamp cache to see if there is an entry for
+	// Also look in the timestamp cache to see if there is a tombstone entry for
 	// this transaction, which would indicate this transaction has already been
 	// finalized or was already aborted by a concurrent transaction. If there is
 	// an entry, then we return a retriable error: if this is a re-evaluation,
 	// then the error will be transformed into an ambiguous one higher up.
 	// Otherwise, if the client is still waiting for a result, then this cannot
 	// be a "replay" of any sort.
-	wTS, wTxnID := r.store.tsCache.GetMaxWrite(key, nil /* end */)
+	tombstoneTimestamp, tombstomeTxnID := r.store.tsCache.GetMax(tombstoneKey, nil /* end */)
 	// Compare against the minimum timestamp that the transaction could have
 	// written intents at.
-	if !wTS.Less(txnMinTS) {
-		switch wTxnID {
+	if txnMinTS.LessEq(tombstoneTimestamp) {
+		switch tombstomeTxnID {
 		case txnID:
-			// If we find our own transaction ID then an EndTransaction request
-			// sent by our coordinator has already been processed. We might be a
-			// replay, or we raced with an asynchronous abort. Either way, return
-			// an error.
-			return false, minCommitTS, roachpb.ABORT_REASON_ALREADY_COMMITTED_OR_ROLLED_BACK_POSSIBLE_REPLAY
+			// If we find our own transaction ID then an EndTxn request sent by
+			// our coordinator has already been processed. We might be a replay,
+			// or we raced with an asynchronous abort. Either way, return an
+			// error.
+			return false, hlc.Timestamp{},
+				roachpb.ABORT_REASON_ALREADY_COMMITTED_OR_ROLLED_BACK_POSSIBLE_REPLAY
 		case uuid.Nil:
-			// On lease transfers the timestamp cache is reset with the transfer
-			// time as the low water mark. The timestamp cache may also lose
-			// information when bumping its low water mark due to memory
-			// constraints. If this replica recently obtained the lease or if
-			// the timestamp cache recently bumped its low water mark, this case
-			// will be true for new txns, even if they're not a replay. We force
-			// these txns to retry.
-			return false, minCommitTS, roachpb.ABORT_REASON_TIMESTAMP_CACHE_REJECTED_POSSIBLE_REPLAY
+			lease, _ /* nextLease */ := r.GetLease()
+			// Recognize the case where a lease started recently. Lease transfers bump
+			// the ts cache low water mark.
+			if tombstoneTimestamp == lease.Start {
+				return false, hlc.Timestamp{}, roachpb.ABORT_REASON_NEW_LEASE_PREVENTS_TXN
+			}
+			return false, hlc.Timestamp{}, roachpb.ABORT_REASON_TIMESTAMP_CACHE_REJECTED
 		default:
 			// If we find another transaction's ID then that transaction has
 			// aborted us before our transaction record was written. It obeyed
 			// the restriction that it couldn't create a transaction record for
-			// us, so it bumped the write timestamp cache instead to prevent us
+			// us, so it recorded a tombstone cache instead to prevent us
 			// from ever creating a transaction record.
-			return false, minCommitTS, roachpb.ABORT_REASON_ABORTED_RECORD_FOUND
+			return false, hlc.Timestamp{}, roachpb.ABORT_REASON_ABORTED_RECORD_FOUND
 		}
 	}
 	return true, minCommitTS, 0
+}
+
+// transactionTombstoneMarker returns the key used as a marker indicating that a
+// particular txn was finalized (i.e. by an EndTransaction, RecoverTxn or
+// PushTxn(Abort)). It is used as a marker in the timestamp cache serving as a
+// guard against creating a transaction record after the transaction record has
+// been cleaned up (i.e. by a BeginTxn being evaluated out of order or arriving
+// after another txn Push(Abort)'ed the txn).
+func transactionTombstoneMarker(key roachpb.Key, txnID uuid.UUID) roachpb.Key {
+	return append(keys.TransactionKey(key, txnID), []byte("-tmbs")...)
+}
+
+// transactionPushMarker returns the key used by the marker indicating that a
+// particular txn was pushed before writing its transaction record. It is used
+// as a marker in the timestamp cache indicating that the transaction was pushed
+// in case the push happens before there's a transaction record.
+func transactionPushMarker(key roachpb.Key, txnID uuid.UUID) roachpb.Key {
+	return append(keys.TransactionKey(key, txnID), []byte("-push")...)
 }

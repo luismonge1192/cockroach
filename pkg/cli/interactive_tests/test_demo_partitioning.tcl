@@ -21,8 +21,10 @@ expect {
       report "License server could not be reached - skipping with no error"
       exit 0
   }
-  "movr>" {}
+  "Partitioning the demo database, please wait..." {}
 }
+
+eexpect "movr>"
 
 send "SELECT count(*) AS NRPARTS FROM \[SHOW PARTITIONS FROM DATABASE movr\];\r"
 eexpect "nrparts"
@@ -97,7 +99,7 @@ start_test "Expect an error if geo-partitioning is requested and license acquisi
 set env(COCKROACH_SKIP_ENABLING_DIAGNOSTIC_REPORTING) "true"
 spawn $argv demo --geo-partitioned-replicas
 # expect a failure
-eexpect Error
+eexpect ERROR:
 eexpect "enterprise features are needed for this demo"
 # clean up after the test
 eexpect eof

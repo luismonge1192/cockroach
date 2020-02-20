@@ -132,8 +132,8 @@ type ProposalData struct {
 //
 // The method is safe to call more than once, but only the first result will be
 // returned to the client.
-func (proposal *ProposalData) finishApplication(pr proposalResult) {
-	proposal.ec.done(proposal.Request, pr.Reply, pr.Err)
+func (proposal *ProposalData) finishApplication(ctx context.Context, pr proposalResult) {
+	proposal.ec.done(ctx, proposal.Request, pr.Reply, pr.Err)
 	proposal.signalProposalResult(pr)
 	if proposal.sp != nil {
 		tracing.FinishSpan(proposal.sp)
@@ -590,7 +590,7 @@ func addSSTablePreApply(
 	return copied
 }
 
-func (r *Replica) handleLocalEvalResult(ctx context.Context, lResult result.LocalResult) {
+func (r *Replica) handleReadWriteLocalEvalResult(ctx context.Context, lResult result.LocalResult) {
 	// Fields for which no action is taken in this method are zeroed so that
 	// they don't trigger an assertion at the end of the method (which checks
 	// that all fields were handled).
@@ -598,19 +598,22 @@ func (r *Replica) handleLocalEvalResult(ctx context.Context, lResult result.Loca
 		lResult.Reply = nil
 	}
 
-	// ======================
-	// Non-state updates and actions.
-	// ======================
-
 	// The caller is required to detach and handle the following three fields.
-	if lResult.Intents != nil {
-		log.Fatalf(ctx, "LocalEvalResult.Intents should be nil: %+v", lResult.Intents)
+	if lResult.EncounteredIntents != nil {
+		log.Fatalf(ctx, "LocalEvalResult.EncounteredIntents should be nil: %+v", lResult.EncounteredIntents)
 	}
 	if lResult.EndTxns != nil {
 		log.Fatalf(ctx, "LocalEvalResult.EndTxns should be nil: %+v", lResult.EndTxns)
 	}
 	if lResult.MaybeWatchForMerge {
 		log.Fatalf(ctx, "LocalEvalResult.MaybeWatchForMerge should be false")
+	}
+
+	if lResult.UpdatedTxns != nil {
+		for _, txn := range lResult.UpdatedTxns {
+			r.txnWaitQueue.UpdateTxn(ctx, txn)
+		}
+		lResult.UpdatedTxns = nil
 	}
 
 	if lResult.GossipFirstRange {
@@ -648,6 +651,7 @@ func (r *Replica) handleLocalEvalResult(ctx context.Context, lResult result.Loca
 		}
 		lResult.MaybeGossipSystemConfig = false
 	}
+
 	if lResult.MaybeGossipNodeLiveness != nil {
 		if err := r.MaybeGossipNodeLiveness(ctx, *lResult.MaybeGossipNodeLiveness); err != nil {
 			log.Error(ctx, err)
@@ -660,14 +664,7 @@ func (r *Replica) handleLocalEvalResult(ctx context.Context, lResult result.Loca
 		lResult.Metrics = nil
 	}
 
-	if lResult.UpdatedTxns != nil {
-		for _, txn := range *lResult.UpdatedTxns {
-			r.txnWaitQueue.UpdateTxn(ctx, txn)
-			lResult.UpdatedTxns = nil
-		}
-	}
-
-	if (lResult != result.LocalResult{}) {
+	if !lResult.IsZero() {
 		log.Fatalf(ctx, "unhandled field in LocalEvalResult: %s", pretty.Diff(lResult, result.LocalResult{}))
 	}
 }
@@ -675,10 +672,10 @@ func (r *Replica) handleLocalEvalResult(ctx context.Context, lResult result.Loca
 // proposalResult indicates the result of a proposal. Exactly one of
 // Reply and Err is set, and it represents the result of the proposal.
 type proposalResult struct {
-	Reply   *roachpb.BatchResponse
-	Err     *roachpb.Error
-	Intents []result.IntentsWithArg
-	EndTxns []result.EndTxnIntents
+	Reply              *roachpb.BatchResponse
+	Err                *roachpb.Error
+	EncounteredIntents []roachpb.Intent
+	EndTxns            []result.EndTxnIntents
 }
 
 // evaluateProposal generates a Result from the given request by
@@ -711,7 +708,9 @@ func (r *Replica) evaluateProposal(
 	// Note: reusing the proposer's batch when applying the command on the
 	// proposer was explored as an optimization but resulted in no performance
 	// benefit.
-	defer batch.Close()
+	if batch != nil {
+		defer batch.Close()
+	}
 
 	if pErr != nil {
 		pErr = r.maybeSetCorrupt(ctx, pErr)
@@ -723,12 +722,12 @@ func (r *Replica) evaluateProposal(
 
 		// Failed proposals can't have any Result except for what's
 		// whitelisted here.
-		intents := res.Local.DetachIntents()
+		intents := res.Local.DetachEncounteredIntents()
 		endTxns := res.Local.DetachEndTxns(true /* alwaysOnly */)
 		res.Local = result.LocalResult{
-			Intents: &intents,
-			EndTxns: &endTxns,
-			Metrics: res.Local.Metrics,
+			EncounteredIntents: intents,
+			EndTxns:            endTxns,
+			Metrics:            res.Local.Metrics,
 		}
 		res.Replicated.Reset()
 		return &res, false /* needConsensus */, pErr
@@ -746,12 +745,9 @@ func (r *Replica) evaluateProposal(
 	// 2. the request had an impact on the MVCCStats. NB: this is possible
 	//    even with an empty write batch when stats are recomputed.
 	// 3. the request has replicated side-effects.
-	// 4. the cluster is in "clockless" mode, in which case consensus is
-	//    used to enforce a linearization of all reads and writes.
 	needConsensus := !batch.Empty() ||
 		ms != (enginepb.MVCCStats{}) ||
-		!res.Replicated.Equal(storagepb.ReplicatedEvalResult{}) ||
-		r.store.Clock().MaxOffset() == timeutil.ClocklessMaxOffset
+		!res.Replicated.Equal(storagepb.ReplicatedEvalResult{})
 
 	if needConsensus {
 		// Set the proposal's WriteBatch, which is the serialized representation of

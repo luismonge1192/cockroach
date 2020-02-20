@@ -14,7 +14,9 @@ import (
 	"context"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 )
 
@@ -44,7 +46,7 @@ func (p *planner) CreateDatabase(ctx context.Context, n *tree.CreateDatabase) (p
 		if !(strings.EqualFold(enc, "UTF8") ||
 			strings.EqualFold(enc, "UTF-8") ||
 			strings.EqualFold(enc, "UNICODE")) {
-			return nil, unimplemented.Newf("create.db.encoding",
+			return nil, unimplemented.NewWithIssueDetailf(35882, "create.db.encoding",
 				"unsupported encoding: %s", enc)
 		}
 	}
@@ -52,7 +54,7 @@ func (p *planner) CreateDatabase(ctx context.Context, n *tree.CreateDatabase) (p
 	if col := n.Collate; col != "" {
 		// We only support C and C.UTF-8.
 		if col != "C" && col != "C.UTF-8" {
-			return nil, unimplemented.Newf("create.db.collation",
+			return nil, unimplemented.NewWithIssueDetailf(16618, "create.db.collation",
 				"unsupported collation: %s", col)
 		}
 	}
@@ -60,7 +62,7 @@ func (p *planner) CreateDatabase(ctx context.Context, n *tree.CreateDatabase) (p
 	if ctype := n.CType; ctype != "" {
 		// We only support C and C.UTF-8.
 		if ctype != "C" && ctype != "C.UTF-8" {
-			return nil, unimplemented.Newf("create.db.classification",
+			return nil, unimplemented.NewWithIssueDetailf(35882, "create.db.classification",
 				"unsupported character classification: %s", ctype)
 		}
 	}
@@ -73,6 +75,7 @@ func (p *planner) CreateDatabase(ctx context.Context, n *tree.CreateDatabase) (p
 }
 
 func (n *createDatabaseNode) startExec(params runParams) error {
+	telemetry.Inc(sqltelemetry.SchemaChangeCreate("database"))
 	desc := makeDatabaseDesc(n.n)
 
 	created, err := params.p.createDatabase(params.ctx, &desc, n.n.IfNotExists)

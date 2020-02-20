@@ -24,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -32,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/jackc/pgx"
 	"github.com/pkg/errors"
@@ -260,7 +262,27 @@ func (f *jobFeed) fetchJobError() error {
 
 func (f *jobFeed) Pause() error {
 	_, err := f.db.Exec(`PAUSE JOB $1`, f.JobID)
-	return err
+	if err != nil {
+		return err
+	}
+	// PAUSE JOB does not actually pause the job but only sends a request for
+	// it. Actually block until the job state changes.
+	opts := retry.Options{
+		InitialBackoff: 1 * time.Millisecond,
+		MaxBackoff:     time.Second,
+		Multiplier:     2,
+	}
+	ctx := context.Background()
+	return retry.WithMaxAttempts(ctx, opts, 10, func() error {
+		var status string
+		if err := f.db.QueryRowContext(ctx, `SELECT status FROM system.jobs WHERE id = $1`, f.JobID).Scan(&status); err != nil {
+			return err
+		}
+		if jobs.Status(status) != jobs.StatusPaused {
+			return errors.New("could not pause job")
+		}
+		return nil
+	})
 }
 
 func (f *jobFeed) Resume() error {
@@ -613,10 +635,20 @@ func (c *cloudFeed) Next() (*TestFeedMessage, error) {
 	}
 }
 
-func (c *cloudFeed) walkDir(path string, info os.FileInfo, _ error) error {
+func (c *cloudFeed) walkDir(path string, info os.FileInfo, err error) error {
 	if strings.HasSuffix(path, `.tmp`) {
 		// File in the process of being written by ExternalStorage. Ignore.
 		return nil
+	}
+
+	if err != nil {
+		// From filepath.WalkFunc:
+		//  If there was a problem walking to the file or directory named by
+		//  path, the incoming error will describe the problem and the function
+		//  can decide how to handle that error (and Walk will not descend into
+		//  that directory). In the case of an error, the info argument will be
+		//  nil. If an error is returned, processing stops.
+		return err
 	}
 
 	if info.IsDir() {

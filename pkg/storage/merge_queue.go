@@ -97,8 +97,20 @@ func newMergeQueue(store *Store, db *client.DB, gossip *gossip.Gossip) *mergeQue
 	mq.baseQueue = newBaseQueue(
 		"merge", mq, store, gossip,
 		queueConfig{
-			maxSize:              defaultQueueMaxSize,
-			maxConcurrency:       mergeQueueConcurrency,
+			maxSize:        defaultQueueMaxSize,
+			maxConcurrency: mergeQueueConcurrency,
+			// TODO(ajwerner): Sometimes the merge queue needs to send multiple
+			// snapshots, but the timeout function here is configured based on the
+			// duration required to send a single snapshot. That being said, this
+			// timeout provides leeway for snapshots to be 10x slower than the
+			// specified rate and still respects the queue processing minimum timeout.
+			// While using the below function is certainly better than just using the
+			// default timeout, it would be better to have a function which takes into
+			// account how many snapshots processing will need to send. That might be
+			// hard to determine ahead of time. An alternative would be to calculate
+			// the timeout with a function that additionally considers the replication
+			// factor.
+			processTimeoutFunc:   makeQueueSnapshotTimeoutFunc(rebalanceSnapshotRate),
 			needsLease:           true,
 			needsSystemConfig:    true,
 			acceptsUnsplitRanges: false,
@@ -261,8 +273,8 @@ func (mq *mergeQueue) process(
 	// Use a lower threshold for load based splitting so we don't find ourselves
 	// in a situation where we keep merging ranges that would be split soon after
 	// by a small increase in load.
-	loadBasedSplitPossible := lhsRepl.SplitByLoadQPSThreshold() < 2*mergedQPS
-	if ok, _ := shouldSplitRange(mergedDesc, mergedStats, lhsRepl.GetMaxBytes(), sysCfg); ok || loadBasedSplitPossible {
+	conservativeLoadBasedSplitThreshold := 0.5 * lhsRepl.SplitByLoadQPSThreshold()
+	if ok, _ := shouldSplitRange(mergedDesc, mergedStats, lhsRepl.GetMaxBytes(), sysCfg); ok || mergedQPS >= conservativeLoadBasedSplitThreshold {
 		log.VEventf(ctx, 2,
 			"skipping merge to avoid thrashing: merged range %s may split "+
 				"(estimated size, estimated QPS: %d, %v)",
@@ -328,14 +340,15 @@ func (mq *mergeQueue) process(
 	}
 
 	log.VEventf(ctx, 2, "merging to produce range: %s-%s", mergedDesc.StartKey, mergedDesc.EndKey)
-	reason := fmt.Sprintf("lhs+rhs has (size=%s+%s qps=%.2f+%.2f --> %.2fqps) below threshold (size=%s, qps=%.2f)",
+	reason := fmt.Sprintf("lhs+rhs has (size=%s+%s=%s qps=%.2f+%.2f=%.2fqps) below threshold (size=%s, qps=%.2f)",
 		humanizeutil.IBytes(lhsStats.Total()),
 		humanizeutil.IBytes(rhsStats.Total()),
+		humanizeutil.IBytes(mergedStats.Total()),
 		lhsQPS,
 		rhsQPS,
 		mergedQPS,
-		humanizeutil.IBytes(mergedStats.Total()),
-		mergedQPS,
+		humanizeutil.IBytes(minBytes),
+		conservativeLoadBasedSplitThreshold,
 	)
 	_, pErr := lhsRepl.AdminMerge(ctx, roachpb.AdminMergeRequest{
 		RequestHeader: roachpb.RequestHeader{Key: lhsRepl.Desc().StartKey.AsRawKey()},

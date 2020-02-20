@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -43,8 +44,9 @@ const (
 	loginPath  = "/login"
 	logoutPath = "/logout"
 	// secretLength is the number of random bytes generated for session secrets.
-	secretLength      = 16
-	sessionCookieName = "session"
+	secretLength = 16
+	// SessionCookieName is the name of the cookie used for HTTP auth.
+	SessionCookieName = "session"
 )
 
 var webSessionTimeout = settings.RegisterPublicNonNegativeDurationSetting(
@@ -97,15 +99,6 @@ func (s *authenticationServer) UserLogin(
 		return nil, status.Errorf(
 			codes.Unauthenticated,
 			"no username was provided",
-		)
-	}
-
-	// Root user does not have a password, simply disallow this.
-	if username == security.RootUser {
-		return nil, status.Errorf(
-			codes.Unauthenticated,
-			"user %s must use certificate authentication instead of password authentication",
-			security.RootUser,
 		)
 	}
 
@@ -166,10 +159,11 @@ func (s *authenticationServer) UserLogout(
 	}
 
 	// Revoke the session.
-	if n, err := s.server.internalExecutor.Exec(
+	if n, err := s.server.internalExecutor.ExecEx(
 		ctx,
 		"revoke-auth-session",
 		nil, /* txn */
+		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 		`UPDATE system.web_sessions SET "revokedAt" = now() WHERE id = $1`,
 		sessionID,
 	); err != nil {
@@ -213,10 +207,12 @@ WHERE id = $1`
 		isRevoked    bool
 	)
 
-	row, err := s.server.internalExecutor.QueryRow(
+	row, err := s.server.internalExecutor.QueryRowEx(
 		ctx,
 		"lookup-auth-session",
-		nil /* txn */, sessionQuery, cookie.ID)
+		nil, /* txn */
+		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+		sessionQuery, cookie.ID)
 	if row == nil || err != nil {
 		return false, "", err
 	}
@@ -259,8 +255,8 @@ WHERE id = $1`
 func (s *authenticationServer) verifyPassword(
 	ctx context.Context, username string, password string,
 ) (bool, error) {
-	exists, hashedPassword, err := sql.GetUserHashedPassword(
-		ctx, s.server.execCfg.InternalExecutor, s.memMetrics, username,
+	exists, pwRetrieveFn, err := sql.GetUserHashedPassword(
+		ctx, s.server.execCfg.InternalExecutor, username,
 	)
 	if err != nil {
 		return false, err
@@ -268,7 +264,24 @@ func (s *authenticationServer) verifyPassword(
 	if !exists {
 		return false, nil
 	}
+	hashedPassword, err := pwRetrieveFn(ctx)
+	if err != nil {
+		return false, err
+	}
 	return (security.CompareHashAndPassword(hashedPassword, password) == nil), nil
+}
+
+// CreateAuthSecret creates a secret, hash pair to populate a session auth token.
+func CreateAuthSecret() (secret, hashedSecret []byte, err error) {
+	secret = make([]byte, secretLength)
+	if _, err := rand.Read(secret); err != nil {
+		return nil, nil, err
+	}
+
+	hasher := sha256.New()
+	_, _ = hasher.Write(secret)
+	hashedSecret = hasher.Sum(nil)
+	return secret, hashedSecret, nil
 }
 
 // newAuthSession attempts to create a new authentication session for the given
@@ -276,14 +289,11 @@ func (s *authenticationServer) verifyPassword(
 func (s *authenticationServer) newAuthSession(
 	ctx context.Context, username string,
 ) (int64, []byte, error) {
-	secret := make([]byte, secretLength)
-	if _, err := rand.Read(secret); err != nil {
+	secret, hashedSecret, err := CreateAuthSecret()
+	if err != nil {
 		return 0, nil, err
 	}
 
-	hasher := sha256.New()
-	_, _ = hasher.Write(secret)
-	hashedSecret := hasher.Sum(nil)
 	expiration := s.server.clock.PhysicalTime().Add(webSessionTimeout.Get(&s.server.st.SV))
 
 	insertSessionStmt := `
@@ -293,10 +303,11 @@ RETURNING id
 `
 	var id int64
 
-	row, err := s.server.internalExecutor.QueryRow(
+	row, err := s.server.internalExecutor.QueryRowEx(
 		ctx,
 		"create-auth-session",
 		nil, /* txn */
+		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 		insertSessionStmt,
 		hashedSecret,
 		username,
@@ -385,7 +396,7 @@ func EncodeSessionCookie(sessionCookie *serverpb.SessionCookie) (*http.Cookie, e
 
 func makeCookieWithValue(value string) *http.Cookie {
 	return &http.Cookie{
-		Name:     sessionCookieName,
+		Name:     SessionCookieName,
 		Value:    value,
 		Path:     "/",
 		HttpOnly: true,
@@ -400,7 +411,7 @@ func (am *authenticationMux) getSession(
 	w http.ResponseWriter, req *http.Request,
 ) (string, *serverpb.SessionCookie, error) {
 	// Validate the returned cookie.
-	rawCookie, err := req.Cookie(sessionCookieName)
+	rawCookie, err := req.Cookie(SessionCookieName)
 	if err != nil {
 		return "", nil, err
 	}

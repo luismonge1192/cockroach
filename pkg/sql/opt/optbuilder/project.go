@@ -46,10 +46,7 @@ func (b *Builder) constructProject(input memo.RelExpr, cols []scopeColumn) memo.
 			if scalar == nil {
 				passthrough.Add(id)
 			} else {
-				projections = append(projections, memo.ProjectionsItem{
-					Element:    scalar,
-					ColPrivate: memo.ColPrivate{Col: id},
-				})
+				projections = append(projections, b.factory.ConstructProjectionsItem(scalar, id))
 			}
 			colSet.Add(id)
 		}
@@ -228,7 +225,7 @@ func (b *Builder) finishBuildScalar(
 	}
 
 	// Avoid synthesizing a new column if possible.
-	if col := outScope.findExistingCol(texpr); col != nil && col != outCol {
+	if col := outScope.findExistingCol(texpr, false /* allowSideEffects */); col != nil && col != outCol {
 		outCol.id = col.id
 		outCol.scalar = scalar
 		return scalar
@@ -277,7 +274,7 @@ func (b *Builder) finishBuildScalarRef(
 	// column id before projection.
 	if isOuterColumn {
 		// Avoid synthesizing a new column if possible.
-		existing := outScope.findExistingCol(col)
+		existing := outScope.findExistingCol(col, false /* allowSideEffects */)
 		if existing == nil || existing == outCol {
 			if outCol.name == "" {
 				outCol.name = col.name

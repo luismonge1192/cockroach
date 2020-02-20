@@ -15,9 +15,26 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
+
+// SupportedAggFns contains all aggregate functions supported by the vectorized
+// engine.
+var SupportedAggFns = []execinfrapb.AggregatorSpec_Func{
+	execinfrapb.AggregatorSpec_ANY_NOT_NULL,
+	execinfrapb.AggregatorSpec_AVG,
+	execinfrapb.AggregatorSpec_SUM,
+	execinfrapb.AggregatorSpec_SUM_INT,
+	execinfrapb.AggregatorSpec_COUNT_ROWS,
+	execinfrapb.AggregatorSpec_COUNT,
+	execinfrapb.AggregatorSpec_MIN,
+	execinfrapb.AggregatorSpec_MAX,
+	execinfrapb.AggregatorSpec_BOOL_AND,
+	execinfrapb.AggregatorSpec_BOOL_OR,
+}
 
 // aggregateFunc is an aggregate function that performs computation on a batch
 // when Compute(batch) is called and writes the output to the Vec passed in
@@ -48,7 +65,8 @@ type aggregateFunc interface {
 	// index is carried over. Note that calling SetOutputIndex is a noop if
 	// CurrentOutputIndex returns a negative value (i.e. the aggregate function
 	// has not yet performed any computation). This method also has the side
-	// effect of clearing the output buffer past the given index.
+	// effect of clearing the NULLs bitmap of the output buffer past the given
+	// index.
 	SetOutputIndex(idx int)
 
 	// Compute computes the aggregation on the input batch. A zero-length input
@@ -196,7 +214,9 @@ func NewOrderedAggregator(
 	a.aggregateFuncs, a.outputTypes, err = makeAggregateFuncs(a.allocator, aggTypes, aggFns)
 
 	if err != nil {
-		return nil, err
+		return nil, errors.AssertionFailedf(
+			"this error should have been checked in isAggregateSupported\n%+v", err,
+		)
 	}
 
 	return a, nil
@@ -225,6 +245,10 @@ func makeAggregateFuncs(
 			funcs[i], err = newMinAgg(allocator, aggTyps[i][0])
 		case execinfrapb.AggregatorSpec_MAX:
 			funcs[i], err = newMaxAgg(allocator, aggTyps[i][0])
+		case execinfrapb.AggregatorSpec_BOOL_AND:
+			funcs[i] = newBoolAndAgg()
+		case execinfrapb.AggregatorSpec_BOOL_OR:
+			funcs[i] = newBoolOrAgg()
 		default:
 			return nil, nil, errors.Errorf("unsupported columnar aggregate function %s", aggFns[i].String())
 		}
@@ -285,46 +309,48 @@ func (a *orderedAggregator) Next(ctx context.Context) coldata.Batch {
 		// Copy the second part of the output batch into the first and resume from
 		// there.
 		newResumeIdx := a.scratch.resumeIdx - a.scratch.outputSize
-		for i := 0; i < len(a.outputTypes); i++ {
-			vec := a.scratch.ColVec(i)
-			// According to the aggregate function interface contract, the value at
-			// the current index must also be copied.
-			// Note that we're using Append here instead of Copy because we want the
-			// "truncation" behavior, i.e. we want to copy over the remaining tuples
-			// such the "lengths" of the vectors are equal to the number of copied
-			// elements.
-			a.allocator.Append(
-				vec,
-				coldata.SliceArgs{
-					Src:         vec,
-					ColType:     a.outputTypes[i],
-					DestIdx:     0,
-					SrcStartIdx: uint64(a.scratch.outputSize),
-					SrcEndIdx:   uint64(a.scratch.resumeIdx + 1),
-				},
-			)
-			// Now we need to restore the desired length for the Vec.
-			vec.SetLength(a.scratch.inputSize)
-			a.aggregateFuncs[i].SetOutputIndex(newResumeIdx)
-		}
+		a.allocator.PerformOperation(a.scratch.ColVecs(), func() {
+			for i := 0; i < len(a.outputTypes); i++ {
+				vec := a.scratch.ColVec(i)
+				// According to the aggregate function interface contract, the value at
+				// the current index must also be copied.
+				// Note that we're using Append here instead of Copy because we want the
+				// "truncation" behavior, i.e. we want to copy over the remaining tuples
+				// such the "lengths" of the vectors are equal to the number of copied
+				// elements.
+				vec.Append(
+					coldata.SliceArgs{
+						Src:         vec,
+						ColType:     a.outputTypes[i],
+						DestIdx:     0,
+						SrcStartIdx: uint64(a.scratch.outputSize),
+						SrcEndIdx:   uint64(a.scratch.resumeIdx + 1),
+					},
+				)
+				// Now we need to restore the desired length for the Vec.
+				vec.SetLength(a.scratch.inputSize)
+				a.aggregateFuncs[i].SetOutputIndex(newResumeIdx)
+			}
+		})
 		a.scratch.resumeIdx = newResumeIdx
 		if a.scratch.resumeIdx >= a.scratch.outputSize {
 			// We still have overflow output values.
 			a.scratch.SetLength(uint16(a.scratch.outputSize))
-			for i := 0; i < len(a.outputTypes); i++ {
-				a.allocator.Copy(
-					a.unsafeBatch.ColVec(i),
-					coldata.CopySliceArgs{
-						SliceArgs: coldata.SliceArgs{
-							Src:         a.scratch.ColVec(i),
-							ColType:     a.outputTypes[i],
-							SrcStartIdx: 0,
-							SrcEndIdx:   uint64(a.scratch.Length()),
+			a.allocator.PerformOperation(a.unsafeBatch.ColVecs(), func() {
+				for i := 0; i < len(a.outputTypes); i++ {
+					a.unsafeBatch.ColVec(i).Copy(
+						coldata.CopySliceArgs{
+							SliceArgs: coldata.SliceArgs{
+								Src:         a.scratch.ColVec(i),
+								ColType:     a.outputTypes[i],
+								SrcStartIdx: 0,
+								SrcEndIdx:   uint64(a.scratch.Length()),
+							},
 						},
-					},
-				)
-			}
-			a.unsafeBatch.SetLength(a.scratch.Length())
+					)
+				}
+				a.unsafeBatch.SetLength(a.scratch.Length())
+			})
 			a.scratch.shouldResetInternalBatch = false
 			return a.unsafeBatch
 		}
@@ -356,7 +382,7 @@ func (a *orderedAggregator) Next(ctx context.Context) coldata.Batch {
 			a.done = true
 			break
 		}
-		// zero out a.groupCol. This is necessary because distinct ors the
+		// zero out a.groupCol. This is necessary because distinct ORs the
 		// uniqueness of a value with the groupCol, allowing the operators to be
 		// linked.
 		copy(a.groupCol, zeroBoolColumn)
@@ -365,20 +391,21 @@ func (a *orderedAggregator) Next(ctx context.Context) coldata.Batch {
 	batchToReturn := a.scratch.Batch
 	if a.scratch.resumeIdx > a.scratch.outputSize {
 		a.scratch.SetLength(uint16(a.scratch.outputSize))
-		for i := 0; i < len(a.outputTypes); i++ {
-			a.allocator.Copy(
-				a.unsafeBatch.ColVec(i),
-				coldata.CopySliceArgs{
-					SliceArgs: coldata.SliceArgs{
-						Src:         a.scratch.ColVec(i),
-						ColType:     a.outputTypes[i],
-						SrcStartIdx: 0,
-						SrcEndIdx:   uint64(a.scratch.Length()),
+		a.allocator.PerformOperation(a.unsafeBatch.ColVecs(), func() {
+			for i := 0; i < len(a.outputTypes); i++ {
+				a.unsafeBatch.ColVec(i).Copy(
+					coldata.CopySliceArgs{
+						SliceArgs: coldata.SliceArgs{
+							Src:         a.scratch.ColVec(i),
+							ColType:     a.outputTypes[i],
+							SrcStartIdx: 0,
+							SrcEndIdx:   uint64(a.scratch.Length()),
+						},
 					},
-				},
-			)
-		}
-		a.unsafeBatch.SetLength(a.scratch.Length())
+				)
+			}
+			a.unsafeBatch.SetLength(a.scratch.Length())
+		})
 		batchToReturn = a.unsafeBatch
 		a.scratch.shouldResetInternalBatch = false
 	} else {
@@ -416,4 +443,55 @@ func extractAggTypes(aggCols [][]uint32, colTypes []coltypes.T) [][]coltypes.T {
 	}
 
 	return aggTyps
+}
+
+// isAggregateSupported returns whether the aggregate function that operates on
+// columns of types 'inputTypes' (which can be empty in case of COUNT_ROWS) is
+// supported.
+func isAggregateSupported(
+	aggFn execinfrapb.AggregatorSpec_Func, inputTypes []types.T,
+) (bool, error) {
+	aggTypes, err := typeconv.FromColumnTypes(inputTypes)
+	if err != nil {
+		return false, err
+	}
+	switch aggFn {
+	case execinfrapb.AggregatorSpec_SUM:
+		switch inputTypes[0].Family() {
+		case types.IntFamily:
+			// TODO(alfonso): plan ordinary SUM on integer types by casting to DECIMAL
+			// at the end, mod issues with overflow. Perhaps to avoid the overflow
+			// issues, at first, we could plan SUM for all types besides Int64.
+			return false, errors.Newf("sum on int cols not supported (use sum_int)")
+		}
+	case execinfrapb.AggregatorSpec_SUM_INT:
+		// TODO(yuzefovich): support this case through vectorize.
+		if inputTypes[0].Width() != 64 {
+			return false, errors.Newf("sum_int is only supported on Int64 through vectorized")
+		}
+	}
+	_, outputTypes, err := makeAggregateFuncs(
+		nil, /* allocator */
+		[][]coltypes.T{aggTypes},
+		[]execinfrapb.AggregatorSpec_Func{aggFn},
+	)
+	if err != nil {
+		return false, err
+	}
+	_, retType, err := execinfrapb.GetAggregateInfo(aggFn, inputTypes...)
+	if err != nil {
+		return false, err
+	}
+	// The columnar aggregates will return the same physical output type as their
+	// input. However, our current builtin resolution might say that the return
+	// type is the canonical for the family (for example, MAX on INT4 is said to
+	// return INT8), so we explicitly check whether the type the columnar
+	// aggregate returns and the type the planning code will expect it to return
+	// are the same. If they are not, we fallback to row-by-row engine.
+	if typeconv.FromColumnType(retType) != outputTypes[0] {
+		// TODO(yuzefovich): support this case through vectorize. Probably it needs
+		// to be done at the same time as #38845.
+		return false, errors.Newf("aggregates with different input and output types are not supported")
+	}
+	return true, nil
 }

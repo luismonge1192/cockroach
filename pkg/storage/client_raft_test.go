@@ -18,6 +18,7 @@ import (
 	"math/rand"
 	"reflect"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -34,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
@@ -441,7 +443,7 @@ func TestFailedReplicaChange(t *testing.T) {
 	sc := storage.TestStoreConfig(nil)
 	sc.TestingKnobs.EvalKnobs.TestingEvalFilter = func(filterArgs storagebase.FilterArgs) *roachpb.Error {
 		if runFilter.Load().(bool) {
-			if et, ok := filterArgs.Req.(*roachpb.EndTransactionRequest); ok && et.Commit {
+			if et, ok := filterArgs.Req.(*roachpb.EndTxnRequest); ok && et.Commit {
 				return roachpb.NewErrorWithTxn(errors.Errorf("boom"), filterArgs.Hdr.Txn)
 			}
 		}
@@ -1040,13 +1042,22 @@ func TestFailedSnapshotFillsReservation(t *testing.T) {
 	mtc.Start(t, 3)
 
 	rep, err := mtc.stores[0].GetReplica(1)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
+	repDesc, err := rep.GetReplicaDescriptor()
+	require.NoError(t, err)
+	desc := protoutil.Clone(rep.Desc()).(*roachpb.RangeDescriptor)
+	desc.AddReplica(2, 2, roachpb.LEARNER)
+	rep2Desc, found := desc.GetReplicaDescriptor(2)
+	require.True(t, found)
 	header := storage.SnapshotRequest_Header{
 		CanDecline: true,
 		RangeSize:  100,
-		State:      storagepb.ReplicaState{Desc: rep.Desc()},
+		State:      storagepb.ReplicaState{Desc: desc},
+		RaftMessageRequest: storage.RaftMessageRequest{
+			RangeID:     rep.RangeID,
+			FromReplica: repDesc,
+			ToReplica:   rep2Desc,
+		},
 	}
 	header.RaftMessageRequest.Message.Snapshot.Data = uuid.UUID{}.GetBytes()
 	// Cause this stream to return an error as soon as we ask it for something.
@@ -1067,6 +1078,14 @@ func TestFailedSnapshotFillsReservation(t *testing.T) {
 // situation occurs when two replicas need snapshots at the same time.
 func TestConcurrentRaftSnapshots(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	// This test relies on concurrently waiting for a value to change in the
+	// underlying engine(s). Since the teeing engine does not respond well to
+	// value mismatches, whether transient or permanent, skip this test if the
+	// teeing engine is being used. See
+	// https://github.com/cockroachdb/cockroach/issues/42656 for more context.
+	if engine.DefaultStorageEngine == enginepb.EngineTypeTeePebbleRocksDB {
+		t.Skip("disabled on teeing engine")
+	}
 
 	mtc := &multiTestContext{
 		// This test was written before the multiTestContext started creating many
@@ -1695,6 +1714,14 @@ func TestChangeReplicasDescriptorInvariant(t *testing.T) {
 // with a downed node.
 func TestProgressWithDownNode(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	// This test relies on concurrently waiting for a value to change in the
+	// underlying engine(s). Since the teeing engine does not respond well to
+	// value mismatches, whether transient or permanent, skip this test if the
+	// teeing engine is being used. See
+	// https://github.com/cockroachdb/cockroach/issues/42656 for more context.
+	if engine.DefaultStorageEngine == enginepb.EngineTypeTeePebbleRocksDB {
+		t.Skip("disabled on teeing engine")
+	}
 	mtc := &multiTestContext{
 		// This test was written before the multiTestContext started creating many
 		// system ranges at startup, and hasn't been update to take that into
@@ -1859,6 +1886,14 @@ func runReplicateRestartAfterTruncation(t *testing.T, removeBeforeTruncateAndReA
 }
 
 func testReplicaAddRemove(t *testing.T, addFirst bool) {
+	// This test relies on concurrently waiting for a value to change in the
+	// underlying engine(s). Since the teeing engine does not respond well to
+	// value mismatches, whether transient or permanent, skip this test if the
+	// teeing engine is being used. See
+	// https://github.com/cockroachdb/cockroach/issues/42656 for more context.
+	if engine.DefaultStorageEngine == enginepb.EngineTypeTeePebbleRocksDB {
+		t.Skip("disabled on teeing engine")
+	}
 	sc := storage.TestStoreConfig(nil)
 	// We're gonna want to validate the state of the store before and after the
 	// replica GC queue does its work, so we disable the replica gc queue here
@@ -2666,8 +2701,8 @@ func TestRaftRemoveRace(t *testing.T) {
 		mtc.replicateRange(rangeID, 2)
 
 		// Verify the tombstone key does not exist. See #12130.
-		tombstoneKey := keys.RaftTombstoneKey(rangeID)
-		var tombstone roachpb.RaftTombstone
+		tombstoneKey := keys.RangeTombstoneKey(rangeID)
+		var tombstone roachpb.RangeTombstone
 		if ok, err := engine.MVCCGetProto(
 			context.Background(), mtc.stores[2].Engine(), tombstoneKey,
 			hlc.Timestamp{}, &tombstone, engine.MVCCGetOptions{},
@@ -3617,90 +3652,6 @@ func TestRemovedReplicaError(t *testing.T) {
 	})
 }
 
-// TestRemoveRangeWithoutGC ensures that we do not panic when a
-// replica has been removed but not yet GC'd (and therefore
-// does not have an active raft group).
-func TestRemoveRangeWithoutGC(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	sc := storage.TestStoreConfig(nil)
-	sc.TestingKnobs.DisableReplicaGCQueue = true
-	sc.TestingKnobs.DisableEagerReplicaRemoval = true
-	mtc := &multiTestContext{storeConfig: &sc}
-	defer mtc.Stop()
-	mtc.Start(t, 2)
-	const rangeID roachpb.RangeID = 1
-	mtc.replicateRange(rangeID, 1)
-	mtc.transferLease(context.TODO(), rangeID, 0, 1)
-	mtc.unreplicateRange(rangeID, 0)
-
-	// Wait for store 0 to process the removal. The in-memory replica
-	// object still exists but store 0 is no longer present in the
-	// configuration.
-	testutils.SucceedsSoon(t, func() error {
-		rep, err := mtc.stores[0].GetReplica(rangeID)
-		if err != nil {
-			return err
-		}
-		desc := rep.Desc()
-		if len(desc.InternalReplicas) != 1 {
-			return errors.Errorf("range has %d replicas", len(desc.InternalReplicas))
-		}
-		return nil
-	})
-
-	// The replica's data is still on disk.
-	var desc roachpb.RangeDescriptor
-	descKey := keys.RangeDescriptorKey(roachpb.RKeyMin)
-	if ok, err := engine.MVCCGetProto(context.Background(), mtc.stores[0].Engine(), descKey,
-		mtc.stores[0].Clock().Now(), &desc, engine.MVCCGetOptions{}); err != nil {
-		t.Fatal(err)
-	} else if !ok {
-		t.Fatal("expected range descriptor to be present")
-	}
-
-	// Stop and restart the store. The primary motivation for this test
-	// is to ensure that the store does not panic on restart (as was
-	// previously the case).
-	mtc.stopStore(0)
-	mtc.restartStore(0)
-
-	// Initially, the in-memory Replica object is recreated from the
-	// on-disk state.
-	if _, err := mtc.stores[0].GetReplica(rangeID); err != nil {
-		t.Fatal(err)
-	}
-
-	// Re-enable the GC queue to allow the replica to be destroyed
-	// (after the simulated passage of time).
-	mtc.advanceClock(context.TODO())
-	mtc.manualClock.Increment(int64(storage.ReplicaGCQueueInactivityThreshold + 1))
-	mtc.stores[0].SetReplicaGCQueueActive(true)
-	// There's a fun flake where between when the queue detects that this replica
-	// needs to be removed and when it actually gets processed whereby an older
-	// replica will send this replica a raft message which will give it an ID.
-	// When our replica ID changes the queue will ignore the previous addition and
-	// we won't be removed.
-	testutils.SucceedsSoon(t, func() error {
-		mtc.stores[0].MustForceReplicaGCScanAndProcess()
-
-		// The Replica object should be removed.
-		const msg = "r[0-9]+ was not found"
-		if _, err := mtc.stores[0].GetReplica(rangeID); !testutils.IsError(err, msg) {
-			return errors.Errorf("expected %s, got %v", msg, err)
-		}
-		return nil
-	})
-
-	// And the data should no longer be on disk.
-	if ok, err := engine.MVCCGetProto(context.Background(), mtc.stores[0].Engine(), descKey,
-		mtc.stores[0].Clock().Now(), &desc, engine.MVCCGetOptions{}); err != nil {
-		t.Fatal(err)
-	} else if ok {
-		t.Fatalf("expected range descriptor to be absent")
-	}
-}
-
 func TestTransferRaftLeadership(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -4003,11 +3954,9 @@ func TestInitRaftGroupOnRequest(t *testing.T) {
 	}
 }
 
-// TestFailedConfChange verifies correct behavior after a
-// configuration change experiences an error when applying
-// EndTransaction. Specifically, it verifies that
-// https://github.com/cockroachdb/cockroach/issues/13506 has been
-// fixed.
+// TestFailedConfChange verifies correct behavior after a configuration change
+// experiences an error when applying EndTxn. Specifically, it verifies that
+// https://github.com/cockroachdb/cockroach/issues/13506 has been fixed.
 func TestFailedConfChange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -4146,7 +4095,7 @@ func TestStoreRangeWaitForApplication(t *testing.T) {
 	sc := storage.TestStoreConfig(nil)
 	sc.TestingKnobs.DisableReplicateQueue = true
 	sc.TestingKnobs.DisableReplicaGCQueue = true
-	sc.TestingKnobs.TestingRequestFilter = func(ba roachpb.BatchRequest) (retErr *roachpb.Error) {
+	sc.TestingKnobs.TestingRequestFilter = func(_ context.Context, ba roachpb.BatchRequest) (retErr *roachpb.Error) {
 		if rangeID := roachpb.RangeID(atomic.LoadInt64(&filterRangeIDAtomic)); rangeID != ba.RangeID {
 			return nil
 		}
@@ -4461,6 +4410,14 @@ func (cs *disablingClientStream) SendMsg(m interface{}) error {
 // traffic on the SystemClass connection.
 func TestDefaultConnectionDisruptionDoesNotInterfereWithSystemTraffic(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	// This test relies on concurrently waiting for a value to change in the
+	// underlying engine(s). Since the teeing engine does not respond well to
+	// value mismatches, whether transient or permanent, skip this test if the
+	// teeing engine is being used. See
+	// https://github.com/cockroachdb/cockroach/issues/42656 for more context.
+	if engine.DefaultStorageEngine == enginepb.EngineTypeTeePebbleRocksDB {
+		t.Skip("disabled on teeing engine")
+	}
 
 	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
 	stopper := stop.NewStopper()
@@ -4742,6 +4699,14 @@ func TestAckWriteBeforeApplication(t *testing.T) {
 //
 func TestProcessSplitAfterRightHandSideHasBeenRemoved(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	// This test relies on concurrently waiting for a value to change in the
+	// underlying engine(s). Since the teeing engine does not respond well to
+	// value mismatches, whether transient or permanent, skip this test if the
+	// teeing engine is being used. See
+	// https://github.com/cockroachdb/cockroach/issues/42656 for more context.
+	if engine.DefaultStorageEngine == enginepb.EngineTypeTeePebbleRocksDB {
+		t.Skip("disabled on teeing engine")
+	}
 	sc := storage.TestStoreConfig(nil)
 	// Newly-started stores (including the "rogue" one) should not GC
 	// their replicas. We'll turn this back on when needed.
@@ -4783,8 +4748,8 @@ func TestProcessSplitAfterRightHandSideHasBeenRemoved(t *testing.T) {
 		require.NoError(t, db.Run(ctx, b))
 	}
 	ensureNoTombstone := func(t *testing.T, store *storage.Store, rangeID roachpb.RangeID) {
-		var tombstone roachpb.RaftTombstone
-		tombstoneKey := keys.RaftTombstoneKey(rangeID)
+		var tombstone roachpb.RangeTombstone
+		tombstoneKey := keys.RangeTombstoneKey(rangeID)
 		ok, err := engine.MVCCGetProto(
 			ctx, store.Engine(), tombstoneKey, hlc.Timestamp{}, &tombstone, engine.MVCCGetOptions{},
 		)
@@ -4803,11 +4768,11 @@ func TestProcessSplitAfterRightHandSideHasBeenRemoved(t *testing.T) {
 		// before proposing the split trigger.
 		var setupOnce sync.Once
 		f := storagebase.ReplicaProposalFilter(func(args storagebase.ProposalFilterArgs) *roachpb.Error {
-			req, ok := args.Req.GetArg(roachpb.EndTransaction)
+			req, ok := args.Req.GetArg(roachpb.EndTxn)
 			if !ok {
 				return nil
 			}
-			endTxn := req.(*roachpb.EndTransactionRequest)
+			endTxn := req.(*roachpb.EndTxnRequest)
 			if endTxn.InternalCommitTrigger == nil || endTxn.InternalCommitTrigger.SplitTrigger == nil {
 				return nil
 			}
@@ -5140,3 +5105,126 @@ func TestProcessSplitAfterRightHandSideHasBeenRemoved(t *testing.T) {
 		mtc.waitForValues(keyB, []int64{curB, curB, curB})
 	})
 }
+
+// TestReplicaRemovalClosesProposalQuota is a somewhat contrived test to ensure
+// that when a replica is removed that it closes its proposal quota if it has
+// one. This used to not be the case though it wasn't really very consequential.
+// Firstly, it's rare that a removed replica has a proposal quota to begin with.
+// Replicas which believe they are they leaseholder can only be removed if they
+// have lost the lease and are behind. This requires a network partition.
+// Regardless, there was never actually a problem because once the replica has
+// been removed, all commands will eventually fail and remove themselves from
+// the quota pool. This potentially adds latency as every pending request will
+// need to acquire and release their quota. This is almost always very fast as
+// it is rarely the case that there are more outstanding requests than there is
+// quota. Nevertheless, we have this test to ensure that the pool does get
+// closed if only to avoid asking the question and to ensure that that case is
+// tested.
+func TestReplicaRemovalClosesProposalQuota(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+	// These variables track the request count to make sure that all of the
+	// requests have made it to the Replica.
+	var (
+		rangeID         int64
+		putRequestCount int64
+	)
+	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			Knobs: base.TestingKnobs{Store: &storage.StoreTestingKnobs{
+				DisableReplicaGCQueue: true,
+				TestingRequestFilter: storagebase.ReplicaRequestFilter(func(_ context.Context, r roachpb.BatchRequest) *roachpb.Error {
+					if r.RangeID == roachpb.RangeID(atomic.LoadInt64(&rangeID)) {
+						if _, isPut := r.GetArg(roachpb.Put); isPut {
+							atomic.AddInt64(&putRequestCount, 1)
+						}
+					}
+					return nil
+				}),
+			}},
+			RaftConfig: base.RaftConfig{
+				// Set the proposal quota to a tiny amount so that each write will
+				// exceed it.
+				RaftProposalQuota: 512,
+			},
+		},
+		ReplicationMode: base.ReplicationManual,
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	key := tc.ScratchRange(t)
+	require.NoError(t, tc.WaitForSplitAndInitialization(key))
+	desc, err := tc.LookupRange(key)
+	require.NoError(t, err)
+	atomic.StoreInt64(&rangeID, int64(desc.RangeID))
+	tc.AddReplicasOrFatal(t, key, tc.Target(1), tc.Target(2))
+	// Partition node 1 from receiving any requests or responses.
+	// This will prevent it from successfully replicating anything.
+	require.NoError(t, tc.WaitForSplitAndInitialization(key))
+	require.NoError(t, tc.TransferRangeLease(desc, tc.Target(0)))
+	store, repl := getFirstStoreReplica(t, tc.Server(0), key)
+	funcs := unreliableRaftHandlerFuncs{}
+	tc.Servers[0].RaftTransport().Listen(store.StoreID(), &unreliableRaftHandler{
+		rangeID:                    desc.RangeID,
+		RaftMessageHandler:         store,
+		unreliableRaftHandlerFuncs: funcs,
+	})
+	// NB: We need to be sure that our Replica is the leaseholder for this
+	// test to make sense. It usually is.
+	lease, pendingLease := repl.GetLease()
+	if pendingLease != (roachpb.Lease{}) || lease.OwnedBy(store.StoreID()) {
+		t.Skip("the replica is not the leaseholder, this happens rarely under stressrace")
+	}
+	var wg sync.WaitGroup
+	const N = 100
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			k := append(key[0:len(key):len(key)], strconv.Itoa(i)...)
+			_, pErr := client.SendWrappedWith(context.Background(), store.TestSender(), roachpb.Header{
+				RangeID: desc.RangeID,
+			}, putArgs(k, bytes.Repeat([]byte{'a'}, 1000)))
+			require.Regexp(t,
+				`result is ambiguous \(removing replica\)|`+
+					`r`+strconv.Itoa(int(desc.RangeID))+" was not found on s1", pErr.GoError())
+		}(i)
+	}
+	testutils.SucceedsSoon(t, func() error {
+		if seen := atomic.LoadInt64(&putRequestCount); seen < N {
+			return fmt.Errorf("saw %d, waiting for %d", seen, N)
+		}
+		return nil
+	})
+	desc = *repl.Desc()
+	fromReplDesc, found := desc.GetReplicaDescriptor(3)
+	require.True(t, found)
+	replDesc, found := desc.GetReplicaDescriptor(store.StoreID())
+	require.True(t, found)
+	newReplDesc := replDesc
+	newReplDesc.ReplicaID = desc.NextReplicaID
+	require.Nil(t, store.HandleRaftRequest(ctx, &storage.RaftMessageRequest{
+		RangeID:       desc.RangeID,
+		RangeStartKey: desc.StartKey,
+		FromReplica:   fromReplDesc,
+		ToReplica:     newReplDesc,
+		Message:       raftpb.Message{Type: raftpb.MsgVote, Term: 2},
+	}, noopRaftMessageResponseSteam{}))
+	ts := waitForTombstone(t, store.Engine(), desc.RangeID)
+	require.Equal(t, ts.NextReplicaID, desc.NextReplicaID)
+	wg.Wait()
+	_, err = repl.GetProposalQuota().Acquire(ctx, 1)
+	require.Regexp(t, "closed.*destroyed", err)
+}
+
+type noopRaftMessageResponseSteam struct{}
+
+func (n noopRaftMessageResponseSteam) Context() context.Context {
+	return context.Background()
+}
+
+func (n noopRaftMessageResponseSteam) Send(*storage.RaftMessageResponse) error {
+	return nil
+}
+
+var _ storage.RaftMessageResponseStream = noopRaftMessageResponseSteam{}

@@ -13,6 +13,7 @@ import { Helmet } from "react-helmet";
 import { connect } from "react-redux";
 import classNames from "classnames";
 import CopyToClipboard from "react-copy-to-clipboard";
+import { withRouter } from "react-router-dom";
 
 import { AdminUIState } from "src/redux/state";
 
@@ -26,7 +27,7 @@ interface ReduxDebugState {
   copied: boolean;
 }
 
-class ReduxDebug extends React.Component<ReduxDebugProps, ReduxDebugState> {
+export class ReduxDebug extends React.Component<ReduxDebugProps, ReduxDebugState> {
   constructor(props: any) {
     super(props);
     this.state = { copied: false };
@@ -41,10 +42,8 @@ class ReduxDebug extends React.Component<ReduxDebugProps, ReduxDebugState> {
 
     return (
       <div>
-        <Helmet>
-          <title>Redux State | Debug</title>
-        </Helmet>
-        <section className="section"><h1>Redux State</h1></section>
+        <Helmet title="Redux State | Debug" />
+        <section className="section"><h1 className="base-heading page-title">Redux State</h1></section>
         <section className="section">
           <CopyToClipboard text={ text } onCopy={() => this.setState({ copied: true})}>
             <span className={spanClass}>
@@ -64,4 +63,4 @@ function mapStateToProps(state: AdminUIState) {
   return { state };
 }
 
-export default connect(mapStateToProps, null)(ReduxDebug);
+export default withRouter(connect(mapStateToProps, null)(ReduxDebug));

@@ -194,6 +194,14 @@ type projectsVal struct {
 	opts                   *providerOpts
 }
 
+// defaultZones is the list of  zones used by default for cluster creation.
+// If the geo flag is specified, nodes are distributed between zones.
+var defaultZones = []string{
+	"us-east1-b",
+	"us-west1-b",
+	"europe-west2-b",
+}
+
 // Set is part of the pflag.Value interface.
 func (v projectsVal) Set(projects string) error {
 	if projects == "" {
@@ -252,16 +260,19 @@ func (p *Provider) GetProjects() []string {
 func (o *providerOpts) ConfigureCreateFlags(flags *pflag.FlagSet) {
 	flags.StringVar(&o.MachineType, "machine-type", "n1-standard-4", "DEPRECATED")
 	_ = flags.MarkDeprecated("machine-type", "use "+ProviderName+"-machine-type instead")
-	flags.StringSliceVar(&o.Zones, "zones", []string{"us-east1-b", "us-west1-b", "europe-west2-b"}, "DEPRECATED")
+	flags.StringSliceVar(&o.Zones, "zones", nil, "DEPRECATED")
 	_ = flags.MarkDeprecated("zones", "use "+ProviderName+"-zones instead")
 
 	flags.StringVar(&o.ServiceAccount, ProviderName+"-service-account",
 		os.Getenv("GCE_SERVICE_ACCOUNT"), "Service account to use")
 	flags.StringVar(&o.MachineType, ProviderName+"-machine-type", "n1-standard-4",
 		"Machine type (see https://cloud.google.com/compute/docs/machine-types)")
-	flags.StringSliceVar(&o.Zones, ProviderName+"-zones",
-		[]string{"us-east1-b", "us-west1-b", "europe-west2-b"}, "Zones for cluster")
-	flags.StringVar(&o.Image, ProviderName+"-image", "ubuntu-1604-xenial-v20190122a",
+	flags.StringSliceVar(&o.Zones, ProviderName+"-zones", nil,
+		fmt.Sprintf("Zones for cluster. If zones are formatted as AZ:N where N is an integer, the zone\n"+
+			"will be repeated N times. If > 1 zone specified, nodes will be geo-distributed\n"+
+			"regardless of geo (default [%s])",
+			strings.Join(defaultZones, ",")))
+	flags.StringVar(&o.Image, ProviderName+"-image", "ubuntu-1604-xenial-v20200129",
 		"Image to use to create the vm, ubuntu-1904-disco-v20191008 is a more modern image")
 	flags.IntVar(&o.SSDCount, ProviderName+"-local-ssd-count", 1,
 		"Number of local SSDs to create on GCE instance.")
@@ -341,8 +352,16 @@ func (p *Provider) Create(names []string, opts vm.CreateOpts) error {
 			"`roachprod gc --gce-project=%s` cronjob\n", project)
 	}
 
-	if !opts.GeoDistributed {
-		p.opts.Zones = []string{p.opts.Zones[0]}
+	zones, err := vm.ExpandZonesFlag(p.opts.Zones)
+	if err != nil {
+		return err
+	}
+	if len(zones) == 0 {
+		if opts.GeoDistributed {
+			zones = defaultZones
+		} else {
+			zones = []string{defaultZones[0]}
+		}
 	}
 
 	// Fixed args.
@@ -367,14 +386,14 @@ func (p *Provider) Create(names []string, opts vm.CreateOpts) error {
 	extraMountOpts := ""
 	// Dynamic args.
 	if opts.SSDOpts.UseLocalSSD {
-		// n2-class GCP machines cannot be requested with only 1 SSD;
-		// minimum number of actual SSDs is 2.
+		// n2-class and c2-class GCP machines cannot be requested with only 1
+		// SSD; minimum number of actual SSDs is 2.
 		// TODO(pbardea): This is more general for machine types that
 		// come in different sizes.
 		// See: https://cloud.google.com/compute/docs/disks/
-		n2MachineTypes := regexp.MustCompile("^n2-.+-16")
+		n2MachineTypes := regexp.MustCompile("^[cn]2-.+-16")
 		if n2MachineTypes.MatchString(p.opts.MachineType) && p.opts.SSDCount < 2 {
-			fmt.Fprint(os.Stderr, "WARNING: SSD count must be at least 2 for n2 machine types with 16vCPU. Setting --gce-local-ssd-count to 2.\n")
+			fmt.Fprint(os.Stderr, "WARNING: SSD count must be at least 2 for n2 and c2 machine types with 16vCPU. Setting --gce-local-ssd-count to 2.\n")
 			p.opts.SSDCount = 2
 		}
 		for i := 0; i < p.opts.SSDCount; i++ {
@@ -402,14 +421,14 @@ func (p *Provider) Create(names []string, opts vm.CreateOpts) error {
 
 	var g errgroup.Group
 
-	nodeZones := vm.ZonePlacement(len(p.opts.Zones), len(names))
-	zoneHostNames := make([][]string, len(p.opts.Zones))
+	nodeZones := vm.ZonePlacement(len(zones), len(names))
+	zoneHostNames := make([][]string, len(zones))
 	for i, name := range names {
 		zone := nodeZones[i]
 		zoneHostNames[zone] = append(zoneHostNames[zone], name)
 	}
 	for i, zoneHosts := range zoneHostNames {
-		argsWithZone := append(args[:len(args):len(args)], "--zone", p.opts.Zones[i])
+		argsWithZone := append(args[:len(args):len(args)], "--zone", zones[i])
 		argsWithZone = append(argsWithZone, zoneHosts...)
 		g.Go(func() error {
 			cmd := exec.Command("gcloud", argsWithZone...)

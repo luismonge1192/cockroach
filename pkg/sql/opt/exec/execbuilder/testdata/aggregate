@@ -12,7 +12,7 @@ query TTTTT
 EXPLAIN (TYPES) SELECT min(1), max(1), count(1), sum_int(1), avg(1), sum(1), stddev(1), variance(1), bool_and(true), bool_or(false), xor_agg(b'\x01') FROM kv
 ----
 ·               distributed   false               ·                                                                                                                                                   ·
-·               vectorized    false               ·                                                                                                                                                   ·
+·               vectorized    true                ·                                                                                                                                                   ·
 group           ·             ·                   (min int, max int, count int, sum_int int, avg decimal, sum decimal, stddev decimal, variance decimal, bool_and bool, bool_or bool, xor_agg bytes)  ·
  │              aggregate 0   min(column5)        ·                                                                                                                                                   ·
  │              aggregate 1   max(column5)        ·                                                                                                                                                   ·
@@ -181,7 +181,7 @@ query TTTTT
 EXPLAIN (TYPES) SELECT count(k), sum(k), max(k) FROM kv
 ----
 ·          distributed  false       ·                                  ·
-·          vectorized   false       ·                                  ·
+·          vectorized   true        ·                                  ·
 group      ·            ·           (count int, sum decimal, max int)  ·
  │         aggregate 0  count(k)    ·                                  ·
  │         aggregate 1  sum(k)      ·                                  ·
@@ -195,7 +195,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT count(v), count(DISTINCT v), sum(v), sum(DISTINCT v), min(v), min(DISTINCT v) FROM kv
 ----
 ·          distributed  false              ·                                   ·
-·          vectorized   false              ·                                   ·
+·          vectorized   true               ·                                   ·
 group      ·            ·                  (count, count, sum, sum, min, min)  ·
  │         aggregate 0  count(v)           ·                                   ·
  │         aggregate 1  count(DISTINCT v)  ·                                   ·
@@ -211,65 +211,65 @@ group      ·            ·                  (count, count, sum, sum, min, min) 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT count(DISTINCT a.*) FROM kv a, kv b
 ----
-·                    distributed  false                         ·             ·
-·                    vectorized   false                         ·             ·
-group                ·            ·                             (count)       ·
- │                   aggregate 0  count(DISTINCT column9)       ·             ·
- │                   scalar       ·                             ·             ·
- └── render          ·            ·                             (column9)     ·
-      │              render 0     ((k, v, w, s) AS k, v, w, s)  ·             ·
-      └── hash-join  ·            ·                             (k, v, w, s)  ·
-           │         type         cross                         ·             ·
-           ├── scan  ·            ·                             (k, v, w, s)  ·
-           │         table        kv@primary                    ·             ·
-           │         spans        ALL                           ·             ·
-           └── scan  ·            ·                             ()            ·
-·                    table        kv@primary                    ·             ·
-·                    spans        ALL                           ·             ·
+·                     distributed  false                         ·             ·
+·                     vectorized   false                         ·             ·
+group                 ·            ·                             (count)       ·
+ │                    aggregate 0  count(DISTINCT column9)       ·             ·
+ │                    scalar       ·                             ·             ·
+ └── render           ·            ·                             (column9)     ·
+      │               render 0     ((k, v, w, s) AS k, v, w, s)  ·             ·
+      └── cross-join  ·            ·                             (k, v, w, s)  ·
+           │          type         cross                         ·             ·
+           ├── scan   ·            ·                             (k, v, w, s)  ·
+           │          table        kv@primary                    ·             ·
+           │          spans        ALL                           ·             ·
+           └── scan   ·            ·                             ()            ·
+·                     table        kv@primary                    ·             ·
+·                     spans        ALL                           ·             ·
 
 query TTT
 SELECT tree, field, description FROM [
 EXPLAIN (VERBOSE) SELECT min(b.k) FROM kv a, kv b GROUP BY a.*
 ]
 ----
-·                    distributed  false
-·                    vectorized   false
-render               ·            ·
- │                   render 0     min
- └── group           ·            ·
-      │              aggregate 0  k
-      │              aggregate 1  min(k)
-      │              group by     k
-      └── hash-join  ·            ·
-           │         type         cross
-           ├── scan  ·            ·
-           │         table        kv@primary
-           │         spans        ALL
-           └── scan  ·            ·
-·                    table        kv@primary
-·                    spans        ALL
+·                     distributed  false
+·                     vectorized   false
+render                ·            ·
+ │                    render 0     min
+ └── group            ·            ·
+      │               aggregate 0  k
+      │               aggregate 1  min(k)
+      │               group by     k
+      └── cross-join  ·            ·
+           │          type         cross
+           ├── scan   ·            ·
+           │          table        kv@primary
+           │          spans        ALL
+           └── scan   ·            ·
+·                     table        kv@primary
+·                     spans        ALL
 
 query TTT
 SELECT tree, field, description FROM [
 EXPLAIN (VERBOSE) SELECT min(b.k) FROM kv a, kv b GROUP BY (1, (a.*))
 ]
 ----
-·                    distributed  false
-·                    vectorized   false
-render               ·            ·
- │                   render 0     min
- └── group           ·            ·
-      │              aggregate 0  k
-      │              aggregate 1  min(k)
-      │              group by     k
-      └── hash-join  ·            ·
-           │         type         cross
-           ├── scan  ·            ·
-           │         table        kv@primary
-           │         spans        ALL
-           └── scan  ·            ·
-·                    table        kv@primary
-·                    spans        ALL
+·                     distributed  false
+·                     vectorized   false
+render                ·            ·
+ │                    render 0     min
+ └── group            ·            ·
+      │               aggregate 0  k
+      │               aggregate 1  min(k)
+      │               group by     k
+      └── cross-join  ·            ·
+           │          type         cross
+           ├── scan   ·            ·
+           │          table        kv@primary
+           │          spans        ALL
+           └── scan   ·            ·
+·                     table        kv@primary
+·                     spans        ALL
 
 # A useful optimization: naked tuple expansion in GROUP BY clause.
 query TTT
@@ -277,22 +277,22 @@ SELECT tree, field, description FROM [
 EXPLAIN (VERBOSE) SELECT min(b.k) FROM kv a, kv b GROUP BY (a.*)
 ]
 ----
-·                    distributed  false
-·                    vectorized   false
-render               ·            ·
- │                   render 0     min
- └── group           ·            ·
-      │              aggregate 0  k
-      │              aggregate 1  min(k)
-      │              group by     k
-      └── hash-join  ·            ·
-           │         type         cross
-           ├── scan  ·            ·
-           │         table        kv@primary
-           │         spans        ALL
-           └── scan  ·            ·
-·                    table        kv@primary
-·                    spans        ALL
+·                     distributed  false
+·                     vectorized   false
+render                ·            ·
+ │                    render 0     min
+ └── group            ·            ·
+      │               aggregate 0  k
+      │               aggregate 1  min(k)
+      │               group by     k
+      └── cross-join  ·            ·
+           │          type         cross
+           ├── scan   ·            ·
+           │          table        kv@primary
+           │          spans        ALL
+           └── scan   ·            ·
+·                     table        kv@primary
+·                     spans        ALL
 
 # Show reuse of renders expression inside an expansion.
 query TTT
@@ -300,20 +300,20 @@ SELECT tree, field, description FROM [
 EXPLAIN (VERBOSE) SELECT a.v FROM kv a, kv b GROUP BY a.v, a.w, a.s
 ]
 ----
-·                    distributed  false
-·                    vectorized   false
-render               ·            ·
- │                   render 0     v
- └── distinct        ·            ·
-      │              distinct on  v, w, s
-      └── hash-join  ·            ·
-           │         type         cross
-           ├── scan  ·            ·
-           │         table        kv@primary
-           │         spans        ALL
-           └── scan  ·            ·
-·                    table        kv@primary
-·                    spans        ALL
+·                     distributed  false
+·                     vectorized   false
+render                ·            ·
+ │                    render 0     v
+ └── distinct         ·            ·
+      │               distinct on  v, w, s
+      └── cross-join  ·            ·
+           │          type         cross
+           ├── scan   ·            ·
+           │          table        kv@primary
+           │          spans        ALL
+           └── scan   ·            ·
+·                     table        kv@primary
+·                     spans        ALL
 
 statement ok
 CREATE TABLE abc (
@@ -511,7 +511,7 @@ query TTTTT
 EXPLAIN (TYPES) SELECT variance(x) FROM xyz WHERE x = 1
 ----
 ·          distributed  false        ·                   ·
-·          vectorized   false        ·                   ·
+·          vectorized   true         ·                   ·
 group      ·            ·            (variance decimal)  ·
  │         aggregate 0  variance(x)  ·                   ·
  │         scalar       ·            ·                   ·
@@ -658,7 +658,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT count(*) FILTER (WHERE k>5), max(k>5) FILTER(WHERE k>5) FROM filter_test GROUP BY v
 ----
 ·                    distributed  false                                  ·                      ·
-·                    vectorized   false                                  ·                      ·
+·                    vectorized   true                                   ·                      ·
 render               ·            ·                                      (count, max)           ·
  │                   render 0     count                                  ·                      ·
  │                   render 1     max                                    ·                      ·
@@ -679,7 +679,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT count(*) FILTER (WHERE k > 5) FROM filter_test GROUP BY v
 ----
 ·                    distributed  false                                  ·                      ·
-·                    vectorized   false                                  ·                      ·
+·                    vectorized   true                                   ·                      ·
 render               ·            ·                                      (count)                ·
  │                   render 0     count                                  ·                      ·
  └── group           ·            ·                                      (v, count)             ·
@@ -709,23 +709,23 @@ render     ·            ·           (a int)  ·
 query TTTTT
 EXPLAIN (TYPES) SELECT sum(abc.d) FROM kv JOIN abc ON kv.k >= abc.d GROUP BY kv.*;
 ----
-·                    distributed  false                             ·                     ·
-·                    vectorized   false                             ·                     ·
-render               ·            ·                                 (sum decimal)         ·
- │                   render 0     (sum)[decimal]                    ·                     ·
- └── group           ·            ·                                 (k int, sum decimal)  ·
-      │              aggregate 0  k                                 ·                     ·
-      │              aggregate 1  sum(d)                            ·                     ·
-      │              group by     k                                 ·                     ·
-      └── hash-join  ·            ·                                 (k int, d decimal)    ·
-           │         type         inner                             ·                     ·
-           │         pred         ((k)[int] >= (d)[decimal])[bool]  ·                     ·
-           ├── scan  ·            ·                                 (k int)               ·
-           │         table        kv@primary                        ·                     ·
-           │         spans        ALL                               ·                     ·
-           └── scan  ·            ·                                 (d decimal)           ·
-·                    table        abc@primary                       ·                     ·
-·                    spans        ALL                               ·                     ·
+·                     distributed  false                             ·                     ·
+·                     vectorized   false                             ·                     ·
+render                ·            ·                                 (sum decimal)         ·
+ │                    render 0     (sum)[decimal]                    ·                     ·
+ └── group            ·            ·                                 (k int, sum decimal)  ·
+      │               aggregate 0  k                                 ·                     ·
+      │               aggregate 1  sum(d)                            ·                     ·
+      │               group by     k                                 ·                     ·
+      └── cross-join  ·            ·                                 (k int, d decimal)    ·
+           │          type         inner                             ·                     ·
+           │          pred         ((k)[int] >= (d)[decimal])[bool]  ·                     ·
+           ├── scan   ·            ·                                 (k int)               ·
+           │          table        kv@primary                        ·                     ·
+           │          spans        ALL                               ·                     ·
+           └── scan   ·            ·                                 (d decimal)           ·
+·                     table        abc@primary                       ·                     ·
+·                     spans        ALL                               ·                     ·
 
 # opt_test is used for tests around the single-row optimization for MIN/MAX.
 statement ok
@@ -812,25 +812,25 @@ render     ·            ·                                        (r tuple{int,
 query TTTTT
 EXPLAIN (TYPES) SELECT min(y), (b, a) r FROM ab, xy GROUP BY (x, (a, b))
 ----
-·                    distributed  false                                               ·                                                ·
-·                    vectorized   false                                               ·                                                ·
-render               ·            ·                                                   (min string, r tuple{int, int})                  ·
- │                   render 0     (min)[string]                                       ·                                                ·
- │                   render 1     (((any_not_null)[int], (a)[int]))[tuple{int, int}]  ·                                                ·
- └── group           ·            ·                                                   (a int, x string, min string, any_not_null int)  ·
-      │              aggregate 0  a                                                   ·                                                ·
-      │              aggregate 1  x                                                   ·                                                ·
-      │              aggregate 2  min(y)                                              ·                                                ·
-      │              aggregate 3  any_not_null(b)                                     ·                                                ·
-      │              group by     a, x                                                ·                                                ·
-      └── hash-join  ·            ·                                                   (a int, b int, x string, y string)               ·
-           │         type         cross                                               ·                                                ·
-           ├── scan  ·            ·                                                   (a int, b int)                                   ·
-           │         table        ab@primary                                          ·                                                ·
-           │         spans        ALL                                                 ·                                                ·
-           └── scan  ·            ·                                                   (x string, y string)                             ·
-·                    table        xy@primary                                          ·                                                ·
-·                    spans        ALL                                                 ·                                                ·
+·                     distributed  false                                               ·                                                ·
+·                     vectorized   false                                               ·                                                ·
+render                ·            ·                                                   (min string, r tuple{int, int})                  ·
+ │                    render 0     (min)[string]                                       ·                                                ·
+ │                    render 1     (((any_not_null)[int], (a)[int]))[tuple{int, int}]  ·                                                ·
+ └── group            ·            ·                                                   (a int, x string, min string, any_not_null int)  ·
+      │               aggregate 0  a                                                   ·                                                ·
+      │               aggregate 1  x                                                   ·                                                ·
+      │               aggregate 2  min(y)                                              ·                                                ·
+      │               aggregate 3  any_not_null(b)                                     ·                                                ·
+      │               group by     a, x                                                ·                                                ·
+      └── cross-join  ·            ·                                                   (a int, b int, x string, y string)               ·
+           │          type         cross                                               ·                                                ·
+           ├── scan   ·            ·                                                   (a int, b int)                                   ·
+           │          table        ab@primary                                          ·                                                ·
+           │          spans        ALL                                                 ·                                                ·
+           └── scan   ·            ·                                                   (x string, y string)                             ·
+·                     table        xy@primary                                          ·                                                ·
+·                     spans        ALL                                                 ·                                                ·
 
 # Test that ordering on GROUP BY columns is maintained.
 # TODO(radu): Derive GROUP BY ordering in physicalPropsBuilder.
@@ -1036,7 +1036,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT concat_agg(s) FROM (SELECT s FROM kv ORDER BY k)
 ----
 ·          distributed  false          ·             ·
-·          vectorized   false          ·             ·
+·          vectorized   true           ·             ·
 group      ·            ·              (concat_agg)  ·
  │         aggregate 0  concat_agg(s)  ·             ·
  │         scalar       ·              ·             ·
@@ -1062,7 +1062,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT string_agg(s, ',') FROM (SELECT s FROM kv ORDER BY k)
 ----
 ·               distributed  false          ·             ·
-·               vectorized   false          ·             ·
+·               vectorized   true           ·             ·
 group           ·            ·              (string_agg)  ·
  │              aggregate 0  string_agg(s)  ·             ·
  │              scalar       ·              ·             ·
@@ -1118,7 +1118,7 @@ query TTTTT
 EXPLAIN (VERBOSE) SELECT string_agg(s, ', ') FROM kv
 ----
 ·               distributed  false          ·             ·
-·               vectorized   false          ·             ·
+·               vectorized   true           ·             ·
 group           ·            ·              (string_agg)  ·
  │              aggregate 0  string_agg(s)  ·             ·
  │              scalar       ·              ·             ·

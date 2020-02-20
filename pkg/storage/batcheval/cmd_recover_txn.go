@@ -25,7 +25,7 @@ import (
 )
 
 func init() {
-	RegisterCommand(roachpb.RecoverTxn, declareKeysRecoverTransaction, RecoverTxn)
+	RegisterReadWriteCommand(roachpb.RecoverTxn, declareKeysRecoverTransaction, RecoverTxn)
 }
 
 func declareKeysRecoverTransaction(
@@ -47,7 +47,7 @@ func declareKeysRecoverTransaction(
 // result of the recovery should be committing the abandoned transaction or
 // aborting it.
 func RecoverTxn(
-	ctx context.Context, batch engine.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, readWriter engine.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
 ) (result.Result, error) {
 	args := cArgs.Args.(*roachpb.RecoverTxnRequest)
 	h := cArgs.Header
@@ -67,7 +67,7 @@ func RecoverTxn(
 
 	// Fetch transaction record; if missing, attempt to synthesize one.
 	if ok, err := engine.MVCCGetProto(
-		ctx, batch, key, hlc.Timestamp{}, &reply.RecoveredTxn, engine.MVCCGetOptions{},
+		ctx, readWriter, key, hlc.Timestamp{}, &reply.RecoveredTxn, engine.MVCCGetOptions{},
 	); err != nil {
 		return result.Result{}, err
 	} else if !ok {
@@ -108,7 +108,7 @@ func RecoverTxn(
 			// that transaction records that are GCed after being COMMITTED are
 			// never re-written as ABORTED. We used to allow this to happen when
 			// PushTxn requests found missing transaction records because it was
-			// harmless, but we now use to write timestamp cache to avoid
+			// harmless, but we now use the timestamp cache to avoid
 			// needing to ever do so. If this ever becomes possible again, we'll
 			// need to relax this check.
 			return result.Result{}, roachpb.NewTransactionStatusError(fmt.Sprintf(
@@ -213,7 +213,7 @@ func RecoverTxn(
 		reply.RecoveredTxn.Status = roachpb.ABORTED
 	}
 	txnRecord := reply.RecoveredTxn.AsRecord()
-	if err := engine.MVCCPutProto(ctx, batch, cArgs.Stats, key, hlc.Timestamp{}, nil, &txnRecord); err != nil {
+	if err := engine.MVCCPutProto(ctx, readWriter, cArgs.Stats, key, hlc.Timestamp{}, nil, &txnRecord); err != nil {
 		return result.Result{}, err
 	}
 
@@ -222,6 +222,6 @@ func RecoverTxn(
 	// that, we might need to plumb in a "poison" flag on the RecoverTxn
 	// request.
 	result := result.Result{}
-	result.Local.UpdatedTxns = &[]*roachpb.Transaction{&reply.RecoveredTxn}
+	result.Local.UpdatedTxns = []*roachpb.Transaction{&reply.RecoveredTxn}
 	return result, nil
 }

@@ -15,8 +15,6 @@ import (
 	"net"
 	"strings"
 	"time"
-
-	"github.com/cockroachdb/cockroach/pkg/util/duration"
 )
 
 // SessionData contains session parameters. They are all user-configurable.
@@ -35,9 +33,6 @@ type SessionData struct {
 	// DistSQLMode indicates whether to run queries using the distributed
 	// execution engine.
 	DistSQLMode DistSQLExecMode
-	// ForceSplitAt indicates whether checks to prevent incorrect usage of ALTER
-	// TABLE ... SPLIT AT should be skipped.
-	ForceSplitAt bool
 	// OptimizerFKs indicates whether we should use the new paths to plan foreign
 	// key checks in the optimizer.
 	OptimizerFKs bool
@@ -58,17 +53,19 @@ type SessionData struct {
 	// ZigzagJoinEnabled indicates whether the optimizer should try and plan a
 	// zigzag join.
 	ZigzagJoinEnabled bool
+	// PrimaryKeyChangesEnabled indicates whether are allowed to be used.
+	PrimaryKeyChangesEnabled bool
 	// ReorderJoinsLimit indicates the number of joins at which the optimizer should
 	// stop attempting to reorder.
 	ReorderJoinsLimit int
+	// RequireExplicitPrimaryKeys indicates whether CREATE TABLE statements should
+	// error out if no primary key is provided.
+	RequireExplicitPrimaryKeys bool
 	// SequenceState gives access to the SQL sequences that have been manipulated
 	// by the session.
 	SequenceState *SequenceState
 	// DataConversion gives access to the data conversion configuration.
 	DataConversion DataConversionConfig
-	// DurationAdditionMode enables math compatibility options to be enabled.
-	// TODO(bob): Remove this once the 2.2 release branch is cut.
-	DurationAdditionMode duration.AdditionMode
 	// VectorizeMode indicates which kinds of queries to use vectorized execution
 	// engine for.
 	VectorizeMode VectorizeExecMode
@@ -96,6 +93,11 @@ type SessionData struct {
 	SaveTablesPrefix string
 	// TempTablesEnabled indicates whether temporary tables can be created or not.
 	TempTablesEnabled bool
+	// HashShardedIndexesEnabled indicates whether hash sharded indexes can be created.
+	HashShardedIndexesEnabled bool
+	// InsertFastPath is true if the fast path for insert (with VALUES input) may
+	// be used.
+	InsertFastPath bool
 }
 
 // DataConversionConfig contains the parameters that influence

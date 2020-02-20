@@ -13,6 +13,8 @@ package sqlbase
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -149,7 +151,7 @@ func MakeColumnDefDescs(
 
 	col := &ColumnDescriptor{
 		Name:     string(d.Name),
-		Nullable: d.Nullable.Nullability != tree.NotNull && !d.PrimaryKey,
+		Nullable: d.Nullable.Nullability != tree.NotNull && !d.PrimaryKey.IsPrimaryKey,
 	}
 
 	// Validate and assign column type.
@@ -186,11 +188,30 @@ func MakeColumnDefDescs(
 	}
 
 	var idx *IndexDescriptor
-	if d.PrimaryKey || d.Unique {
-		idx = &IndexDescriptor{
-			Unique:           true,
-			ColumnNames:      []string{string(d.Name)},
-			ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC},
+	if d.PrimaryKey.IsPrimaryKey || d.Unique {
+		if !d.PrimaryKey.Sharded {
+			idx = &IndexDescriptor{
+				Unique:           true,
+				ColumnNames:      []string{string(d.Name)},
+				ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC},
+			}
+		} else {
+			buckets, err := tree.EvalShardBucketCount(d.PrimaryKey.ShardBuckets)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			shardColName := GetShardColumnName([]string{string(d.Name)}, buckets)
+			idx = &IndexDescriptor{
+				Unique:           true,
+				ColumnNames:      []string{shardColName, string(d.Name)},
+				ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC, IndexDescriptor_ASC},
+				Sharded: ShardedDescriptor{
+					IsSharded:    true,
+					Name:         shardColName,
+					ShardBuckets: buckets,
+					ColumnNames:  []string{string(d.Name)},
+				},
+			}
 		}
 		if d.UniqueConstraintName != "" {
 			idx.Name = string(d.UniqueConstraintName)
@@ -198,6 +219,17 @@ func MakeColumnDefDescs(
 	}
 
 	return col, idx, typedExpr, nil
+}
+
+// GetShardColumnName generates a name for the hidden shard column to be used to create a
+// hash sharded index.
+func GetShardColumnName(colNames []string, buckets int32) string {
+	// We sort the `colNames` here because we want to avoid creating a duplicate shard
+	// column if one already exists for the set of columns in `colNames`.
+	sort.Strings(colNames)
+	return strings.Join(
+		append(append([]string{`crdb_internal`}, colNames...), fmt.Sprintf(`shard_%v`, buckets)), `_`,
+	)
 }
 
 // EncodeColumns is a version of EncodePartialIndexKey that takes ColumnIDs and
@@ -388,7 +420,8 @@ func (desc *TableDescriptor) collectConstraintInfo(
 
 	for _, c := range desc.AllActiveAndInactiveChecks() {
 		if _, ok := info[c.Name]; ok {
-			return nil, errors.Errorf("duplicate constraint name: %q", c.Name)
+			return nil, pgerror.Newf(pgcode.DuplicateObject,
+				"duplicate constraint name: %q", c.Name)
 		}
 		detail := ConstraintDetail{Kind: ConstraintTypeCheck}
 		// Constraints in the Validating state are considered Unvalidated for this purpose
@@ -415,6 +448,18 @@ func (desc *TableDescriptor) collectConstraintInfo(
 	return info, nil
 }
 
+// IsValidOriginIndex returns whether the index can serve as an origin index for a foreign
+// key constraint with the provided set of originColIDs.
+func (idx *IndexDescriptor) IsValidOriginIndex(originColIDs ColumnIDs) bool {
+	return ColumnIDs(idx.ColumnIDs).HasPrefix(originColIDs)
+}
+
+// IsValidReferencedIndex returns whether the index can serve as a referenced index for a foreign
+// key constraint with the provided set of referencedColumnIDs.
+func (idx *IndexDescriptor) IsValidReferencedIndex(referencedColIDs ColumnIDs) bool {
+	return idx.Unique && ColumnIDs(idx.ColumnIDs).Equals(referencedColIDs)
+}
+
 // FindFKReferencedIndex finds the first index in the supplied referencedTable
 // that can satisfy a foreign key of the supplied column ids.
 func FindFKReferencedIndex(
@@ -422,13 +467,14 @@ func FindFKReferencedIndex(
 ) (*IndexDescriptor, error) {
 	// Search for a unique index on the referenced table that matches our foreign
 	// key columns.
-	if ColumnIDs(referencedTable.PrimaryIndex.ColumnIDs).HasPrefix(referencedColIDs) {
+	if referencedTable.PrimaryIndex.IsValidReferencedIndex(referencedColIDs) {
 		return &referencedTable.PrimaryIndex, nil
 	}
 	// If the PK doesn't match, find the index corresponding to the referenced column.
-	for _, idx := range referencedTable.Indexes {
-		if idx.Unique && ColumnIDs(idx.ColumnIDs).HasPrefix(referencedColIDs) {
-			return &idx, nil
+	for i := range referencedTable.Indexes {
+		idx := &referencedTable.Indexes[i]
+		if idx.IsValidReferencedIndex(referencedColIDs) {
+			return idx, nil
 		}
 	}
 	return nil, pgerror.Newf(
@@ -445,13 +491,14 @@ func FindFKOriginIndex(
 ) (*IndexDescriptor, error) {
 	// Search for an index on the origin table that matches our foreign
 	// key columns.
-	if ColumnIDs(originTable.PrimaryIndex.ColumnIDs).HasPrefix(originColIDs) {
+	if originTable.PrimaryIndex.IsValidOriginIndex(originColIDs) {
 		return &originTable.PrimaryIndex, nil
 	}
 	// If the PK doesn't match, find the index corresponding to the origin column.
-	for _, idx := range originTable.Indexes {
-		if ColumnIDs(idx.ColumnIDs).HasPrefix(originColIDs) {
-			return &idx, nil
+	for i := range originTable.Indexes {
+		idx := &originTable.Indexes[i]
+		if idx.IsValidOriginIndex(originColIDs) {
+			return idx, nil
 		}
 	}
 	return nil, pgerror.Newf(

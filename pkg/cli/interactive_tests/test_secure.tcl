@@ -2,6 +2,7 @@
 
 source [file join [file dirname $argv0] common.tcl]
 
+set python "python2.7"
 set certs_dir "/certs"
 set ::env(COCKROACH_INSECURE) "false"
 set ::env(COCKROACH_HOST) "localhost"
@@ -13,7 +14,7 @@ set prompt ":/# "
 eexpect $prompt
 
 start_test "Check that --insecure reports that the server is really insecure"
-send "$argv start-single-node --insecure\r"
+send "$argv start-single-node --host=localhost --insecure\r"
 eexpect "WARNING: RUNNING IN INSECURE MODE"
 eexpect "node starting"
 interrupt
@@ -23,7 +24,7 @@ end_test
 
 proc start_secure_server {argv certs_dir} {
     report "BEGIN START SECURE SERVER"
-    system "$argv start-single-node --certs-dir=$certs_dir --pid-file=server_pid -s=path=logs/db --background >>expect-cmd.log 2>&1;
+    system "$argv start-single-node --host=localhost --certs-dir=$certs_dir --pid-file=server_pid -s=path=logs/db --background >>expect-cmd.log 2>&1;
             $argv sql --certs-dir=$certs_dir -e 'select 1'"
     report "END START SECURE SERVER"
 }
@@ -44,41 +45,9 @@ eexpect "1 row"
 eexpect $prompt
 end_test
 
-start_test "Cannot create users with empty passwords."
-send "$argv user set carl --password --certs-dir=$certs_dir\r"
-eexpect "Enter password:"
-send "\r"
-eexpect "empty passwords are not permitted"
-eexpect $prompt
-end_test
-
-start_test "Make the user without password."
-send "$argv user set carl --certs-dir=$certs_dir\r"
-eexpect "CREATE USER"
-eexpect $prompt
-end_test
-
-start_test "Check a password can be changed."
-send "$argv user set carl --password --certs-dir=$certs_dir\r"
-eexpect "Enter password:"
-send "woof\r"
-eexpect "Confirm password:"
-send "woof\r"
-eexpect "ALTER USER"
-eexpect $prompt
-end_test
-
-start_test "Check a password is requested by the client."
-send "$argv sql --certs-dir=$certs_dir --user=carl\r"
-eexpect "Enter password:"
-send "woof\r"
-eexpect "carl@"
-send "\\q\r"
-eexpect $prompt
-end_test
 
 start_test "Can create users without passwords."
-send "$argv user set testuser --certs-dir=$certs_dir\r"
+send "$argv sql -e 'create user testuser' --certs-dir=$certs_dir\r"
 eexpect $prompt
 end_test
 
@@ -87,13 +56,6 @@ send "$argv sql --user=testuser --certs-dir=$certs_dir\r"
 eexpect "testuser@"
 send "\\q\r"
 eexpect $prompt
-end_test
-
-start_test "Check that root cannot use password."
-# Run as root but with a non-existent certs directory.
-send "$argv sql --url='postgresql://root@localhost:26257?sslmode=verify-full&sslrootcert=$certs_dir/ca.crt'\r"
-eexpect "Error: connections with user root must use a client certificate"
-eexpect "Failed running \"sql\""
 end_test
 
 start_test "Check that CREATE USER WITH PASSWORD can be used from transactions."
@@ -119,7 +81,7 @@ eexpect $prompt
 send "$argv sql --certs-dir=$certs_dir --user=eisen\r"
 eexpect "Enter password:"
 send "*****\r"
-eexpect "Error: pq: password authentication failed for user eisen"
+eexpect "ERROR: password authentication failed for user eisen"
 eexpect "Failed running \"sql\""
 # Check that history is scrubbed.
 send "$argv sql --certs-dir=$certs_dir\r"
@@ -127,10 +89,72 @@ eexpect "root@"
 interrupt
 end_test
 
-# Terminate with Ctrl+C.
+# Terminate the shell with Ctrl+C.
 interrupt
-
 eexpect $prompt
+
+start_test "Check that an auth cookie cannot be created for a user that does not exist."
+send "$argv auth-session login nonexistent --certs-dir=$certs_dir\r"
+eexpect "user \"nonexistent\" does not exist"
+eexpect $prompt
+end_test
+
+start_test "Check that the auth cookie creation works and reports useful output."
+send "$argv auth-session login eisen --certs-dir=$certs_dir\r"
+eexpect "authentication cookie"
+eexpect "session="
+eexpect "HttpOnly"
+eexpect "Example uses:"
+eexpect "curl"
+eexpect "wget"
+eexpect $prompt
+end_test
+
+start_test "Check that the auth cookie can be emitted standalone."
+send "$argv auth-session login eisen --certs-dir=$certs_dir --only-cookie >cookie.txt\r"
+eexpect $prompt
+system "grep HttpOnly cookie.txt"
+end_test
+
+start_test "Check that the session is visible in the output of list."
+send "$argv auth-session list --certs-dir=$certs_dir\r"
+eexpect username
+eexpect eisen
+eexpect eisen
+eexpect "2 rows"
+eexpect $prompt
+end_test
+
+set pyfile [file join [file dirname $argv0] test_auth_cookie.py]
+
+start_test "Check that the auth cookie works."
+send "$python $pyfile cookie.txt 'https://localhost:8080/_admin/v1/settings'\r"
+eexpect "cluster.organization"
+eexpect $prompt
+end_test
+
+
+start_test "Check that the cookie can be revoked."
+send "$argv auth-session logout eisen --certs-dir=$certs_dir\r"
+eexpect username
+eexpect eisen
+eexpect eisen
+eexpect "2 rows"
+eexpect $prompt
+
+send "$python $pyfile cookie.txt 'https://localhost:8080/_admin/v1/settings'\r"
+eexpect "HTTP Error 401"
+eexpect $prompt
+end_test
+
+start_test "Check that a root cookie works."
+send "$argv auth-session login root --certs-dir=$certs_dir --only-cookie >cookie.txt\r"
+eexpect $prompt
+send "$python $pyfile cookie.txt 'https://localhost:8080/_admin/v1/settings'\r"
+eexpect "cluster.organization"
+eexpect $prompt
+end_test
+
 
 send "exit 0\r"
 eexpect eof

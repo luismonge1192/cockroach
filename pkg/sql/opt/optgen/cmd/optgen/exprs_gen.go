@@ -132,12 +132,12 @@ func (g *exprsGen) genExprGroupDef(define *lang.DefineExpr) {
 
 // genPrivateStruct generates the struct for a define tagged as Private:
 //
-//  type FunctionPrivate struct {
-//    Name       string
-//    Typ        *types.T
-//    Properties *tree.FunctionProperties
-//    Overload   *tree.Overload
-//  }
+//   type FunctionPrivate struct {
+//     Name       string
+//     Typ        *types.T
+//     Properties *tree.FunctionProperties
+//     Overload   *tree.Overload
+//   }
 //
 func (g *exprsGen) genPrivateStruct(define *lang.DefineExpr) {
 	privTyp := g.md.typeOf(define)
@@ -154,9 +154,9 @@ func (g *exprsGen) genPrivateStruct(define *lang.DefineExpr) {
 
 		// If field's name is "_", then use Go embedding syntax.
 		if isEmbeddedField(field) {
-			fmt.Fprintf(g.w, "  %s\n", g.md.typeOf(field).name)
+			fmt.Fprintf(g.w, "  %s\n", g.md.typeOf(field).asField())
 		} else {
-			fmt.Fprintf(g.w, "  %s %s\n", field.Name, g.md.typeOf(field).name)
+			fmt.Fprintf(g.w, "  %s %s\n", field.Name, g.md.typeOf(field).asField())
 		}
 	}
 	fmt.Fprintf(g.w, "}\n\n")
@@ -189,10 +189,10 @@ func (g *exprsGen) genExprStruct(define *lang.DefineExpr) {
 
 		// If field's name is "_", then use Go embedding syntax.
 		if isEmbeddedField(field) {
-			fmt.Fprintf(g.w, "  %s\n", g.md.typeOf(field).name)
+			fmt.Fprintf(g.w, "  %s\n", g.md.typeOf(field).asField())
 		} else {
 			fieldName := g.md.fieldName(field)
-			fmt.Fprintf(g.w, "  %s %s\n", fieldName, g.md.typeOf(field).name)
+			fmt.Fprintf(g.w, "  %s %s\n", fieldName, g.md.typeOf(field).asField())
 		}
 	}
 
@@ -201,7 +201,13 @@ func (g *exprsGen) genExprStruct(define *lang.DefineExpr) {
 		if g.needsDataTypeField(define) {
 			fmt.Fprintf(g.w, "  Typ *types.T\n")
 		}
-		fmt.Fprintf(g.w, "  id  opt.ScalarID\n")
+		if define.Tags.Contains("ListItem") {
+			if define.Tags.Contains("ScalarProps") {
+				fmt.Fprintf(g.w, "  scalar props.Scalar\n")
+			}
+		} else {
+			fmt.Fprintf(g.w, "  id opt.ScalarID\n")
+		}
 	} else if define.Tags.Contains("Enforcer") {
 		fmt.Fprintf(g.w, "  Input RelExpr\n")
 		fmt.Fprintf(g.w, "  best  bestProps\n")
@@ -210,6 +216,7 @@ func (g *exprsGen) genExprStruct(define *lang.DefineExpr) {
 		fmt.Fprintf(g.w, "  grp  exprGroup\n")
 		fmt.Fprintf(g.w, "  next RelExpr\n")
 	}
+
 	fmt.Fprintf(g.w, "}\n\n")
 }
 
@@ -225,7 +232,11 @@ func (g *exprsGen) genExprFuncs(define *lang.DefineExpr) {
 
 		// Generate the ID method.
 		fmt.Fprintf(g.w, "func (e *%s) ID() opt.ScalarID {\n", opTyp.name)
-		fmt.Fprintf(g.w, "  return e.id\n")
+		if define.Tags.Contains("ListItem") {
+			fmt.Fprintf(g.w, "  return 0\n")
+		} else {
+			fmt.Fprintf(g.w, "  return e.id\n")
+		}
 		fmt.Fprintf(g.w, "}\n\n")
 	} else {
 		fmt.Fprintf(g.w, "var _ RelExpr = &%s{}\n\n", opTyp.name)
@@ -248,13 +259,12 @@ func (g *exprsGen) genExprFuncs(define *lang.DefineExpr) {
 		n := 0
 		for _, field := range childFields {
 			fieldName := g.md.fieldName(field)
+			fieldType := g.md.typeOf(field)
 
+			// Use dynamicFieldLoadPrefix, since we're loading from field and
+			// returning as dynamic opt.Expr type.
 			fmt.Fprintf(g.w, "  case %d:\n", n)
-			if g.md.typeOf(field).isPointer {
-				fmt.Fprintf(g.w, "    return e.%s\n", fieldName)
-			} else {
-				fmt.Fprintf(g.w, "    return &e.%s\n", fieldName)
-			}
+			fmt.Fprintf(g.w, "    return %se.%s\n", dynamicFieldLoadPrefix(fieldType), fieldName)
 			n++
 		}
 		fmt.Fprintf(g.w, "  }\n")
@@ -266,12 +276,11 @@ func (g *exprsGen) genExprFuncs(define *lang.DefineExpr) {
 	fmt.Fprintf(g.w, "func (e *%s) Private() interface{} {\n", opTyp.name)
 	if privateField != nil {
 		fieldName := g.md.fieldName(privateField)
+		fieldType := g.md.typeOf(privateField)
 
-		if g.md.typeOf(privateField).isPointer {
-			fmt.Fprintf(g.w, "  return e.%s\n", fieldName)
-		} else {
-			fmt.Fprintf(g.w, "  return &e.%s\n", fieldName)
-		}
+		// Use dynamicFieldLoadPrefix, since we're loading from field and returning
+		// as dynamic interface{} type.
+		fmt.Fprintf(g.w, "  return %se.%s\n", dynamicFieldLoadPrefix(fieldType), fieldName)
 	} else {
 		fmt.Fprintf(g.w, "  return nil\n")
 	}
@@ -297,12 +306,12 @@ func (g *exprsGen) genExprFuncs(define *lang.DefineExpr) {
 			fieldTyp := g.md.typeOf(field)
 			fieldName := g.md.fieldName(field)
 
+			// Use castFromDynamicParam and then fieldStorePrefix, in order to first
+			// cast from the dynamic param type (opt.Expr) to the static param type,
+			// and then to store that into the field.
 			fmt.Fprintf(g.w, "  case %d:\n", n)
-			if fieldTyp.isPointer {
-				fmt.Fprintf(g.w, "    e.%s = child.(%s)\n", fieldName, fieldTyp.name)
-			} else {
-				fmt.Fprintf(g.w, "    e.%s = *child.(*%s)\n", fieldName, fieldTyp.name)
-			}
+			fmt.Fprintf(g.w, "    %se.%s = %s\n", fieldStorePrefix(fieldTyp), fieldName,
+				castFromDynamicParam("child", fieldTyp))
 			fmt.Fprintf(g.w, "    return\n")
 			n++
 		}
@@ -321,13 +330,15 @@ func (g *exprsGen) genExprFuncs(define *lang.DefineExpr) {
 		}
 		fmt.Fprintf(g.w, "}\n\n")
 
-		// Generate the ScalarProps method.
-		if name := g.scalarPropsFieldName(define); name != "" {
-			fmt.Fprintf(g.w, "func (e *%s) ScalarProps(mem *Memo) *props.Scalar {\n", opTyp.name)
-			fmt.Fprintf(g.w, "  if !e.scalar.Populated {\n")
-			fmt.Fprintf(g.w, "    mem.logPropsBuilder.build%sProps(e, &e.%s)\n", define.Name, name)
-			fmt.Fprintf(g.w, "  }\n")
-			fmt.Fprintf(g.w, "  return &e.%s\n", name)
+		// Generate the PopulateProps and ScalarProps methods.
+		if define.Tags.Contains("ScalarProps") {
+			fmt.Fprintf(g.w, "func (e *%s) PopulateProps(mem *Memo) {\n", opTyp.name)
+			fmt.Fprintf(g.w, "  mem.logPropsBuilder.build%sProps(e, &e.scalar)\n", opTyp.name)
+			fmt.Fprintf(g.w, "  e.scalar.Populated = true\n")
+			fmt.Fprintf(g.w, "}\n\n")
+
+			fmt.Fprintf(g.w, "func (e *%s) ScalarProps() *props.Scalar {\n", opTyp.name)
+			fmt.Fprintf(g.w, "  return &e.scalar\n")
 			fmt.Fprintf(g.w, "}\n\n")
 		}
 	} else {
@@ -521,12 +532,10 @@ func (g *exprsGen) genListExprFuncs(define *lang.DefineExpr) {
 	fmt.Fprintf(g.w, "}\n\n")
 
 	// Generate the Child method.
+	// Use dynamicFieldLoadPrefix, since the field is being passed as the dynamic
+	// opt.Expr type.
 	fmt.Fprintf(g.w, "func (e *%s) Child(nth int) opt.Expr {\n", opTyp.name)
-	if opTyp.listItemType.isPointer {
-		fmt.Fprintf(g.w, "  return (*e)[nth]\n")
-	} else {
-		fmt.Fprintf(g.w, "  return &(*e)[nth]\n")
-	}
+	fmt.Fprintf(g.w, "    return %s(*e)[nth]\n", dynamicFieldLoadPrefix(opTyp.listItemType))
 	fmt.Fprintf(g.w, "}\n\n")
 
 	// Generate the Private method.
@@ -542,12 +551,12 @@ func (g *exprsGen) genListExprFuncs(define *lang.DefineExpr) {
 	fmt.Fprintf(g.w, "}\n\n")
 
 	// Generate the SetChild method.
+	// Use castFromDynamicParam and then fieldStorePrefix, in order to first cast
+	// from the dynamic param type (opt.Expr) to the static param type, and then
+	// to store that into the field.
 	fmt.Fprintf(g.w, "func (e *%s) SetChild(nth int, child opt.Expr) {\n", opTyp.name)
-	if opTyp.listItemType.isPointer {
-		fmt.Fprintf(g.w, "  (*e)[nth] = child.(%s)\n", opTyp.listItemType.name)
-	} else {
-		fmt.Fprintf(g.w, "  (*e)[nth] = *child.(*%s)\n", opTyp.listItemType.name)
-	}
+	fmt.Fprintf(g.w, "    (*e)[nth] = %s%s\n", fieldStorePrefix(opTyp.listItemType),
+		castFromDynamicParam("child", opTyp.listItemType))
 	fmt.Fprintf(g.w, "}\n\n")
 
 	// Generate the DataType method.
@@ -568,9 +577,10 @@ func (g *exprsGen) genMemoizeFuncs() {
 
 	for _, define := range defines {
 		opTyp := g.md.typeOf(define)
+		fields := g.md.childAndPrivateFields(define)
 
 		fmt.Fprintf(g.w, "func (m *Memo) Memoize%s(\n", define.Name)
-		for _, field := range define.Fields {
+		for _, field := range fields {
 			fieldTyp := g.md.typeOf(field)
 			fieldName := g.md.fieldName(field)
 			fmt.Fprintf(g.w, "  %s %s,\n", unTitle(fieldName), fieldTyp.asParam())
@@ -597,15 +607,13 @@ func (g *exprsGen) genMemoizeFuncs() {
 			fmt.Fprintf(g.w, "  grp := &%s{mem: m, first: %s{\n", groupName, opTyp.name)
 		}
 
-		for _, field := range define.Fields {
+		for _, field := range fields {
 			fieldTyp := g.md.typeOf(field)
 			fieldName := g.md.fieldName(field)
 
-			if fieldTyp.passByVal {
-				fmt.Fprintf(g.w, "   %s: %s,\n", fieldName, unTitle(fieldName))
-			} else {
-				fmt.Fprintf(g.w, "   %s: *%s,\n", fieldName, unTitle(fieldName))
-			}
+			// Use fieldStorePrefix since a value with a static param type is being
+			// stored as a field type.
+			fmt.Fprintf(g.w, "   %s: %s%s,\n", fieldName, fieldStorePrefix(fieldTyp), unTitle(fieldName))
 		}
 
 		if define.Tags.Contains("Scalar") {
@@ -628,11 +636,17 @@ func (g *exprsGen) genMemoizeFuncs() {
 		fmt.Fprintf(g.w, "  if m.newGroupFn != nil {\n")
 		fmt.Fprintf(g.w, "    m.newGroupFn(e)\n")
 		fmt.Fprintf(g.w, "  }\n")
+
+		if g.md.hasUnexportedFields(define) {
+			fmt.Fprintf(g.w, "  e.initUnexportedFields(m)\n")
+		}
+
 		if !define.Tags.Contains("Scalar") {
 			fmt.Fprintf(g.w, "  m.logPropsBuilder.build%sProps(e, &grp.rel)\n", define.Name)
+			fmt.Fprintf(g.w, "  grp.rel.Populated = true\n")
 		}
 		fmt.Fprintf(g.w, "    m.memEstimate += size\n")
-		fmt.Fprintf(g.w, "    m.checkExpr(e)\n")
+		fmt.Fprintf(g.w, "    m.CheckExpr(e)\n")
 		fmt.Fprintf(g.w, "  }\n")
 		if define.Tags.Contains("Scalar") {
 			fmt.Fprintf(g.w, "  return interned\n")
@@ -683,9 +697,12 @@ func (g *exprsGen) genAddToGroupFuncs() {
 		fmt.Fprintf(g.w, "  const size = int64(unsafe.Sizeof(%s{}))\n", opTyp.name)
 		fmt.Fprintf(g.w, "  interned := m.interner.Intern%s(e)\n", define.Name)
 		fmt.Fprintf(g.w, "  if interned == e {\n")
+		if g.md.hasUnexportedFields(define) {
+			fmt.Fprintf(g.w, "    e.initUnexportedFields(m)\n")
+		}
 		fmt.Fprintf(g.w, "    e.setGroup(grp)\n")
 		fmt.Fprintf(g.w, "    m.memEstimate += size\n")
-		fmt.Fprintf(g.w, "    m.checkExpr(e)\n")
+		fmt.Fprintf(g.w, "    m.CheckExpr(e)\n")
 		fmt.Fprintf(g.w, "  } else if interned.group() != grp.group() {\n")
 		fmt.Fprintf(g.w, "    // This is a group collision, do nothing.\n")
 		fmt.Fprintf(g.w, "    return nil\n")
@@ -807,15 +824,6 @@ func (g *exprsGen) genBuildPropsFunc() {
 
 	fmt.Fprintf(g.w, "  }\n")
 	fmt.Fprintf(g.w, "}\n\n")
-}
-
-func (g *exprsGen) scalarPropsFieldName(define *lang.DefineExpr) string {
-	for _, field := range expandFields(g.compiled, define) {
-		if field.Type == "ScalarProps" {
-			return string(field.Name)
-		}
-	}
-	return ""
 }
 
 func (g *exprsGen) needsDataTypeField(define *lang.DefineExpr) bool {

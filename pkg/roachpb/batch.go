@@ -18,7 +18,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 //go:generate go run -tags gen-batch gen_batch.go
@@ -43,9 +43,6 @@ func (ba *BatchRequest) SetActiveTimestamp(nowFn func() hlc.Timestamp) error {
 		// Note that writes will be performed at the provisional commit timestamp,
 		// txn.Timestamp, regardless of the batch timestamp.
 		ba.Timestamp = txn.ReadTimestamp
-		// For compatibility with 19.2 nodes which might not have set ReadTimestamp,
-		// fallback to DeprecatedOrigTimestamp.
-		ba.Timestamp.Forward(txn.DeprecatedOrigTimestamp)
 	} else {
 		// When not transactional, allow empty timestamp and use nowFn instead
 		if ba.Timestamp == (hlc.Timestamp{}) {
@@ -173,21 +170,21 @@ func (ba *BatchRequest) IsSingleHeartbeatTxnRequest() bool {
 	return false
 }
 
-// IsSingleEndTransactionRequest returns true iff the batch contains a single
-// request, and that request is an EndTransactionRequest.
-func (ba *BatchRequest) IsSingleEndTransactionRequest() bool {
+// IsSingleEndTxnRequest returns true iff the batch contains a single request,
+// and that request is an EndTxnRequest.
+func (ba *BatchRequest) IsSingleEndTxnRequest() bool {
 	if ba.IsSingleRequest() {
-		_, ok := ba.Requests[0].GetInner().(*EndTransactionRequest)
+		_, ok := ba.Requests[0].GetInner().(*EndTxnRequest)
 		return ok
 	}
 	return false
 }
 
-// IsSingleAbortTransactionRequest returns true iff the batch contains a single
-// request, and that request is an EndTransactionRequest(commit=false).
-func (ba *BatchRequest) IsSingleAbortTransactionRequest() bool {
+// IsSingleAbortTxnRequest returns true iff the batch contains a single request,
+// and that request is an EndTxnRequest(commit=false).
+func (ba *BatchRequest) IsSingleAbortTxnRequest() bool {
 	if ba.IsSingleRequest() {
-		if et, ok := ba.Requests[0].GetInner().(*EndTransactionRequest); ok {
+		if et, ok := ba.Requests[0].GetInner().(*EndTxnRequest); ok {
 			return !et.Commit
 		}
 	}
@@ -238,15 +235,9 @@ func (ba *BatchRequest) IsSingleAddSSTableRequest() bool {
 // IsCompleteTransaction determines whether a batch contains every write in a
 // transactions.
 func (ba *BatchRequest) IsCompleteTransaction() bool {
-	et, hasET := ba.GetArg(EndTransaction)
-	if !hasET || !et.(*EndTransactionRequest).Commit {
+	et, hasET := ba.GetArg(EndTxn)
+	if !hasET || !et.(*EndTxnRequest).Commit {
 		return false
-	}
-	if _, hasBegin := ba.GetArg(BeginTransaction); hasBegin {
-		// TODO(nvanbenschoten): Remove this condition in 2.3. It can be removed
-		// in 2.3 once we're sure that all nodes will properly set sequence
-		// numbers (i.e. on writes only).
-		return true
 	}
 	maxSeq := et.Header().Sequence
 	switch maxSeq {
@@ -263,7 +254,7 @@ func (ba *BatchRequest) IsCompleteTransaction() bool {
 		return false
 	}
 	// Check whether any sequence numbers were skipped between 1 and the
-	// EndTransaction's sequence number. A Batch is only a complete transaction
+	// EndTxn's sequence number. A Batch is only a complete transaction
 	// if it contains every write that the transaction performed.
 	nextSeq := enginepb.TxnSeq(1)
 	for _, args := range ba.Requests {
@@ -319,12 +310,12 @@ func (ba *BatchRequest) hasFlagForAll(flag int) bool {
 
 // GetArg returns a request of the given type if one is contained in the
 // Batch. The request returned is the first of its kind, with the exception
-// of EndTransaction, where it examines the very last request only.
+// of EndTxn, where it examines the very last request only.
 func (ba *BatchRequest) GetArg(method Method) (Request, bool) {
-	// when looking for EndTransaction, just look at the last entry.
-	if method == EndTransaction {
+	// when looking for EndTxn, just look at the last entry.
+	if method == EndTxn {
 		if length := len(ba.Requests); length > 0 {
-			if req := ba.Requests[length-1].GetInner(); req.Method() == EndTransaction {
+			if req := ba.Requests[length-1].GetInner(); req.Method() == EndTxn {
 				return req, true
 			}
 		}
@@ -384,9 +375,8 @@ func (ba *BatchRequest) IntentSpanIterate(br *BatchResponse, fn func(Span)) {
 // requests are used, but when a response contains a ResumeSpan the
 // ResumeSpan is subtracted from the request span to provide a more
 // minimal span of keys affected by the request. The supplied function
-// is called with each span and a bool indicating whether the span
-// updates the write timestamp cache.
-func (ba *BatchRequest) RefreshSpanIterate(br *BatchResponse, fn func(Span, bool)) {
+// is called with each span.
+func (ba *BatchRequest) RefreshSpanIterate(br *BatchResponse, fn func(Span)) {
 	for i, arg := range ba.Requests {
 		req := arg.GetInner()
 		if !NeedsRefresh(req) {
@@ -397,7 +387,7 @@ func (ba *BatchRequest) RefreshSpanIterate(br *BatchResponse, fn func(Span, bool
 			resp = br.Responses[i].GetInner()
 		}
 		if span, ok := ActualSpan(req, resp); ok {
-			fn(span, UpdatesWriteTimestampCache(req))
+			fn(span)
 		}
 	}
 }
@@ -486,11 +476,16 @@ func (ba *BatchRequest) Methods() []Method {
 // Split separates the requests contained in a batch so that each subset of
 // requests can be executed by a Store (without changing order). In particular,
 // Admin requests are always singled out and mutating requests separated from
-// reads. The boolean parameter indicates whether EndTransaction should be
-// special-cased: If false, an EndTransaction request will never be split into
-// a new chunk (otherwise, it is treated according to its flags). This allows
-// sending a whole transaction in a single Batch when addressing a single
-// range.
+// reads. The boolean parameter indicates whether EndTxn should be
+// special-cased: If false, an EndTxn request will never be split into a new
+// chunk (otherwise, it is treated according to its flags). This allows sending
+// a whole transaction in a single Batch when addressing a single range.
+//
+// NOTE: One reason for splitting reads from writes is that write-only batches
+// can sometimes have their read timestamp bumped on the server, which doesn't
+// work for read requests due to how the timestamp-aware latching works (i.e. a
+// read that acquired a latch @ ts10 can't simply be bumped to ts 20 because
+// there might have been overlapping writes in the 10..20 window).
 func (ba BatchRequest) Split(canSplitET bool) [][]RequestUnion {
 	compatible := func(exFlags, newFlags int) bool {
 		// isAlone requests are never compatible.
@@ -531,7 +526,7 @@ func (ba BatchRequest) Split(canSplitET bool) [][]RequestUnion {
 						nArgs := nUnion.GetInner()
 						nFlags := nArgs.flags()
 						nMethod := nArgs.Method()
-						if !canSplitET && nMethod == EndTransaction {
+						if !canSplitET && nMethod == EndTxn {
 							nFlags = 0 // always compatible
 						}
 						if (nFlags & isPrefix) == 0 {
@@ -547,7 +542,7 @@ func (ba BatchRequest) Split(canSplitET bool) [][]RequestUnion {
 				hFlags = -1 // reset
 			}
 			cmpFlags := flags
-			if !canSplitET && method == EndTransaction {
+			if !canSplitET && method == EndTxn {
 				cmpFlags = 0 // always compatible
 			}
 			if gFlags == -1 {
@@ -585,9 +580,10 @@ func (ba BatchRequest) String() string {
 			continue
 		}
 		req := arg.GetInner()
-		if et, ok := req.(*EndTransactionRequest); ok {
+		if et, ok := req.(*EndTxnRequest); ok {
 			h := req.Header()
-			str = append(str, fmt.Sprintf("%s(commit:%t) [%s]", req.Method(), et.Commit, h.Key))
+			str = append(str, fmt.Sprintf("%s(commit:%t tsflex:%t) [%s] ",
+				req.Method(), et.Commit, et.CanCommitAtHigherTimestamp, h.Key))
 		} else {
 			h := req.Header()
 			var s string
@@ -601,4 +597,23 @@ func (ba BatchRequest) String() string {
 		}
 	}
 	return strings.Join(str, ", ")
+}
+
+// ValidateForEvaluation performs sanity checks on the batch when it's received
+// by the "server" for evaluation.
+func (ba BatchRequest) ValidateForEvaluation() error {
+	if ba.RangeID == 0 {
+		return errors.AssertionFailedf("batch request missing range ID")
+	} else if ba.Replica.StoreID == 0 {
+		return errors.AssertionFailedf("batch request missing store ID")
+	}
+	if _, ok := ba.GetArg(EndTxn); ok && ba.Txn == nil {
+		return errors.AssertionFailedf("EndTxn request without transaction")
+	}
+	if ba.Txn != nil {
+		if ba.Txn.WriteTooOld && (ba.Txn.ReadTimestamp.Equal(ba.Txn.WriteTimestamp)) {
+			return errors.AssertionFailedf("WriteTooOld set but no offset in timestamps. txn: %s", ba.Txn)
+		}
+	}
+	return nil
 }

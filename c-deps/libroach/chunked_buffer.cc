@@ -29,6 +29,7 @@ void chunkedBuffer::Put(const rocksdb::Slice& key, const rocksdb::Slice& value) 
   put(key.data(), key.size(), value.size());
   put(value.data(), value.size(), 0);
   count_++;
+  bytes_ += sizeof(size_buf) + key.size() + value.size(); // see (*pebbleResults).put
 }
 
 void chunkedBuffer::Clear() {
@@ -36,6 +37,7 @@ void chunkedBuffer::Clear() {
     delete[] bufs_[i].data;
   }
   count_ = 0;
+  bytes_ = 0;
   buf_ptr_ = nullptr;
   bufs_.clear();
 }
@@ -59,8 +61,8 @@ void chunkedBuffer::put(const char* data, int len, int next_size_hint) {
     data += avail;
     len -= avail;
 
-    const int max_size = 128 << 20; // 128 MB
-    int new_size = bufs_.empty() ? 16 : bufs_.back().len * 2;
+    const int max_size = 128 << 20;  // 128 MB
+    size_t new_size = bufs_.empty() ? 16 : bufs_.back().len * 2;
     for (; new_size < len + next_size_hint && new_size < max_size; new_size *= 2) {
     }
     if (new_size > max_size) {

@@ -89,7 +89,7 @@ func makeDatumFromColOffset(
 		default:
 			data := col.Bytes().Get(rowIdx)
 			str := *(*string)(unsafe.Pointer(&data))
-			return tree.ParseDatumStringAs(hint, str, evalCtx)
+			return sqlbase.ParseDatumStringAs(hint, str, evalCtx)
 		}
 	}
 	return nil, errors.Errorf(
@@ -147,7 +147,7 @@ func (w *workloadReader) readFiles(
 	}
 
 	for _, wc := range wcs {
-		if err := ctxgroup.GroupWorkers(ctx, runtime.NumCPU(), func(ctx context.Context) error {
+		if err := ctxgroup.GroupWorkers(ctx, runtime.NumCPU(), func(ctx context.Context, _ int) error {
 			evalCtx := w.evalCtx.Copy()
 			return wc.Worker(ctx, evalCtx)
 		}); err != nil {
@@ -202,7 +202,7 @@ func NewWorkloadKVConverter(
 //
 // This worker needs its own EvalContext and DatumAlloc.
 func (w *WorkloadKVConverter) Worker(ctx context.Context, evalCtx *tree.EvalContext) error {
-	conv, err := row.NewDatumRowConverter(w.tableDesc, nil /* targetColNames */, evalCtx, w.kvCh)
+	conv, err := row.NewDatumRowConverter(ctx, w.tableDesc, nil /* targetColNames */, evalCtx, w.kvCh)
 	if err != nil {
 		return err
 	}

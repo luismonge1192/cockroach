@@ -262,7 +262,7 @@ func (eg *exprGen) castToDesiredType(arg interface{}, desiredType reflect.Type) 
 				if !ok {
 					return nil
 				}
-				return memo.FiltersItem{Condition: expr}
+				return eg.f.ConstructFiltersItem(expr)
 			})
 			if converted != nil {
 				return converted
@@ -309,6 +309,18 @@ func (eg *exprGen) castToDesiredType(arg interface{}, desiredType reflect.Type) 
 		// String to ExplainOptions.
 		if desiredType == reflect.TypeOf(tree.ExplainOptions{}) {
 			return eg.ExplainOptions(str)
+		}
+
+		// String to bool.
+		if desiredType == reflect.TypeOf(true) {
+			switch str {
+			case "true":
+				return true
+			case "false":
+				return false
+			default:
+				panic(errorf("invalid boolean value \"%s\" (expected \"true\" or \"false\")", str))
+			}
 		}
 	}
 	return nil

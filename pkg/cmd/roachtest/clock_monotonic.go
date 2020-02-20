@@ -27,7 +27,7 @@ func runClockMonotonicity(ctx context.Context, t *test, c *cluster, tc clockMono
 
 	t.Status("deploying offset injector")
 	offsetInjector := newOffsetInjector(c)
-	if err := offsetInjector.deploy(ctx, t.l); err != nil {
+	if err := offsetInjector.deploy(ctx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -129,7 +129,8 @@ func registerClockMonotonicTests(r *testRegistry) {
 	for i := range testCases {
 		tc := testCases[i]
 		spec := testSpec{
-			Name: "clock/monotonic/" + tc.name,
+			Name:  "clock/monotonic/" + tc.name,
+			Owner: OwnerKV,
 			// These tests muck with NTP, therefor we don't want the cluster reused by
 			// others.
 			Cluster: makeClusterSpec(1, reuseTagged("offset-injector")),

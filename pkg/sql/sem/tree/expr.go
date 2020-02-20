@@ -20,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
 )
 
@@ -522,7 +521,7 @@ func (node *ComparisonExpr) memoizeFn() {
 		}
 	}
 
-	fn, ok := CmpOps[fOp].lookupImpl(leftRet, rightRet)
+	fn, ok := CmpOps[fOp].LookupImpl(leftRet, rightRet)
 	if !ok {
 		panic(errors.AssertionFailedf("lookup for ComparisonExpr %s's CmpOp failed",
 			AsStringWithFlags(node, FmtShowTypes)))
@@ -548,6 +547,12 @@ type RangeCond struct {
 	Left      Expr
 	From, To  Expr
 
+	// Typed version of Left for the comparison with To (where it may be
+	// type-checked differently). After type-checking, Left is set to the typed
+	// version for the comparison with From, and leftTo is set to the typed
+	// version for the comparison with To.
+	leftTo TypedExpr
+
 	typeAnnotation
 }
 
@@ -567,14 +572,21 @@ func (node *RangeCond) Format(ctx *FmtCtx) {
 	binExprFmtWithParen(ctx, node.From, "AND", node.To, true)
 }
 
-// TypedLeft returns the RangeCond's left expression as a TypedExpr.
-func (node *RangeCond) TypedLeft() TypedExpr {
+// TypedLeftFrom returns the RangeCond's left expression as a TypedExpr, in the
+// context of a comparison with TypedFrom().
+func (node *RangeCond) TypedLeftFrom() TypedExpr {
 	return node.Left.(TypedExpr)
 }
 
 // TypedFrom returns the RangeCond's from expression as a TypedExpr.
 func (node *RangeCond) TypedFrom() TypedExpr {
 	return node.From.(TypedExpr)
+}
+
+// TypedLeftTo returns the RangeCond's left expression as a TypedExpr, in the
+// context of a comparison with TypedTo().
+func (node *RangeCond) TypedLeftTo() TypedExpr {
+	return node.leftTo
 }
 
 // TypedTo returns the RangeCond's to expression as a TypedExpr.
@@ -856,36 +868,6 @@ func (node *Tuple) Format(ctx *FmtCtx) {
 // ResolvedType implements the TypedExpr interface.
 func (node *Tuple) ResolvedType() *types.T {
 	return node.typ
-}
-
-// Truncate returns a new Tuple that contains only a prefix of the original
-// expressions. E.g.
-//   Tuple:       (1, 2, 3)
-//   Truncate(2): (1, 2)
-func (node *Tuple) Truncate(prefix int) *Tuple {
-	return &Tuple{
-		Exprs: append(Exprs(nil), node.Exprs[:prefix]...),
-		Row:   node.Row,
-		typ:   types.MakeTuple(append([]types.T(nil), node.typ.TupleContents()[:prefix]...)),
-	}
-}
-
-// Project returns a new Tuple that contains a subset of the original
-// expressions. E.g.
-//  Tuple:           (1, 2, 3)
-//  Project({0, 2}): (1, 3)
-func (node *Tuple) Project(set util.FastIntSet) *Tuple {
-	exprs := make(Exprs, 0, set.Len())
-	contents := make([]types.T, 0, set.Len())
-	for i, ok := set.Next(0); ok; i, ok = set.Next(i + 1) {
-		exprs = append(exprs, node.Exprs[i])
-		contents = append(contents, node.typ.TupleContents()[i])
-	}
-	return &Tuple{
-		Exprs: exprs,
-		Row:   node.Row,
-		typ:   types.MakeTuple(contents),
-	}
 }
 
 // Array represents an array constructor.
@@ -1691,7 +1673,7 @@ func (node *TupleStar) Format(ctx *FmtCtx) {
 }
 
 // ColumnAccessExpr represents (E).x expressions. Specifically, it
-// allows accessing the column(s) from a Set Retruning Function.
+// allows accessing the column(s) from a Set Returning Function.
 type ColumnAccessExpr struct {
 	Expr    Expr
 	ColName string

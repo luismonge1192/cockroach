@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -73,7 +74,7 @@ func TestSelfBootstrap(t *testing.T) {
 func TestHealthCheck(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	cfg := config.DefaultZoneConfig()
+	cfg := zonepb.DefaultZoneConfig()
 	cfg.NumReplicas = proto.Int32(1)
 	s, err := serverutils.StartServerRaw(base.TestServerArgs{
 		Knobs: base.TestingKnobs{
@@ -116,6 +117,31 @@ func TestHealthCheck(t *testing.T) {
 		if !reflect.DeepEqual(expAlerts, result.Alerts) {
 			t.Fatalf("expected %+v, got %+v", expAlerts, result.Alerts)
 		}
+	}
+}
+
+// TestEngineTelemetry tests that the server increments a telemetry counter on
+// start that denotes engine type.
+func TestEngineTelemetry(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.TODO())
+
+	rows, err := db.Query("SELECT * FROM crdb_internal.feature_usage WHERE feature_name LIKE 'storage.engine.%' AND usage_count > 0;")
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for rows.Next() {
+		count++
+	}
+	if count < 1 {
+		t.Fatal("expected engine type telemetry counter to be emiitted")
 	}
 }
 
@@ -367,8 +393,9 @@ func TestMultiRangeScanDeleteRange(t *testing.T) {
 		t.Errorf("expected %d keys to be deleted, but got %d instead", writes, dr.Keys)
 	}
 
-	txnProto := roachpb.MakeTransaction("MyTxn", nil, 0, s.Clock().Now(), 0)
-	txn := client.NewTxnWithProto(ctx, db, s.NodeID(), client.RootTxn, txnProto)
+	now := s.Clock().Now()
+	txnProto := roachpb.MakeTransaction("MyTxn", nil, 0, now, 0)
+	txn := client.NewTxnFromProto(ctx, db, s.NodeID(), now, client.RootTxn, &txnProto)
 
 	scan := roachpb.NewScan(writes[0], writes[len(writes)-1].Next())
 	ba := roachpb.BatchRequest{}

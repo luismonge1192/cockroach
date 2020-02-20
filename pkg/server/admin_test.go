@@ -27,7 +27,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -59,7 +59,13 @@ import (
 func getAdminJSONProto(
 	ts serverutils.TestServerInterface, path string, response protoutil.Message,
 ) error {
-	return serverutils.GetJSONProto(ts, adminPrefix+path, response)
+	return getAdminJSONProtoWithAdminOption(ts, path, response, true)
+}
+
+func getAdminJSONProtoWithAdminOption(
+	ts serverutils.TestServerInterface, path string, response protoutil.Message, isAdmin bool,
+) error {
+	return serverutils.GetJSONProtoWithAdminOption(ts, adminPrefix+path, response, isAdmin)
 }
 
 func postAdminJSONProto(
@@ -236,88 +242,114 @@ func TestAdminAPIDatabases(t *testing.T) {
 	ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
 	defer span.Finish()
 
-	// Test databases endpoint.
 	const testdb = "test"
 	query := "CREATE DATABASE " + testdb
 	if _, err := db.Exec(query); err != nil {
 		t.Fatal(err)
 	}
 
-	var resp serverpb.DatabasesResponse
-	if err := getAdminJSONProto(s, "databases", &resp); err != nil {
+	// We have to create the non-admin user before calling
+	// "GRANT ... TO authenticatedUserNameNoAdmin".
+	// This is done in "GetAuthenticatedHTTPClient".
+	if _, err := ts.GetAuthenticatedHTTPClient(false); err != nil {
 		t.Fatal(err)
 	}
 
-	expectedDBs := []string{"defaultdb", "postgres", "system", testdb}
-	if a, e := len(resp.Databases), len(expectedDBs); a != e {
-		t.Fatalf("length of result %d != expected %d", a, e)
-	}
-
-	sort.Strings(resp.Databases)
-	for i, e := range expectedDBs {
-		if a := resp.Databases[i]; a != e {
-			t.Fatalf("database name %s != expected %s", a, e)
-		}
-	}
-
-	// Test database details endpoint.
+	// Grant permissions to view the tables for the given viewing user.
 	privileges := []string{"SELECT", "UPDATE"}
-	testuser := "testuser"
-	createUserQuery := "CREATE USER " + testuser
-	if _, err := db.Exec(createUserQuery); err != nil {
+	query = fmt.Sprintf(
+		"GRANT %s ON DATABASE %s TO %s",
+		strings.Join(privileges, ", "),
+		testdb,
+		authenticatedUserNameNoAdmin,
+	)
+	if _, err := db.Exec(query); err != nil {
 		t.Fatal(err)
 	}
 
-	grantQuery := "GRANT " + strings.Join(privileges, ", ") + " ON DATABASE " + testdb + " TO " + testuser
-	if _, err := db.Exec(grantQuery); err != nil {
-		t.Fatal(err)
-	}
-
-	var details serverpb.DatabaseDetailsResponse
-	if err := getAdminJSONProto(s, "databases/"+testdb, &details); err != nil {
-		t.Fatal(err)
-	}
-
-	if a, e := len(details.Grants), 4; a != e {
-		t.Fatalf("# of grants %d != expected %d", a, e)
-	}
-
-	userGrants := make(map[string][]string)
-	for _, grant := range details.Grants {
-		switch grant.User {
-		case sqlbase.AdminRole, security.RootUser, testuser:
-			userGrants[grant.User] = append(userGrants[grant.User], grant.Privileges...)
-		default:
-			t.Fatalf("unknown grant to user %s", grant.User)
-		}
-	}
-	for u, p := range userGrants {
-		switch u {
-		case sqlbase.AdminRole:
-			if !reflect.DeepEqual(p, []string{"ALL"}) {
-				t.Fatalf("privileges %v != expected %v", p, privileges)
+	for _, tc := range []struct {
+		expectedDBs []string
+		isAdmin     bool
+	}{
+		{[]string{"defaultdb", "postgres", "system", testdb}, true},
+		{[]string{testdb}, false},
+	} {
+		t.Run(fmt.Sprintf("isAdmin:%t", tc.isAdmin), func(t *testing.T) {
+			// Test databases endpoint.
+			var resp serverpb.DatabasesResponse
+			if err := getAdminJSONProtoWithAdminOption(
+				s,
+				"databases",
+				&resp,
+				tc.isAdmin,
+			); err != nil {
+				t.Fatal(err)
 			}
-		case security.RootUser:
-			if !reflect.DeepEqual(p, []string{"ALL"}) {
-				t.Fatalf("privileges %v != expected %v", p, privileges)
-			}
-		case testuser:
-			sort.Strings(p)
-			if !reflect.DeepEqual(p, privileges) {
-				t.Fatalf("privileges %v != expected %v", p, privileges)
-			}
-		default:
-			t.Fatalf("unknown grant to user %s", u)
-		}
-	}
 
-	// Verify Descriptor ID.
-	path, err := ts.admin.queryDescriptorIDPath(ctx, security.RootUser, []string{testdb})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if a, e := details.DescriptorID, int64(path[1]); a != e {
-		t.Fatalf("db had descriptorID %d, expected %d", a, e)
+			if a, e := len(resp.Databases), len(tc.expectedDBs); a != e {
+				t.Fatalf("length of result %d != expected %d", a, e)
+			}
+
+			sort.Strings(resp.Databases)
+			for i, e := range tc.expectedDBs {
+				if a := resp.Databases[i]; a != e {
+					t.Fatalf("database name %s != expected %s", a, e)
+				}
+			}
+
+			// Test database details endpoint.
+			var details serverpb.DatabaseDetailsResponse
+			if err := getAdminJSONProtoWithAdminOption(
+				s,
+				"databases/"+testdb,
+				&details,
+				tc.isAdmin,
+			); err != nil {
+				t.Fatal(err)
+			}
+
+			if a, e := len(details.Grants), 4; a != e {
+				t.Fatalf("# of grants %d != expected %d", a, e)
+			}
+
+			userGrants := make(map[string][]string)
+			for _, grant := range details.Grants {
+				switch grant.User {
+				case sqlbase.AdminRole, security.RootUser, authenticatedUserNameNoAdmin:
+					userGrants[grant.User] = append(userGrants[grant.User], grant.Privileges...)
+				default:
+					t.Fatalf("unknown grant to user %s", grant.User)
+				}
+			}
+			for u, p := range userGrants {
+				switch u {
+				case sqlbase.AdminRole:
+					if !reflect.DeepEqual(p, []string{"ALL"}) {
+						t.Fatalf("privileges %v != expected %v", p, privileges)
+					}
+				case security.RootUser:
+					if !reflect.DeepEqual(p, []string{"ALL"}) {
+						t.Fatalf("privileges %v != expected %v", p, privileges)
+					}
+				case authenticatedUserNameNoAdmin:
+					sort.Strings(p)
+					if !reflect.DeepEqual(p, privileges) {
+						t.Fatalf("privileges %v != expected %v", p, privileges)
+					}
+				default:
+					t.Fatalf("unknown grant to user %s", u)
+				}
+			}
+
+			// Verify Descriptor ID.
+			path, err := ts.admin.queryDescriptorIDPath(ctx, security.RootUser, []string{testdb})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if a, e := details.DescriptorID, int64(path[1]); a != e {
+				t.Fatalf("db had descriptorID %d, expected %d", a, e)
+			}
+		})
 	}
 }
 
@@ -386,7 +418,7 @@ func TestAdminAPINonTableStats(t *testing.T) {
 // with no user data, all the ranges on the Databases page consist of:
 // 1) the total ranges listed for the system database
 // 2) the total ranges listed for the Non-Table data
-func TestRangeCount_MissingOneRange(t *testing.T) {
+func TestRangeCount_MissingTwoRanges(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	testCluster := serverutils.StartTestCluster(t, 3, base.TestClusterArgs{})
 	defer testCluster.Stopper().Stop(context.Background())
@@ -444,7 +476,9 @@ func TestRangeCount_MissingOneRange(t *testing.T) {
 	}
 
 	// TODO(celia): We're missing 1 range -- where is it?
-	expectedMissingRangeCount := int64(1)
+	// TODO(arul): We're missing 2 ranges after moving system.namespace out from
+	//  the gossip range -- where are they?
+	expectedMissingRangeCount := int64(2)
 	assert.Equal(t,
 		totalRangeCount,
 		nonTableRangeCount+systemTableRangeCount+expectedMissingRangeCount)
@@ -649,7 +683,7 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 	// Function to verify the zone for table "test.tbl" as returned by the Admin
 	// API.
 	verifyTblZone := func(
-		expectedZone config.ZoneConfig, expectedLevel serverpb.ZoneConfigurationLevel,
+		expectedZone zonepb.ZoneConfig, expectedLevel serverpb.ZoneConfigurationLevel,
 	) {
 		var resp serverpb.TableDetailsResponse
 		if err := getAdminJSONProto(s, "databases/test/tables/tbl", &resp); err != nil {
@@ -669,7 +703,7 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 	// Function to verify the zone for database "test" as returned by the Admin
 	// API.
 	verifyDbZone := func(
-		expectedZone config.ZoneConfig, expectedLevel serverpb.ZoneConfigurationLevel,
+		expectedZone zonepb.ZoneConfig, expectedLevel serverpb.ZoneConfigurationLevel,
 	) {
 		var resp serverpb.DatabaseDetailsResponse
 		if err := getAdminJSONProto(s, "databases/test", &resp); err != nil {
@@ -687,7 +721,7 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 	}
 
 	// Function to store a zone config for a given object ID.
-	setZone := func(zoneCfg config.ZoneConfig, id sqlbase.ID) {
+	setZone := func(zoneCfg zonepb.ZoneConfig, id sqlbase.ID) {
 		zoneBytes, err := protoutil.Marshal(&zoneCfg)
 		if err != nil {
 			t.Fatal(err)
@@ -710,7 +744,7 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 	}
 
 	// Apply zone configuration to database and check again.
-	dbZone := config.ZoneConfig{
+	dbZone := zonepb.ZoneConfig{
 		RangeMinBytes: proto.Int64(456),
 	}
 	setZone(dbZone, idPath[1])
@@ -718,7 +752,7 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 	verifyTblZone(dbZone, serverpb.ZoneConfigurationLevel_DATABASE)
 
 	// Apply zone configuration to table and check again.
-	tblZone := config.ZoneConfig{
+	tblZone := zonepb.ZoneConfig{
 		RangeMinBytes: proto.Int64(789),
 	}
 	setZone(tblZone, idPath[2])
@@ -1216,14 +1250,16 @@ func TestAdminAPIJobs(t *testing.T) {
 		status   jobs.Status
 		details  jobspb.Details
 		progress jobspb.ProgressDetails
+		username string
 	}{
-		{1, jobs.StatusRunning, jobspb.RestoreDetails{}, jobspb.RestoreProgress{}},
-		{2, jobs.StatusRunning, jobspb.BackupDetails{}, jobspb.BackupProgress{}},
-		{3, jobs.StatusSucceeded, jobspb.BackupDetails{}, jobspb.BackupProgress{}},
-		{4, jobs.StatusRunning, jobspb.ChangefeedDetails{}, jobspb.ChangefeedProgress{}},
+		{1, jobs.StatusRunning, jobspb.RestoreDetails{}, jobspb.RestoreProgress{}, security.RootUser},
+		{2, jobs.StatusRunning, jobspb.BackupDetails{}, jobspb.BackupProgress{}, security.RootUser},
+		{3, jobs.StatusSucceeded, jobspb.BackupDetails{}, jobspb.BackupProgress{}, security.RootUser},
+		{4, jobs.StatusRunning, jobspb.ChangefeedDetails{}, jobspb.ChangefeedProgress{}, security.RootUser},
+		{5, jobs.StatusSucceeded, jobspb.BackupDetails{}, jobspb.BackupProgress{}, authenticatedUserNameNoAdmin},
 	}
 	for _, job := range testJobs {
-		payload := jobspb.Payload{Details: jobspb.WrapPayloadDetails(job.details)}
+		payload := jobspb.Payload{Username: job.username, Details: jobspb.WrapPayloadDetails(job.details)}
 		payloadBytes, err := protoutil.Marshal(&payload)
 		if err != nil {
 			t.Fatal(err)
@@ -1255,33 +1291,43 @@ func TestAdminAPIJobs(t *testing.T) {
 	const invalidJobType = math.MaxInt32
 
 	testCases := []struct {
-		uri         string
-		expectedIDs []int64
+		uri                    string
+		expectedIDsViaAdmin    []int64
+		expectedIDsViaNonAdmin []int64
 	}{
-		{"jobs", append([]int64{4, 3, 2, 1}, existingIDs...)},
-		{"jobs?limit=1", []int64{4}},
-		{"jobs?status=running", []int64{4, 2, 1}},
-		{"jobs?status=succeeded", append([]int64{3}, existingIDs...)},
-		{"jobs?status=pending", []int64{}},
-		{"jobs?status=garbage", []int64{}},
-		{fmt.Sprintf("jobs?type=%d", jobspb.TypeBackup), []int64{3, 2}},
-		{fmt.Sprintf("jobs?type=%d", jobspb.TypeRestore), []int64{1}},
-		{fmt.Sprintf("jobs?type=%d", invalidJobType), []int64{}},
-		{fmt.Sprintf("jobs?status=running&type=%d", jobspb.TypeBackup), []int64{2}},
+		{"jobs", append([]int64{5, 4, 3, 2, 1}, existingIDs...), []int64{5}},
+		{"jobs?limit=1", []int64{5}, []int64{5}},
+		{"jobs?status=running", []int64{4, 2, 1}, []int64{}},
+		{"jobs?status=succeeded", append([]int64{5, 3}, existingIDs...), []int64{5}},
+		{"jobs?status=pending", []int64{}, []int64{}},
+		{"jobs?status=garbage", []int64{}, []int64{}},
+		{fmt.Sprintf("jobs?type=%d", jobspb.TypeBackup), []int64{5, 3, 2}, []int64{5}},
+		{fmt.Sprintf("jobs?type=%d", jobspb.TypeRestore), []int64{1}, []int64{}},
+		{fmt.Sprintf("jobs?type=%d", invalidJobType), []int64{}, []int64{}},
+		{fmt.Sprintf("jobs?status=running&type=%d", jobspb.TypeBackup), []int64{2}, []int64{}},
 	}
-	for i, testCase := range testCases {
-		var res serverpb.JobsResponse
-		if err := getAdminJSONProto(s, testCase.uri, &res); err != nil {
-			t.Fatal(err)
+
+	testutils.RunTrueAndFalse(t, "isAdmin", func(t *testing.T, isAdmin bool) {
+		for i, testCase := range testCases {
+			var res serverpb.JobsResponse
+			if err := getAdminJSONProtoWithAdminOption(s, testCase.uri, &res, isAdmin); err != nil {
+				t.Fatal(err)
+			}
+			resIDs := []int64{}
+			for _, job := range res.Jobs {
+				resIDs = append(resIDs, job.ID)
+			}
+
+			expected := testCase.expectedIDsViaAdmin
+			if !isAdmin {
+				expected = testCase.expectedIDsViaNonAdmin
+			}
+
+			if e, a := expected, resIDs; !reflect.DeepEqual(e, a) {
+				t.Errorf("%d: expected job IDs %v, but got %v", i, e, a)
+			}
 		}
-		resIDs := []int64{}
-		for _, job := range res.Jobs {
-			resIDs = append(resIDs, job.ID)
-		}
-		if e, a := testCase.expectedIDs, resIDs; !reflect.DeepEqual(e, a) {
-			t.Errorf("%d: expected job IDs %v, but got %v", i, e, a)
-		}
-	}
+	})
 }
 
 func TestAdminAPILocations(t *testing.T) {

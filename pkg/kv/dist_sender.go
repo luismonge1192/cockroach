@@ -560,8 +560,8 @@ func (ds *DistSender) initAndVerifyBatch(
 
 	if ba.MaxSpanRequestKeys != 0 {
 		// Verify that the batch contains only specific range requests or the
-		// Begin/EndTransactionRequest. Verify that a batch with a ReverseScan
-		// only contains ReverseScan range requests.
+		// EndTxnRequest. Verify that a batch with a ReverseScan only contains
+		// ReverseScan range requests.
 		isReverse := ba.IsReverse()
 		for _, req := range ba.Requests {
 			inner := req.GetInner()
@@ -577,7 +577,7 @@ func (ds *DistSender) initAndVerifyBatch(
 			case *roachpb.QueryIntentRequest, *roachpb.ResolveIntentRangeRequest:
 				continue
 
-			case *roachpb.BeginTransactionRequest, *roachpb.EndTransactionRequest, *roachpb.ReverseScanRequest:
+			case *roachpb.EndTxnRequest, *roachpb.ReverseScanRequest:
 				continue
 
 			case *roachpb.RevertRangeRequest:
@@ -588,50 +588,30 @@ func (ds *DistSender) initAndVerifyBatch(
 		}
 	}
 
-	// If ScanOptions is set the batch is only allowed to contain scans.
-	if ba.ScanOptions != nil {
-		for _, req := range ba.Requests {
-			switch req.GetInner().(type) {
-			case *roachpb.ScanRequest, *roachpb.ReverseScanRequest:
-				// Scans are supported.
-			case *roachpb.BeginTransactionRequest, *roachpb.EndTransactionRequest:
-				// These requests are ignored.
-			default:
-				return roachpb.NewErrorf("batch with scan option has non-scans: %s", ba)
-			}
-		}
-		// If both MaxSpanRequestKeys and MinResults are set, then they can't be
-		// contradictory.
-		if ba.Header.MaxSpanRequestKeys != 0 &&
-			ba.Header.MaxSpanRequestKeys < ba.Header.ScanOptions.MinResults {
-			return roachpb.NewErrorf("MaxSpanRequestKeys (%d) < MinResults (%d): %s",
-				ba.Header.MaxSpanRequestKeys, ba.Header.ScanOptions.MinResults, ba)
-		}
-	}
 	return nil
 }
 
 // errNo1PCTxn indicates that a batch cannot be sent as a 1 phase
 // commit because it spans multiple ranges and must be split into at
-// least two parts, with the final part containing the EndTransaction
+// least two parts, with the final part containing the EndTxn
 // request.
 var errNo1PCTxn = roachpb.NewErrorf("cannot send 1PC txn to multiple ranges")
 
 // splitBatchAndCheckForRefreshSpans splits the batch according to the
 // canSplitET parameter and checks whether the final request is an
-// EndTransaction. If so, the EndTransactionRequest.NoRefreshSpans
+// EndTxn. If so, the EndTxnRequest.CanCommitAtHigherTimestamp
 // flag is reset to indicate whether earlier parts of the split may
 // result in refresh spans.
 func splitBatchAndCheckForRefreshSpans(
 	ba roachpb.BatchRequest, canSplitET bool,
 ) [][]roachpb.RequestUnion {
 	parts := ba.Split(canSplitET)
-	// If the final part contains an EndTransaction, we need to check
+	// If the final part contains an EndTxn, we need to check
 	// whether earlier split parts contain any refresh spans and properly
-	// set the NoRefreshSpans flag on the end transaction.
+	// set the CanCommitAtHigherTimestamp flag on the end transaction.
 	lastPart := parts[len(parts)-1]
 	lastReq := lastPart[len(lastPart)-1].GetInner()
-	if et, ok := lastReq.(*roachpb.EndTransactionRequest); ok && et.NoRefreshSpans {
+	if et, ok := lastReq.(*roachpb.EndTxnRequest); ok && et.CanCommitAtHigherTimestamp {
 		hasRefreshSpans := func() bool {
 			for _, part := range parts[:len(parts)-1] {
 				for _, req := range part {
@@ -644,7 +624,7 @@ func splitBatchAndCheckForRefreshSpans(
 		}()
 		if hasRefreshSpans {
 			etCopy := *et
-			etCopy.NoRefreshSpans = false
+			etCopy.CanCommitAtHigherTimestamp = false
 			lastPart = append([]roachpb.RequestUnion(nil), lastPart...)
 			lastPart[len(lastPart)-1].MustSetInner(&etCopy)
 			parts[len(parts)-1] = lastPart
@@ -660,14 +640,6 @@ func splitBatchAndCheckForRefreshSpans(
 //
 // When the request spans ranges, it is split by range and a partial
 // subset of the batch request is sent to affected ranges in parallel.
-//
-// Note that on error, this method will return any batch responses for
-// successfully processed batch requests. This allows the caller to
-// deal with potential retry situations where a batch is split so that
-// EndTransaction is processed alone, after earlier requests in the
-// batch succeeded. Where possible, the caller may be able to update
-// spans encountered in the transaction and retry just the
-// EndTransaction request to avoid client-side serializable txn retries.
 func (ds *DistSender) Send(
 	ctx context.Context, ba roachpb.BatchRequest,
 ) (*roachpb.BatchResponse, *roachpb.Error) {
@@ -690,7 +662,7 @@ func (ds *DistSender) Send(
 	splitET := false
 	var require1PC bool
 	lastReq := ba.Requests[len(ba.Requests)-1].GetInner()
-	if et, ok := lastReq.(*roachpb.EndTransactionRequest); ok && et.Require1PC {
+	if et, ok := lastReq.(*roachpb.EndTxnRequest); ok && et.Require1PC {
 		require1PC = true
 	}
 	// To ensure that we lay down intents to prevent starvation, always
@@ -706,7 +678,6 @@ func (ds *DistSender) Send(
 		panic("batch with MaxSpanRequestKeys needs splitting")
 	}
 
-	var pErr *roachpb.Error
 	errIdxOffset := 0
 	for len(parts) > 0 {
 		part := parts[0]
@@ -721,15 +692,16 @@ func (ds *DistSender) Send(
 		}
 
 		// Determine whether this part of the BatchRequest contains a committing
-		// EndTransaction request.
+		// EndTxn request.
 		var withCommit, withParallelCommit bool
-		if etArg, ok := ba.GetArg(roachpb.EndTransaction); ok {
-			et := etArg.(*roachpb.EndTransactionRequest)
+		if etArg, ok := ba.GetArg(roachpb.EndTxn); ok {
+			et := etArg.(*roachpb.EndTxnRequest)
 			withCommit = et.Commit
 			withParallelCommit = et.IsParallelCommit()
 		}
 
 		var rpl *roachpb.BatchResponse
+		var pErr *roachpb.Error
 		if withParallelCommit {
 			rpl, pErr = ds.divideAndSendParallelCommit(ctx, ba, rs, 0 /* batchIdx */)
 		} else {
@@ -737,26 +709,23 @@ func (ds *DistSender) Send(
 		}
 
 		if pErr == errNo1PCTxn {
-			// If we tried to send a single round-trip EndTransaction but
-			// it looks like it's going to hit multiple ranges, split it
-			// here and try again.
+			// If we tried to send a single round-trip EndTxn but it looks like
+			// it's going to hit multiple ranges, split it here and try again.
 			if len(parts) != 1 {
-				panic("EndTransaction not in last chunk of batch")
+				panic("EndTxn not in last chunk of batch")
 			} else if require1PC {
 				log.Fatalf(ctx, "required 1PC transaction cannot be split: %s", ba)
 			}
 			parts = splitBatchAndCheckForRefreshSpans(ba, true /* split ET */)
-			// Restart transaction of the last chunk as multiple parts
-			// with EndTransaction in the last part.
+			// Restart transaction of the last chunk as multiple parts with
+			// EndTxn in the last part.
 			continue
 		}
 		if pErr != nil {
 			if pErr.Index != nil && pErr.Index.Index != -1 {
 				pErr.Index.Index += int32(errIdxOffset)
 			}
-			// Break out of loop to collate batch responses received so far to
-			// return with error.
-			break
+			return nil, pErr
 		}
 
 		errIdxOffset += len(ba.Requests)
@@ -780,7 +749,7 @@ func (ds *DistSender) Send(
 		reply.BatchResponse_Header = lastHeader
 	}
 
-	return reply, pErr
+	return reply, nil
 }
 
 type response struct {
@@ -793,21 +762,20 @@ type response struct {
 // sub-batches that can be evaluated in parallel but should not be evaluated
 // on a Store together.
 //
-// The case where this comes up is if the batch is performing a parallel
-// commit and the transaction has previously pipelined writes that have yet
-// to be proven successful. In this scenario, the EndTransaction request
-// will be preceded by a series of QueryIntent requests (see
-// txn_pipeliner.go). Before evaluating, each of these QueryIntent requests
-// will grab latches and wait for their corresponding write to finish. This
-// is how the QueryIntent requests synchronize with the write they are
-// trying to verify.
+// The case where this comes up is if the batch is performing a parallel commit
+// and the transaction has previously pipelined writes that have yet to be
+// proven successful. In this scenario, the EndTxn request will be preceded by a
+// series of QueryIntent requests (see txn_pipeliner.go). Before evaluating,
+// each of these QueryIntent requests will grab latches and wait for their
+// corresponding write to finish. This is how the QueryIntent requests
+// synchronize with the write they are trying to verify.
 //
-// If these QueryIntents remained in the same batch as the EndTransaction
-// request then they would force the EndTransaction request to wait for the
-// previous write before evaluating itself. This "pipeline stall" would
-// effectively negate the benefit of the parallel commit. To avoid this, we
-// make sure that these "pre-commit" QueryIntent requests are split from and
-// issued concurrently with the rest of the parallel commit batch.
+// If these QueryIntents remained in the same batch as the EndTxn request then
+// they would force the EndTxn request to wait for the previous write before
+// evaluating itself. This "pipeline stall" would effectively negate the benefit
+// of the parallel commit. To avoid this, we make sure that these "pre-commit"
+// QueryIntent requests are split from and issued concurrently with the rest of
+// the parallel commit batch.
 //
 // batchIdx indicates which partial fragment of the larger batch is being
 // processed by this method. Currently it is always set to zero because this
@@ -832,8 +800,8 @@ func (ds *DistSender) divideAndSendParallelCommit(
 		return ds.divideAndSendBatchToRanges(ctx, ba, rs, true /* withCommit */, batchIdx)
 	}
 
-	// Swap the EndTransaction request and the first pre-commit QueryIntent.
-	// This effectively creates a split point between the two groups of requests.
+	// Swap the EndTxn request and the first pre-commit QueryIntent. This
+	// effectively creates a split point between the two groups of requests.
 	//
 	//  Before:    [put qi(1) put del qi(2) qi(3) qi(4) et]
 	//  After:     [put qi(1) put del et qi(3) qi(4) qi(2)]
@@ -883,7 +851,7 @@ func (ds *DistSender) divideAndSendParallelCommit(
 		}
 
 		// Send the batch with withCommit=true since it will be inflight
-		// concurrently with the EndTransaction batch below.
+		// concurrently with the EndTxn batch below.
 		reply, pErr := ds.divideAndSendBatchToRanges(ctx, qiBa, qiRS, true /* withCommit */, qiBatchIdx)
 		qiResponseCh <- response{reply: reply, positions: positions, pErr: pErr}
 	}); err != nil {
@@ -906,9 +874,9 @@ func (ds *DistSender) divideAndSendParallelCommit(
 
 	// Handle error conditions.
 	if pErr != nil {
-		// The batch with the EndTransaction returned an error. Ignore errors
-		// from the pre-commit QueryIntent requests because that request is
-		// read-only and will produce the same errors next time, if applicable.
+		// The batch with the EndTxn returned an error. Ignore errors from the
+		// pre-commit QueryIntent requests because that request is read-only and
+		// will produce the same errors next time, if applicable.
 		if qiReply.reply != nil {
 			pErr.UpdateTxn(qiReply.reply.Txn)
 		}
@@ -955,10 +923,10 @@ func (ds *DistSender) divideAndSendParallelCommit(
 // resolution after the transaction was already finalized instead of due to a
 // failure of the corresponding pipelined write. It is possible for these two
 // situations to be confused because the pre-commit QueryIntent requests are
-// issued in parallel with the staging EndTransaction request and may evaluate
-// after the transaction becomes implicitly committed. If this happens and a
-// concurrent transaction observes the implicit commit and makes the commit
-// explicit, it is allowed to begin resolving the transactions intents.
+// issued in parallel with the staging EndTxn request and may evaluate after the
+// transaction becomes implicitly committed. If this happens and a concurrent
+// transaction observes the implicit commit and makes the commit explicit, it is
+// allowed to begin resolving the transactions intents.
 //
 // MVCC values don't remember their transaction once they have been resolved.
 // This loss of information means that QueryIntent returns an intent missing
@@ -1109,16 +1077,16 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 	if ba.Txn == nil && ba.IsTransactional() && ba.ReadConsistency == roachpb.CONSISTENT {
 		return nil, roachpb.NewError(&roachpb.OpRequiresTxnError{})
 	}
-	// If the batch contains a non-parallel commit EndTransaction and spans
-	// ranges then we want the caller to come again with the EndTransaction in a
-	// separate (non-concurrent) batch.
+	// If the batch contains a non-parallel commit EndTxn and spans ranges then
+	// we want the caller to come again with the EndTxn in a separate
+	// (non-concurrent) batch.
 	//
 	// NB: withCommit allows us to short-circuit the check in the common case,
-	// but even when that's true, we still need to search for the EndTransaction
-	// in the batch.
+	// but even when that's true, we still need to search for the EndTxn in the
+	// batch.
 	if withCommit {
-		etArg, ok := ba.GetArg(roachpb.EndTransaction)
-		if ok && !etArg.(*roachpb.EndTransactionRequest).IsParallelCommit() {
+		etArg, ok := ba.GetArg(roachpb.EndTxn)
+		if ok && !etArg.(*roachpb.EndTxnRequest).IsParallelCommit() {
 			return nil, errNo1PCTxn
 		}
 	}
@@ -1184,11 +1152,7 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 		}
 	}()
 
-	// If min_results is set, num_results will count how many results scans have
-	// accumulated so far.
-	var numResults int64
-	stopAtRangeBoundary := ba.Header.ScanOptions != nil && ba.Header.ScanOptions.StopAtRangeBoundary
-	canParallelize := (ba.Header.MaxSpanRequestKeys == 0) && !stopAtRangeBoundary
+	canParallelize := ba.Header.MaxSpanRequestKeys == 0
 	if ba.IsSingleCheckConsistencyRequest() {
 		// Don't parallelize full checksum requests as they have to touch the
 		// entirety of each replica of each range they touch.
@@ -1249,17 +1213,15 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 				ba.UpdateTxn(resp.reply.Txn)
 			}
 
-			mightStopEarly := ba.MaxSpanRequestKeys > 0 || stopAtRangeBoundary
+			mightStopEarly := ba.MaxSpanRequestKeys > 0
 			// Check whether we've received enough responses to exit query loop.
 			if mightStopEarly {
 				var replyResults int64
 				for _, r := range resp.reply.Responses {
 					replyResults += r.GetInner().Header().NumKeys
 				}
-				// Do accounting for results. It's important that we update
-				// MaxSpanRequestKeys and ScanOptions.MinResults, as ba might be
+				// Update MaxSpanRequestKeys, if applicable. Note that ba might be
 				// passed recursively to further divideAndSendBatchToRanges() calls.
-				numResults += replyResults
 				if ba.MaxSpanRequestKeys > 0 {
 					if replyResults > ba.MaxSpanRequestKeys {
 						log.Fatalf(ctx, "received %d results, limit was %d",
@@ -1272,29 +1234,6 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 						resumeReason = roachpb.RESUME_KEY_LIMIT
 						return
 					}
-				}
-				var minResultsSatisfied bool
-				if !stopAtRangeBoundary {
-					minResultsSatisfied = true
-				} else {
-					if ba.Header.ScanOptions.MinResults == 0 {
-						minResultsSatisfied = true
-					} else {
-						// We need to change ba.Header.ScanOptions, so we have to make a
-						// copy so as to not mutate the one that we have already passed to
-						// gRPC.
-						scanOptsCopy := *ba.Header.ScanOptions
-						scanOptsCopy.MinResults -= numResults
-						minResultsSatisfied = scanOptsCopy.MinResults <= 0
-						ba.Header.ScanOptions = &scanOptsCopy
-					}
-				}
-				// If stopAtRangeBoundary is set, we stop unless MinResults is not
-				// satisfied.
-				if stopAtRangeBoundary && minResultsSatisfied {
-					couldHaveSkippedResponses = true
-					resumeReason = roachpb.RESUME_RANGE_BOUNDARY
-					return
 				}
 			}
 		}
@@ -1620,7 +1559,7 @@ func fillSkippedResponses(
 //
 // The method accepts a boolean declaring whether a transaction commit
 // is either in this batch or in-flight concurrently with this batch.
-// If withCommit is false (i.e. either no EndTransaction is in flight,
+// If withCommit is false (i.e. either no EndTxn is in flight,
 // or it is attempting to abort), ambiguous results will never be
 // returned from this method. This is because both transactional writes
 // and aborts can be retried (the former due to seqno idempotency, the

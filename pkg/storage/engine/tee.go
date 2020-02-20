@@ -13,10 +13,13 @@ package engine
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
+	"fmt"
 	"path/filepath"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -87,18 +90,22 @@ func (t *TeeEngine) ExportToSst(
 	startKey, endKey roachpb.Key,
 	startTS, endTS hlc.Timestamp,
 	exportAllRevisions bool,
+	targetSize, maxSize uint64,
 	io IterOptions,
-) ([]byte, roachpb.BulkOpSummary, error) {
-	eng1Sst, bulkOpSummary, err := t.eng1.ExportToSst(startKey, endKey, startTS, endTS, exportAllRevisions, io)
-	rocksSst, _, err2 := t.eng2.ExportToSst(startKey, endKey, startTS, endTS, exportAllRevisions, io)
+) ([]byte, roachpb.BulkOpSummary, roachpb.Key, error) {
+	eng1Sst, bulkOpSummary, resume1, err := t.eng1.ExportToSst(startKey, endKey, startTS, endTS, exportAllRevisions, targetSize, maxSize, io)
+	rocksSst, _, resume2, err2 := t.eng2.ExportToSst(startKey, endKey, startTS, endTS, exportAllRevisions, targetSize, maxSize, io)
 	if err = fatalOnErrorMismatch(t.ctx, err, err2); err != nil {
-		return nil, bulkOpSummary, err
+		return nil, bulkOpSummary, nil, err
 	}
 
 	if !bytes.Equal(eng1Sst, rocksSst) {
 		log.Fatalf(t.ctx, "mismatching SSTs returned by engines: %v != %v", eng1Sst, rocksSst)
 	}
-	return eng1Sst, bulkOpSummary, err
+	if !resume1.Equal(resume2) {
+		log.Fatalf(t.ctx, "mismatching resume key returned by engines: %v != %v", resume1, resume2)
+	}
+	return eng1Sst, bulkOpSummary, resume1, err
 }
 
 // Get implements the Engine interface.
@@ -260,24 +267,24 @@ func (t *TeeEngine) GetTickersAndHistograms() (*enginepb.TickersAndHistograms, e
 }
 
 // GetEncryptionRegistries implements the Engine interface.
-func (t TeeEngine) GetEncryptionRegistries() (*EncryptionRegistries, error) {
+func (t *TeeEngine) GetEncryptionRegistries() (*EncryptionRegistries, error) {
 	return t.eng1.GetEncryptionRegistries()
 }
 
 // GetEnvStats implements the Engine interface.
-func (t TeeEngine) GetEnvStats() (*EnvStats, error) {
+func (t *TeeEngine) GetEnvStats() (*EnvStats, error) {
 	return t.eng2.GetEnvStats()
 }
 
 // GetAuxiliaryDir implements the Engine interface.
-func (t TeeEngine) GetAuxiliaryDir() string {
+func (t *TeeEngine) GetAuxiliaryDir() string {
 	// Treat the eng1 path as the main aux dir, so that checkpoints are made in
 	// subdirectories within it.
 	return t.eng1.GetAuxiliaryDir()
 }
 
 // NewBatch implements the Engine interface.
-func (t TeeEngine) NewBatch() Batch {
+func (t *TeeEngine) NewBatch() Batch {
 	batch1 := t.eng1.NewBatch()
 	batch2 := t.eng2.NewBatch()
 
@@ -301,7 +308,7 @@ func (t TeeEngine) NewReadOnly() ReadWriter {
 }
 
 // NewWriteOnlyBatch implements the Engine interface.
-func (t TeeEngine) NewWriteOnlyBatch() Batch {
+func (t *TeeEngine) NewWriteOnlyBatch() Batch {
 	batch1 := t.eng1.NewWriteOnlyBatch()
 	batch2 := t.eng2.NewWriteOnlyBatch()
 	return &TeeEngineBatch{
@@ -312,7 +319,7 @@ func (t TeeEngine) NewWriteOnlyBatch() Batch {
 }
 
 // NewSnapshot implements the Engine interface.
-func (t TeeEngine) NewSnapshot() Reader {
+func (t *TeeEngine) NewSnapshot() Reader {
 	snap1 := t.eng1.NewSnapshot()
 	snap2 := t.eng2.NewSnapshot()
 
@@ -324,12 +331,12 @@ func (t TeeEngine) NewSnapshot() Reader {
 }
 
 // Type implements the Engine interface.
-func (t TeeEngine) Type() enginepb.EngineType {
+func (t *TeeEngine) Type() enginepb.EngineType {
 	return enginepb.EngineTypeTeePebbleRocksDB
 }
 
 // IngestExternalFiles implements the Engine interface.
-func (t TeeEngine) IngestExternalFiles(ctx context.Context, paths []string) error {
+func (t *TeeEngine) IngestExternalFiles(ctx context.Context, paths []string) error {
 	var err, err2 error
 	// Special case: If either engine is RocksDB, run that last, since RocksDB
 	// IngestExternalFiles deletes the specified files.
@@ -344,14 +351,14 @@ func (t TeeEngine) IngestExternalFiles(ctx context.Context, paths []string) erro
 }
 
 // PreIngestDelay implements the Engine interface.
-func (t TeeEngine) PreIngestDelay(ctx context.Context) {
+func (t *TeeEngine) PreIngestDelay(ctx context.Context) {
 	// TODO(itsbilal): Test why PreIngestDelay on eng1 segfaults when
 	// eng1 = RocksDB in tests like TestDBAddSSTable.
 	t.eng2.PreIngestDelay(ctx)
 }
 
 // ApproximateDiskBytes implements the Engine interface.
-func (t TeeEngine) ApproximateDiskBytes(from, to roachpb.Key) (uint64, error) {
+func (t *TeeEngine) ApproximateDiskBytes(from, to roachpb.Key) (uint64, error) {
 	bytes, err := t.eng1.ApproximateDiskBytes(from, to)
 	bytes2, err2 := t.eng2.ApproximateDiskBytes(from, to)
 	if err = fatalOnErrorMismatch(t.ctx, err, err2); err != nil {
@@ -362,24 +369,56 @@ func (t TeeEngine) ApproximateDiskBytes(from, to roachpb.Key) (uint64, error) {
 }
 
 // CompactRange implements the Engine interface.
-func (t TeeEngine) CompactRange(start, end roachpb.Key, forceBottommost bool) error {
+func (t *TeeEngine) CompactRange(start, end roachpb.Key, forceBottommost bool) error {
 	err := t.eng1.CompactRange(start, end, forceBottommost)
 	err2 := t.eng2.CompactRange(start, end, forceBottommost)
 	return fatalOnErrorMismatch(t.ctx, err, err2)
 }
 
 // InMem implements the Engine interface.
-func (t TeeEngine) InMem() bool {
+func (t *TeeEngine) InMem() bool {
 	return t.inMem
 }
 
-// OpenFile implements the Engine interface.
-func (t TeeEngine) OpenFile(filename string) (DBFile, error) {
-	file1, err := t.eng1.OpenFile(filename)
+// CreateFile implements the FS interface.
+func (t *TeeEngine) CreateFile(filename string) (fs.File, error) {
+	file1, err := t.eng1.CreateFile(filename)
 	if !t.inMem {
 		// No need to write twice if the two engines share the same file system.
 		return file1, err
 	}
+	file2, err2 := t.eng2.CreateFile(filename)
+	if err = fatalOnErrorMismatch(t.ctx, err, err2); err != nil {
+		return nil, err
+	}
+	return &TeeEngineFile{
+		ctx:   t.ctx,
+		file1: file1,
+		file2: file2,
+	}, nil
+}
+
+// CreateFileWithSync implements the FS interface.
+func (t *TeeEngine) CreateFileWithSync(filename string, bytesPerSync int) (fs.File, error) {
+	file1, err := t.eng1.CreateFileWithSync(filename, bytesPerSync)
+	if !t.inMem {
+		// No need to write twice if the two engines share the same file system.
+		return file1, err
+	}
+	file2, err2 := t.eng2.CreateFileWithSync(filename, bytesPerSync)
+	if err = fatalOnErrorMismatch(t.ctx, err, err2); err != nil {
+		return nil, err
+	}
+	return &TeeEngineFile{
+		ctx:   t.ctx,
+		file1: file1,
+		file2: file2,
+	}, nil
+}
+
+// OpenFile implements the FS interface.
+func (t *TeeEngine) OpenFile(filename string) (fs.File, error) {
+	file1, err := t.eng1.OpenFile(filename)
 	file2, err2 := t.eng2.OpenFile(filename)
 	if err = fatalOnErrorMismatch(t.ctx, err, err2); err != nil {
 		return nil, err
@@ -391,13 +430,27 @@ func (t TeeEngine) OpenFile(filename string) (DBFile, error) {
 	}, nil
 }
 
+// OpenDir implements the FS interface.
+func (t *TeeEngine) OpenDir(name string) (fs.File, error) {
+	file1, err := t.eng1.OpenDir(name)
+	file2, err2 := t.eng2.OpenDir(name)
+	if err = fatalOnErrorMismatch(t.ctx, err, err2); err != nil {
+		return nil, err
+	}
+	return &TeeEngineFile{
+		ctx:   t.ctx,
+		file1: file1,
+		file2: file2,
+	}, nil
+}
+
 // ReadFile implements the Engine interface.
-func (t TeeEngine) ReadFile(filename string) ([]byte, error) {
+func (t *TeeEngine) ReadFile(filename string) ([]byte, error) {
 	return t.eng1.ReadFile(filename)
 }
 
 // WriteFile implements the Engine interface.
-func (t TeeEngine) WriteFile(filename string, data []byte) error {
+func (t *TeeEngine) WriteFile(filename string, data []byte) error {
 	err := t.eng1.WriteFile(filename, data)
 	if !t.inMem {
 		// No need to write twice if the two engines share the same file system.
@@ -407,8 +460,8 @@ func (t TeeEngine) WriteFile(filename string, data []byte) error {
 	return fatalOnErrorMismatch(t.ctx, err, err2)
 }
 
-// DeleteFile implements the Engine interface.
-func (t TeeEngine) DeleteFile(filename string) error {
+// DeleteFile implements the FS interface.
+func (t *TeeEngine) DeleteFile(filename string) error {
 	err := t.eng1.DeleteFile(filename)
 	if !t.inMem {
 		// No need to write twice if the two engines share the same file system.
@@ -419,7 +472,7 @@ func (t TeeEngine) DeleteFile(filename string) error {
 }
 
 // DeleteDirAndFiles implements the Engine interface.
-func (t TeeEngine) DeleteDirAndFiles(dir string) error {
+func (t *TeeEngine) DeleteDirAndFiles(dir string) error {
 	err := t.eng1.DeleteDirAndFiles(dir)
 	if !t.inMem {
 		// No need to write twice if the two engines share the same file system.
@@ -429,8 +482,8 @@ func (t TeeEngine) DeleteDirAndFiles(dir string) error {
 	return fatalOnErrorMismatch(t.ctx, err, err2)
 }
 
-// LinkFile implements the Engine interface.
-func (t TeeEngine) LinkFile(oldname, newname string) error {
+// LinkFile implements the FS interface.
+func (t *TeeEngine) LinkFile(oldname, newname string) error {
 	err := t.eng1.LinkFile(oldname, newname)
 	if !t.inMem {
 		// No need to write twice if the two engines share the same file system.
@@ -440,8 +493,53 @@ func (t TeeEngine) LinkFile(oldname, newname string) error {
 	return fatalOnErrorMismatch(t.ctx, err, err2)
 }
 
+// RenameFile implements the FS interface.
+func (t *TeeEngine) RenameFile(oldname, newname string) error {
+	err := t.eng1.RenameFile(oldname, newname)
+	if !t.inMem {
+		// No need to write twice if the two engines share the same file system.
+		return err
+	}
+	err2 := t.eng2.RenameFile(oldname, newname)
+	return fatalOnErrorMismatch(t.ctx, err, err2)
+}
+
+// CreateDir implements the FS interface.
+func (t *TeeEngine) CreateDir(name string) error {
+	err := t.eng1.CreateDir(name)
+	if !t.inMem {
+		// No need to create twice if the two engines share the same file system.
+		return err
+	}
+	err2 := t.eng2.CreateDir(name)
+	return fatalOnErrorMismatch(t.ctx, err, err2)
+}
+
+// DeleteDir implements the FS interface.
+func (t *TeeEngine) DeleteDir(name string) error {
+	err := t.eng1.DeleteDir(name)
+	if !t.inMem {
+		// No need to delete twice if the two engines share the same file system.
+		return err
+	}
+	err2 := t.eng2.DeleteDir(name)
+	return fatalOnErrorMismatch(t.ctx, err, err2)
+}
+
+// ListDir implements the FS interface.
+func (t *TeeEngine) ListDir(name string) ([]string, error) {
+	list1, err := t.eng1.ListDir(name)
+	_, err2 := t.eng2.ListDir(name)
+
+	if err = fatalOnErrorMismatch(t.ctx, err, err2); err != nil {
+		return nil, err
+	}
+	// TODO(sbhola): compare the slices.
+	return list1, nil
+}
+
 // CreateCheckpoint implements the Engine interface.
-func (t TeeEngine) CreateCheckpoint(dir string) error {
+func (t *TeeEngine) CreateCheckpoint(dir string) error {
 	path1 := filepath.Join(dir, "eng1")
 	path2 := filepath.Join(dir, "eng2")
 	err := t.eng1.CreateCheckpoint(path1)
@@ -449,32 +547,36 @@ func (t TeeEngine) CreateCheckpoint(dir string) error {
 	return fatalOnErrorMismatch(t.ctx, err, err2)
 }
 
-// TeeEngineFile is a DBFile that writes to both underlying eng1
+func (t TeeEngine) String() string {
+	return t.eng1.(fmt.Stringer).String()
+}
+
+// TeeEngineFile is a File that forwards to both underlying eng1
 // and eng2 files.
 type TeeEngineFile struct {
 	ctx   context.Context
-	file1 DBFile
-	file2 DBFile
+	file1 fs.File
+	file2 fs.File
 }
 
-var _ DBFile = &TeeEngineFile{}
+var _ fs.File = &TeeEngineFile{}
 
-// Close implements the DBFile interface.
-func (t TeeEngineFile) Close() error {
+// Close implements the File interface.
+func (t *TeeEngineFile) Close() error {
 	err := t.file1.Close()
 	err2 := t.file2.Close()
 	return fatalOnErrorMismatch(t.ctx, err, err2)
 }
 
-// Sync implements the DBFile interface.
-func (t TeeEngineFile) Sync() error {
+// Sync implements the File interface.
+func (t *TeeEngineFile) Sync() error {
 	err := t.file1.Sync()
 	err2 := t.file2.Sync()
 	return fatalOnErrorMismatch(t.ctx, err, err2)
 }
 
-// Write implements the DBFile interface.
-func (t TeeEngineFile) Write(p []byte) (int, error) {
+// Write implements the File interface.
+func (t *TeeEngineFile) Write(p []byte) (int, error) {
 	n, err := t.file1.Write(p)
 	n2, err2 := t.file2.Write(p)
 	if err = fatalOnErrorMismatch(t.ctx, err, err2); err != nil {
@@ -482,6 +584,40 @@ func (t TeeEngineFile) Write(p []byte) (int, error) {
 	}
 	if n != n2 {
 		log.Fatalf(t.ctx, "mismatching number of bytes written by engines: %d != %d", n, n2)
+	}
+	return n, nil
+}
+
+// Read implements the File interface.
+func (t *TeeEngineFile) Read(p []byte) (n int, err error) {
+	p2 := make([]byte, len(p))
+	n, err = t.file1.Read(p)
+	n2, err2 := t.file2.Read(p2)
+	if err = fatalOnErrorMismatch(t.ctx, err, err2); err != nil {
+		return 0, err
+	}
+	if n != n2 {
+		log.Fatalf(t.ctx, "mismatching number of bytes read by engines: %d != %d", n, n2)
+	}
+	if !bytes.Equal(p[:n], p2[:n]) {
+		log.Fatalf(t.ctx, "different bytes read by engines: %s != %s", hex.EncodeToString(p[:n]), hex.EncodeToString(p2[:n]))
+	}
+	return n, nil
+}
+
+// ReadAt implements the File interface.
+func (t *TeeEngineFile) ReadAt(p []byte, off int64) (n int, err error) {
+	p2 := make([]byte, len(p))
+	n, err = t.file1.ReadAt(p, off)
+	n2, err2 := t.file2.ReadAt(p2, off)
+	if err = fatalOnErrorMismatch(t.ctx, err, err2); err != nil {
+		return 0, err
+	}
+	if n != n2 {
+		log.Fatalf(t.ctx, "mismatching number of bytes read by engines: %d != %d", n, n2)
+	}
+	if !bytes.Equal(p[:n], p2[:n]) {
+		log.Fatalf(t.ctx, "different bytes read by engines: %s != %s", hex.EncodeToString(p[:n]), hex.EncodeToString(p2[:n]))
 	}
 	return n, nil
 }
@@ -589,18 +725,22 @@ func (t *TeeEngineReader) ExportToSst(
 	startKey, endKey roachpb.Key,
 	startTS, endTS hlc.Timestamp,
 	exportAllRevisions bool,
+	targetSize, maxSize uint64,
 	io IterOptions,
-) ([]byte, roachpb.BulkOpSummary, error) {
-	sst1, bulkOpSummary, err := t.reader1.ExportToSst(startKey, endKey, startTS, endTS, exportAllRevisions, io)
-	sst2, _, err2 := t.reader2.ExportToSst(startKey, endKey, startTS, endTS, exportAllRevisions, io)
+) ([]byte, roachpb.BulkOpSummary, roachpb.Key, error) {
+	sst1, bulkOpSummary, resume1, err := t.reader1.ExportToSst(startKey, endKey, startTS, endTS, exportAllRevisions, targetSize, maxSize, io)
+	sst2, _, resume2, err2 := t.reader2.ExportToSst(startKey, endKey, startTS, endTS, exportAllRevisions, targetSize, maxSize, io)
 	if err = fatalOnErrorMismatch(t.ctx, err, err2); err != nil {
-		return nil, bulkOpSummary, err
+		return nil, bulkOpSummary, nil, err
 	}
 
 	if !bytes.Equal(sst1, sst2) {
 		log.Fatalf(t.ctx, "mismatching SSTs returned by engines: %v != %v", sst1, sst2)
 	}
-	return sst1, bulkOpSummary, err
+	if !resume1.Equal(resume2) {
+		log.Fatalf(t.ctx, "mismatching resume key returned by engines: %v != %v", resume1, resume2)
+	}
+	return sst1, bulkOpSummary, resume1, err
 }
 
 // Get implements the Reader interface.
@@ -667,13 +807,13 @@ type TeeEngineBatch struct {
 var _ Batch = &TeeEngineBatch{}
 
 // Close implements the Batch interface.
-func (t TeeEngineBatch) Close() {
+func (t *TeeEngineBatch) Close() {
 	t.batch1.Close()
 	t.batch2.Close()
 }
 
 // Closed implements the Batch interface.
-func (t TeeEngineBatch) Closed() bool {
+func (t *TeeEngineBatch) Closed() bool {
 	closed1 := t.batch1.Closed()
 	closed2 := t.batch2.Closed()
 	if closed1 && closed2 {
@@ -685,26 +825,30 @@ func (t TeeEngineBatch) Closed() bool {
 }
 
 // ExportToSst implements the Batch interface.
-func (t TeeEngineBatch) ExportToSst(
+func (t *TeeEngineBatch) ExportToSst(
 	startKey, endKey roachpb.Key,
 	startTS, endTS hlc.Timestamp,
 	exportAllRevisions bool,
+	targetSize, maxSize uint64,
 	io IterOptions,
-) ([]byte, roachpb.BulkOpSummary, error) {
-	sst1, bulkOpSummary, err := t.batch1.ExportToSst(startKey, endKey, startTS, endTS, exportAllRevisions, io)
-	sst2, _, err2 := t.batch2.ExportToSst(startKey, endKey, startTS, endTS, exportAllRevisions, io)
+) ([]byte, roachpb.BulkOpSummary, roachpb.Key, error) {
+	sst1, bulkOpSummary, resume1, err := t.batch1.ExportToSst(startKey, endKey, startTS, endTS, exportAllRevisions, targetSize, maxSize, io)
+	sst2, _, resume2, err2 := t.batch2.ExportToSst(startKey, endKey, startTS, endTS, exportAllRevisions, targetSize, maxSize, io)
 	if err = fatalOnErrorMismatch(t.ctx, err, err2); err != nil {
-		return nil, bulkOpSummary, err
+		return nil, bulkOpSummary, nil, err
 	}
 
 	if !bytes.Equal(sst1, sst2) {
 		log.Fatalf(t.ctx, "mismatching SSTs returned by engines: %v != %v", sst1, sst2)
 	}
-	return sst1, bulkOpSummary, err
+	if !resume1.Equal(resume2) {
+		log.Fatalf(t.ctx, "mismatching resume key returned by engines: %v != %v", resume1, resume2)
+	}
+	return sst1, bulkOpSummary, resume1, err
 }
 
 // Get implements the Batch interface.
-func (t TeeEngineBatch) Get(key MVCCKey) ([]byte, error) {
+func (t *TeeEngineBatch) Get(key MVCCKey) ([]byte, error) {
 	val, err := t.batch1.Get(key)
 	val2, err2 := t.batch2.Get(key)
 	if err = fatalOnErrorMismatch(t.ctx, err, err2); err != nil {
@@ -718,7 +862,7 @@ func (t TeeEngineBatch) Get(key MVCCKey) ([]byte, error) {
 }
 
 // GetProto implements the Batch interface.
-func (t TeeEngineBatch) GetProto(
+func (t *TeeEngineBatch) GetProto(
 	key MVCCKey, msg protoutil.Message,
 ) (ok bool, keyBytes, valBytes int64, err error) {
 	if len(key.Key) == 0 {
@@ -737,14 +881,14 @@ func (t TeeEngineBatch) GetProto(
 }
 
 // Iterate implements the Batch interface.
-func (t TeeEngineBatch) Iterate(
+func (t *TeeEngineBatch) Iterate(
 	start, end roachpb.Key, f func(MVCCKeyValue) (stop bool, err error),
 ) error {
 	return iterateOnReader(t, start, end, f)
 }
 
 // NewIterator implements the Batch interface.
-func (t TeeEngineBatch) NewIterator(opts IterOptions) Iterator {
+func (t *TeeEngineBatch) NewIterator(opts IterOptions) Iterator {
 	iter1 := t.batch1.NewIterator(opts)
 	iter2 := t.batch2.NewIterator(opts)
 	return &TeeEngineIter{
@@ -755,76 +899,76 @@ func (t TeeEngineBatch) NewIterator(opts IterOptions) Iterator {
 }
 
 // ApplyBatchRepr implements the Batch interface.
-func (t TeeEngineBatch) ApplyBatchRepr(repr []byte, sync bool) error {
+func (t *TeeEngineBatch) ApplyBatchRepr(repr []byte, sync bool) error {
 	err := t.batch1.ApplyBatchRepr(repr, sync)
 	err2 := t.batch2.ApplyBatchRepr(repr, sync)
 	return fatalOnErrorMismatch(t.ctx, err, err2)
 }
 
 // Clear implements the Batch interface.
-func (t TeeEngineBatch) Clear(key MVCCKey) error {
+func (t *TeeEngineBatch) Clear(key MVCCKey) error {
 	err := t.batch1.Clear(key)
 	err2 := t.batch2.Clear(key)
 	return fatalOnErrorMismatch(t.ctx, err, err2)
 }
 
 // SingleClear implements the Batch interface.
-func (t TeeEngineBatch) SingleClear(key MVCCKey) error {
+func (t *TeeEngineBatch) SingleClear(key MVCCKey) error {
 	err := t.batch1.SingleClear(key)
 	err2 := t.batch2.SingleClear(key)
 	return fatalOnErrorMismatch(t.ctx, err, err2)
 }
 
 // ClearRange implements the Batch interface.
-func (t TeeEngineBatch) ClearRange(start, end MVCCKey) error {
+func (t *TeeEngineBatch) ClearRange(start, end MVCCKey) error {
 	err := t.batch1.ClearRange(start, end)
 	err2 := t.batch2.ClearRange(start, end)
 	return fatalOnErrorMismatch(t.ctx, err, err2)
 }
 
 // ClearIterRange implements the Batch interface.
-func (t TeeEngineBatch) ClearIterRange(iter Iterator, start, end roachpb.Key) error {
+func (t *TeeEngineBatch) ClearIterRange(iter Iterator, start, end roachpb.Key) error {
 	err := t.batch1.ClearIterRange(iter.(*TeeEngineIter).iter1, start, end)
 	err2 := t.batch2.ClearIterRange(iter.(*TeeEngineIter).iter2, start, end)
 	return fatalOnErrorMismatch(t.ctx, err, err2)
 }
 
 // Merge implements the Batch interface.
-func (t TeeEngineBatch) Merge(key MVCCKey, value []byte) error {
+func (t *TeeEngineBatch) Merge(key MVCCKey, value []byte) error {
 	err := t.batch1.Merge(key, value)
 	err2 := t.batch2.Merge(key, value)
 	return fatalOnErrorMismatch(t.ctx, err, err2)
 }
 
 // Put implements the Batch interface.
-func (t TeeEngineBatch) Put(key MVCCKey, value []byte) error {
+func (t *TeeEngineBatch) Put(key MVCCKey, value []byte) error {
 	err := t.batch1.Put(key, value)
 	err2 := t.batch2.Put(key, value)
 	return fatalOnErrorMismatch(t.ctx, err, err2)
 }
 
 // LogData implements the Batch interface.
-func (t TeeEngineBatch) LogData(data []byte) error {
+func (t *TeeEngineBatch) LogData(data []byte) error {
 	err := t.batch1.LogData(data)
 	err2 := t.batch2.LogData(data)
 	return fatalOnErrorMismatch(t.ctx, err, err2)
 }
 
 // LogLogicalOp implements the Batch interface.
-func (t TeeEngineBatch) LogLogicalOp(op MVCCLogicalOpType, details MVCCLogicalOpDetails) {
+func (t *TeeEngineBatch) LogLogicalOp(op MVCCLogicalOpType, details MVCCLogicalOpDetails) {
 	t.batch1.LogLogicalOp(op, details)
 	t.batch2.LogLogicalOp(op, details)
 }
 
 // Commit implements the Batch interface.
-func (t TeeEngineBatch) Commit(sync bool) error {
+func (t *TeeEngineBatch) Commit(sync bool) error {
 	err := t.batch1.Commit(sync)
 	err2 := t.batch2.Commit(sync)
 	return fatalOnErrorMismatch(t.ctx, err, err2)
 }
 
 // Distinct implements the Batch interface.
-func (t TeeEngineBatch) Distinct() ReadWriter {
+func (t *TeeEngineBatch) Distinct() ReadWriter {
 	distinct1 := t.batch1.Distinct()
 	distinct2 := t.batch2.Distinct()
 	return &TeeEngineReadWriter{TeeEngineReader{
@@ -835,7 +979,7 @@ func (t TeeEngineBatch) Distinct() ReadWriter {
 }
 
 // Empty implements the Batch interface.
-func (t TeeEngineBatch) Empty() bool {
+func (t *TeeEngineBatch) Empty() bool {
 	empty := t.batch1.Empty()
 	empty2 := t.batch2.Empty()
 	if empty != empty2 {
@@ -845,7 +989,7 @@ func (t TeeEngineBatch) Empty() bool {
 }
 
 // Len implements the Batch interface.
-func (t TeeEngineBatch) Len() int {
+func (t *TeeEngineBatch) Len() int {
 	len1 := t.batch1.Len()
 	len2 := t.batch2.Len()
 
@@ -856,7 +1000,7 @@ func (t TeeEngineBatch) Len() int {
 }
 
 // Repr implements the Batch interface.
-func (t TeeEngineBatch) Repr() []byte {
+func (t *TeeEngineBatch) Repr() []byte {
 	repr := t.batch1.Repr()
 	repr2 := t.batch2.Repr()
 	if !bytes.Equal(repr, repr2) {
@@ -877,14 +1021,14 @@ type TeeEngineIter struct {
 var _ MVCCIterator = &TeeEngineIter{}
 
 // Close implements the Iterator interface.
-func (t TeeEngineIter) Close() {
+func (t *TeeEngineIter) Close() {
 	t.iter1.Close()
 	t.iter2.Close()
 }
 
 // check checks if the two underlying iterators have matching validity states
 // and keys.
-func (t TeeEngineIter) check() {
+func (t *TeeEngineIter) check() {
 	valid, err := t.iter1.Valid()
 	valid2, err2 := t.iter2.Valid()
 	_ = fatalOnErrorMismatch(t.ctx, err, err2)
@@ -905,61 +1049,61 @@ func (t TeeEngineIter) check() {
 }
 
 // SeekGE implements the Iterator interface.
-func (t TeeEngineIter) SeekGE(key MVCCKey) {
+func (t *TeeEngineIter) SeekGE(key MVCCKey) {
 	t.iter1.SeekGE(key)
 	t.iter2.SeekGE(key)
 	t.check()
 }
 
 // Valid implements the Iterator interface.
-func (t TeeEngineIter) Valid() (bool, error) {
+func (t *TeeEngineIter) Valid() (bool, error) {
 	return t.iter1.Valid()
 }
 
 // Next implements the Iterator interface.
-func (t TeeEngineIter) Next() {
+func (t *TeeEngineIter) Next() {
 	t.iter1.Next()
 	t.iter2.Next()
 	t.check()
 }
 
 // NextKey implements the Iterator interface.
-func (t TeeEngineIter) NextKey() {
+func (t *TeeEngineIter) NextKey() {
 	t.iter1.NextKey()
 	t.iter2.NextKey()
 	t.check()
 }
 
 // UnsafeKey implements the Iterator interface.
-func (t TeeEngineIter) UnsafeKey() MVCCKey {
+func (t *TeeEngineIter) UnsafeKey() MVCCKey {
 	return t.iter1.UnsafeKey()
 }
 
 // UnsafeValue implements the Iterator interface.
-func (t TeeEngineIter) UnsafeValue() []byte {
+func (t *TeeEngineIter) UnsafeValue() []byte {
 	return t.iter1.UnsafeValue()
 }
 
 // SeekLT implements the Iterator interface.
-func (t TeeEngineIter) SeekLT(key MVCCKey) {
+func (t *TeeEngineIter) SeekLT(key MVCCKey) {
 	t.iter1.SeekLT(key)
 	t.iter2.SeekLT(key)
 	t.check()
 }
 
 // Prev implements the Iterator interface.
-func (t TeeEngineIter) Prev() {
+func (t *TeeEngineIter) Prev() {
 	t.iter1.Prev()
 	t.iter2.Prev()
 	t.check()
 }
 
 // Key implements the Iterator interface.
-func (t TeeEngineIter) Key() MVCCKey {
+func (t *TeeEngineIter) Key() MVCCKey {
 	return t.iter1.Key()
 }
 
-func (t TeeEngineIter) unsafeRawKey() []byte {
+func (t *TeeEngineIter) unsafeRawKey() []byte {
 	type unsafeRawKeyGetter interface {
 		unsafeRawKey() []byte
 	}
@@ -967,17 +1111,17 @@ func (t TeeEngineIter) unsafeRawKey() []byte {
 }
 
 // Value implements the Iterator interface.
-func (t TeeEngineIter) Value() []byte {
+func (t *TeeEngineIter) Value() []byte {
 	return t.iter1.UnsafeValue()
 }
 
 // ValueProto implements the Iterator interface.
-func (t TeeEngineIter) ValueProto(msg protoutil.Message) error {
+func (t *TeeEngineIter) ValueProto(msg protoutil.Message) error {
 	return t.iter1.ValueProto(msg)
 }
 
 // ComputeStats implements the Iterator interface.
-func (t TeeEngineIter) ComputeStats(
+func (t *TeeEngineIter) ComputeStats(
 	start, end roachpb.Key, nowNanos int64,
 ) (enginepb.MVCCStats, error) {
 	stats1, err := t.iter1.ComputeStats(start, end, nowNanos)
@@ -992,7 +1136,7 @@ func (t TeeEngineIter) ComputeStats(
 }
 
 // FindSplitKey implements the Iterator interface.
-func (t TeeEngineIter) FindSplitKey(
+func (t *TeeEngineIter) FindSplitKey(
 	start, end, minSplitKey roachpb.Key, targetSize int64,
 ) (MVCCKey, error) {
 	splitKey1, err := t.iter1.FindSplitKey(start, end, minSplitKey, targetSize)
@@ -1007,7 +1151,7 @@ func (t TeeEngineIter) FindSplitKey(
 }
 
 // CheckForKeyCollisions implements the Iterator interface.
-func (t TeeEngineIter) CheckForKeyCollisions(
+func (t *TeeEngineIter) CheckForKeyCollisions(
 	sstData []byte, start, end roachpb.Key,
 ) (enginepb.MVCCStats, error) {
 	stats1, err := t.iter1.CheckForKeyCollisions(sstData, start, end)
@@ -1022,23 +1166,23 @@ func (t TeeEngineIter) CheckForKeyCollisions(
 }
 
 // SetUpperBound implements the Iterator interface.
-func (t TeeEngineIter) SetUpperBound(key roachpb.Key) {
+func (t *TeeEngineIter) SetUpperBound(key roachpb.Key) {
 	t.iter1.SetUpperBound(key)
 	t.iter2.SetUpperBound(key)
 }
 
 // Stats implements the Iterator interface.
-func (t TeeEngineIter) Stats() IteratorStats {
+func (t *TeeEngineIter) Stats() IteratorStats {
 	return t.iter1.Stats()
 }
 
 // MVCCOpsSpecialized implements the MVCCIterator interface.
-func (t TeeEngineIter) MVCCOpsSpecialized() bool {
+func (t *TeeEngineIter) MVCCOpsSpecialized() bool {
 	return true
 }
 
 // MVCCGet implements the MVCCIterator interface.
-func (t TeeEngineIter) MVCCGet(
+func (t *TeeEngineIter) MVCCGet(
 	key roachpb.Key, timestamp hlc.Timestamp, opts MVCCGetOptions,
 ) (*roachpb.Value, *roachpb.Intent, error) {
 	value1, intent1, err := mvccGet(t.ctx, t.iter1, key, timestamp, opts)
@@ -1078,47 +1222,50 @@ func kvDataEqual(ctx context.Context, data1 []byte, data2 [][]byte) bool {
 }
 
 // MVCCScan implements the MVCCIterator interface.
-func (t TeeEngineIter) MVCCScan(
+func (t *TeeEngineIter) MVCCScan(
 	start, end roachpb.Key, max int64, timestamp hlc.Timestamp, opts MVCCScanOptions,
-) (kvData [][]byte, numKVs int64, resumeSpan *roachpb.Span, intents []roachpb.Intent, err error) {
-	kvData1, numKvs1, resumeSpan1, intents1, err := mvccScanToBytes(t.ctx, t.iter1, start, end, max, timestamp, opts)
-	kvData2, numKvs2, resumeSpan2, intents2, err2 := mvccScanToBytes(t.ctx, t.iter2, start, end, max, timestamp, opts)
+) (MVCCScanResult, error) {
+	res1, err := mvccScanToBytes(t.ctx, t.iter1, start, end, max, timestamp, opts)
+	res2, err2 := mvccScanToBytes(t.ctx, t.iter2, start, end, max, timestamp, opts)
 
-	if err = fatalOnErrorMismatch(t.ctx, err, err2); err != nil {
-		return nil, 0, nil, nil, err
+	if err := fatalOnErrorMismatch(t.ctx, err, err2); err != nil {
+		return MVCCScanResult{}, err
 	}
 
-	if numKvs1 != numKvs2 {
-		log.Fatalf(t.ctx, "mismatching number of KVs returned from engines MVCCScan: %d != %d", numKvs1, numKvs2)
+	if res1.NumKeys != res2.NumKeys {
+		log.Fatalf(t.ctx, "mismatching number of KVs returned from engines MVCCScan: %d != %d", res1.NumKeys, res2.NumKeys)
+	}
+	if res1.NumBytes != res2.NumBytes {
+		log.Fatalf(t.ctx, "mismatching NumBytes returned from engines MVCCScan: %d != %d", res1.NumBytes, res2.NumBytes)
 	}
 
 	// At least one side is expected to have only one contiguous slice inside it.
 	// This lets us simplify the checking code below.
 	equal := false
-	if len(kvData2) != 1 && len(kvData1) != 1 {
+	if len(res1.KVData) != 1 && len(res2.KVData) != 1 {
 		panic("unsupported multiple-slice result from both iterators in MVCCScan")
-	} else if len(kvData2) == 1 {
+	} else if len(res2.KVData) == 1 {
 		// Swap the two slices so that the first argument is the one with only one
 		// slice inside it.
-		equal = kvDataEqual(t.ctx, kvData2[0], kvData1)
+		equal = kvDataEqual(t.ctx, res2.KVData[0], res1.KVData)
 	} else {
-		equal = kvDataEqual(t.ctx, kvData1[0], kvData2)
+		equal = kvDataEqual(t.ctx, res1.KVData[0], res2.KVData)
 	}
 
 	if !equal {
-		log.Fatalf(t.ctx, "mismatching kv data returned by engines: %v != %v", kvData1, kvData2)
+		log.Fatalf(t.ctx, "mismatching kv data returned by engines: %v != %v", res1.KVData, res2.KVData)
 	}
 
-	if !resumeSpan1.Equal(resumeSpan2) {
-		log.Fatalf(t.ctx, "mismatching resume spans returned by engines: %v != %v", resumeSpan1, resumeSpan2)
+	if !res1.ResumeSpan.Equal(res2.ResumeSpan) {
+		log.Fatalf(t.ctx, "mismatching resume spans returned by engines: %v != %v", res1.ResumeSpan, res2.ResumeSpan)
 	}
-	if len(intents1) != len(intents2) {
-		log.Fatalf(t.ctx, "mismatching number of intents returned by engines: %v != %v", len(intents1), len(intents2))
+	if len(res1.Intents) != len(res2.Intents) {
+		log.Fatalf(t.ctx, "mismatching number of intents returned by engines: %v != %v", len(res1.Intents), len(res2.Intents))
 	}
-	for i := range intents1 {
-		if !intents1[i].Equal(intents2[i]) {
-			log.Fatalf(t.ctx, "mismatching intents returned by engines: %v != %v", intents1[i], intents2[i])
+	for i := range res1.Intents {
+		if !res1.Intents[i].Equal(res2.Intents[i]) {
+			log.Fatalf(t.ctx, "mismatching intents returned by engines: %v != %v", res1.Intents[i], res2.Intents[i])
 		}
 	}
-	return kvData1, numKvs1, resumeSpan1, intents1, err
+	return res1, err
 }

@@ -190,6 +190,7 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 	ot.evalCtx.SessionData.ZigzagJoinEnabled = true
 	ot.evalCtx.SessionData.OptimizerFKs = true
 	ot.evalCtx.SessionData.ReorderJoinsLimit = opt.DefaultJoinOrderLimit
+	ot.evalCtx.SessionData.InsertFastPath = true
 
 	return ot
 }
@@ -367,7 +368,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 			return fmt.Sprintf("error: %s\n", text)
 		}
 		ot.postProcess(tb, d, e)
-		return memo.FormatExpr(e, ot.Flags.ExprFormat, ot.catalog)
+		return ot.FormatExpr(e)
 
 	case "norm":
 		e, err := ot.OptNorm()
@@ -384,7 +385,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 			return fmt.Sprintf("error: %s\n", text)
 		}
 		ot.postProcess(tb, d, e)
-		return memo.FormatExpr(e, ot.Flags.ExprFormat, ot.catalog)
+		return ot.FormatExpr(e)
 
 	case "opt":
 		e, err := ot.Optimize()
@@ -392,7 +393,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 			d.Fatalf(tb, "%+v", err)
 		}
 		ot.postProcess(tb, d, e)
-		return memo.FormatExpr(e, ot.Flags.ExprFormat, ot.catalog)
+		return ot.FormatExpr(e)
 
 	case "optsteps":
 		result, err := ot.OptSteps()
@@ -428,7 +429,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 			d.Fatalf(tb, "%+v", err)
 		}
 		ot.postProcess(tb, d, e)
-		return memo.FormatExpr(e, ot.Flags.ExprFormat, ot.catalog)
+		return ot.FormatExpr(e)
 
 	case "exprnorm":
 		e, err := ot.ExprNorm()
@@ -436,7 +437,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 			d.Fatalf(tb, "%+v", err)
 		}
 		ot.postProcess(tb, d, e)
-		return memo.FormatExpr(e, ot.Flags.ExprFormat, ot.catalog)
+		return ot.FormatExpr(e)
 
 	case "save-tables":
 		e, err := ot.SaveTables()
@@ -444,7 +445,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 			d.Fatalf(tb, "%+v", err)
 		}
 		ot.postProcess(tb, d, e)
-		return memo.FormatExpr(e, ot.Flags.ExprFormat, ot.catalog)
+		return ot.FormatExpr(e)
 
 	case "stats":
 		result, err := ot.Stats(d)
@@ -461,6 +462,15 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 		d.Fatalf(tb, "unsupported command: %s", d.Cmd)
 		return ""
 	}
+}
+
+// FormatExpr is a convenience wrapper for memo.FormatExpr.
+func (ot *OptTester) FormatExpr(e opt.Expr) string {
+	var mem *memo.Memo
+	if rel, ok := e.(memo.RelExpr); ok {
+		mem = rel.Memo()
+	}
+	return memo.FormatExpr(e, ot.Flags.ExprFormat, mem, ot.catalog)
 }
 
 func formatRuleSet(r RuleSet) string {
@@ -722,7 +732,7 @@ func (ot *OptTester) Optimize() (opt.Expr, error) {
 // by the optimizer.
 func (ot *OptTester) Memo() (string, error) {
 	var o xform.Optimizer
-	o.Init(&ot.evalCtx)
+	o.Init(&ot.evalCtx, ot.catalog)
 	if _, err := ot.optimizeExpr(&o); err != nil {
 		return "", err
 	}
@@ -732,7 +742,7 @@ func (ot *OptTester) Memo() (string, error) {
 // Expr parses the input directly into an expression; see exprgen.Build.
 func (ot *OptTester) Expr() (opt.Expr, error) {
 	var f norm.Factory
-	f.Init(&ot.evalCtx)
+	f.Init(&ot.evalCtx, ot.catalog)
 	f.DisableOptimizations()
 
 	return exprgen.Build(ot.catalog, &f, ot.sql)
@@ -742,7 +752,7 @@ func (ot *OptTester) Expr() (opt.Expr, error) {
 // normalization; see exprgen.Build.
 func (ot *OptTester) ExprNorm() (opt.Expr, error) {
 	var f norm.Factory
-	f.Init(&ot.evalCtx)
+	f.Init(&ot.evalCtx, ot.catalog)
 
 	f.NotifyOnMatchedRule(func(ruleName opt.RuleName) bool {
 		// exprgen.Build doesn't run optimization, so we don't need to explicitly
@@ -891,7 +901,7 @@ func (ot *OptTester) OptSteps() (string, error) {
 			return "", err
 		}
 
-		next = memo.FormatExpr(os.Root(), ot.Flags.ExprFormat, ot.catalog)
+		next = os.fo.o.FormatExpr(os.Root(), ot.Flags.ExprFormat)
 
 		// This call comes after setting "next", because we want to output the
 		// final expression, even though there were no diffs from the previous
@@ -1032,13 +1042,13 @@ func (ot *OptTester) ExploreTrace() (string, error) {
 		ot.output("%s\n", et.LastRuleName())
 		ot.separator("=")
 		ot.output("Source expression:\n")
-		ot.indent(memo.FormatExpr(et.SrcExpr(), ot.Flags.ExprFormat, ot.catalog))
+		ot.indent(et.fo.o.FormatExpr(et.SrcExpr(), ot.Flags.ExprFormat))
 		if len(newNodes) == 0 {
 			ot.output("\nNo new expressions.\n")
 		}
 		for i := range newNodes {
 			ot.output("\nNew expression %d of %d:\n", i+1, len(newNodes))
-			ot.indent(memo.FormatExpr(newNodes[i], ot.Flags.ExprFormat, ot.catalog))
+			ot.indent(memo.FormatExpr(newNodes[i], ot.Flags.ExprFormat, et.fo.o.Memo(), ot.catalog))
 		}
 	}
 	return ot.builder.String(), nil
@@ -1271,7 +1281,7 @@ func (ot *OptTester) buildExpr(factory *norm.Factory) error {
 
 func (ot *OptTester) makeOptimizer() *xform.Optimizer {
 	var o xform.Optimizer
-	o.Init(&ot.evalCtx)
+	o.Init(&ot.evalCtx, ot.catalog)
 	return &o
 }
 

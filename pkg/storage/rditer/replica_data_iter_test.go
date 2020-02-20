@@ -77,7 +77,6 @@ func createRangeData(
 	}{
 		{keys.AbortSpanKey(desc.RangeID, testTxnID), ts0},
 		{keys.AbortSpanKey(desc.RangeID, testTxnID2), ts0},
-		{keys.RangeFrozenStatusKey(desc.RangeID), ts0},
 		{keys.RangeLastGCKey(desc.RangeID), ts0},
 		{keys.RangeAppliedStateKey(desc.RangeID), ts0},
 		{keys.RaftAppliedIndexLegacyKey(desc.RangeID), ts0},
@@ -85,14 +84,11 @@ func createRangeData(
 		{keys.RangeLeaseKey(desc.RangeID), ts0},
 		{keys.LeaseAppliedIndexLegacyKey(desc.RangeID), ts0},
 		{keys.RangeStatsLegacyKey(desc.RangeID), ts0},
-		{keys.RangeTxnSpanGCThresholdKey(desc.RangeID), ts0},
-		{keys.RaftTombstoneKey(desc.RangeID), ts0},
+		{keys.RangeTombstoneKey(desc.RangeID), ts0},
 		{keys.RaftHardStateKey(desc.RangeID), ts0},
-		{keys.RaftLastIndexKey(desc.RangeID), ts0},
 		{keys.RaftLogKey(desc.RangeID, 1), ts0},
 		{keys.RaftLogKey(desc.RangeID, 2), ts0},
 		{keys.RangeLastReplicaGCTimestampKey(desc.RangeID), ts0},
-		{keys.RangeLastVerificationTimestampKeyDeprecated(desc.RangeID), ts0},
 		{keys.RangeDescriptorKey(desc.StartKey), ts},
 		{keys.TransactionKey(roachpb.Key(desc.StartKey), uuid.MakeV4()), ts0},
 		{keys.TransactionKey(roachpb.Key(desc.StartKey.Next()), uuid.MakeV4()), ts0},
@@ -120,12 +116,12 @@ func createRangeData(
 func verifyRDIter(
 	t *testing.T,
 	desc *roachpb.RangeDescriptor,
-	eng engine.ReadWriter,
+	readWriter engine.ReadWriter,
 	replicatedOnly bool,
 	expectedKeys []engine.MVCCKey,
 ) {
 	t.Helper()
-	testutils.RunTrueAndFalse(t, "spanset", func(t *testing.T, useSpanSet bool) {
+	verify := func(t *testing.T, useSpanSet, reverse bool) {
 		if useSpanSet {
 			var spans spanset.SpanSet
 			spans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{
@@ -140,18 +136,24 @@ func verifyRDIter(
 				Key:    desc.StartKey.AsRawKey(),
 				EndKey: desc.EndKey.AsRawKey(),
 			}, hlc.Timestamp{WallTime: 42})
-			eng = spanset.NewReadWriterAt(eng, &spans, hlc.Timestamp{WallTime: 42})
+			readWriter = spanset.NewReadWriterAt(readWriter, &spans, hlc.Timestamp{WallTime: 42})
 		}
-		iter := NewReplicaDataIterator(desc, eng, replicatedOnly)
+		iter := NewReplicaDataIterator(desc, readWriter, replicatedOnly, reverse /* seekEnd */)
 		defer iter.Close()
 		i := 0
-		for ; ; iter.Next() {
+		if reverse {
+			i = len(expectedKeys) - 1
+		}
+		for {
 			if ok, err := iter.Valid(); err != nil {
 				t.Fatal(err)
 			} else if !ok {
 				break
 			}
-			if i >= len(expectedKeys) {
+			if !reverse && i >= len(expectedKeys) {
+				t.Fatal("there are more keys in the iteration than expected")
+			}
+			if reverse && i < 0 {
 				t.Fatal("there are more keys in the iteration than expected")
 			}
 			if key := iter.Key(); !key.Equal(expectedKeys[i]) {
@@ -159,11 +161,22 @@ func verifyRDIter(
 				k2, ts2 := expectedKeys[i].Key, expectedKeys[i].Timestamp
 				t.Errorf("%d: expected %q(%d); got %q(%d)", i, k2, ts2, k1, ts1)
 			}
-			i++
+			if reverse {
+				i--
+				iter.Prev()
+			} else {
+				i++
+				iter.Next()
+			}
 		}
-		if i != len(expectedKeys) {
+		if (reverse && i >= 0) || (!reverse && i != len(expectedKeys)) {
 			t.Fatal("there are fewer keys in the iteration than expected")
 		}
+	}
+	testutils.RunTrueAndFalse(t, "reverse", func(t *testing.T, reverse bool) {
+		testutils.RunTrueAndFalse(t, "spanset", func(t *testing.T, useSpanSet bool) {
+			verify(t, useSpanSet, reverse)
+		})
 	})
 }
 
@@ -224,7 +237,8 @@ func TestReplicaDataIterator(t *testing.T) {
 
 	// Verify that the replicated-only iterator ignores unreplicated keys.
 	unreplicatedPrefix := keys.MakeRangeIDUnreplicatedPrefix(desc.RangeID)
-	iter := NewReplicaDataIterator(&desc, eng, true /* replicatedOnly */)
+	iter := NewReplicaDataIterator(&desc, eng,
+		true /* replicatedOnly */, false /* seekEnd */)
 	defer iter.Close()
 	for ; ; iter.Next() {
 		if ok, err := iter.Valid(); err != nil {

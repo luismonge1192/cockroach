@@ -24,7 +24,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
 )
 
 // TODO(yuzefovich): add benchmarks.
@@ -73,23 +72,17 @@ var _ Operator = &_ROW_NUMBER_STRINGOp{}
 
 func (r *_ROW_NUMBER_STRINGOp) Next(ctx context.Context) coldata.Batch {
 	batch := r.Input().Next(ctx)
-	// {{ if .HasPartition }}
-	if r.partitionColIdx == batch.Width() {
-		r.allocator.AppendColumn(batch, coltypes.Bool)
-	} else if r.partitionColIdx > batch.Width() {
-		execerror.VectorizedInternalPanic("unexpected: column partitionColIdx is neither present nor the next to be appended")
+	if batch.Length() == 0 {
+		return coldata.ZeroBatch
 	}
+	// {{ if .HasPartition }}
+	r.allocator.MaybeAddColumn(batch, coltypes.Bool, r.partitionColIdx)
+	// {{ end }}
+	r.allocator.MaybeAddColumn(batch, coltypes.Int64, r.outputColIdx)
+
+	// {{ if .HasPartition }}
 	partitionCol := batch.ColVec(r.partitionColIdx).Bool()
 	// {{ end }}
-
-	if r.outputColIdx == batch.Width() {
-		r.allocator.AppendColumn(batch, coltypes.Int64)
-	} else if r.outputColIdx > batch.Width() {
-		execerror.VectorizedInternalPanic("unexpected: column outputColIdx is neither present nor the next to be appended")
-	}
-	if batch.Length() == 0 {
-		return batch
-	}
 	rowNumberCol := batch.ColVec(r.outputColIdx).Int64()
 	sel := batch.Selection()
 	if sel != nil {

@@ -94,14 +94,18 @@ func (b *Builder) findIndexByName(table cat.Table, name tree.UnrestrictedName) (
 		`index %q not found`, name)
 }
 
-// addExtraColumn builds extraCol.expr as a column in extraColsScope; if it is
+// addOrderByOrDistinctOnColumn builds extraCol.expr as a column in extraColsScope; if it is
 // already projected in projectionsScope then that projection is re-used.
-func (b *Builder) addExtraColumn(
+func (b *Builder) addOrderByOrDistinctOnColumn(
 	inScope, projectionsScope, extraColsScope *scope, extraCol *scopeColumn,
 ) {
-	// Use an existing projection if possible. Otherwise, build a new
+	// Use an existing projection if possible (even if it has side-effects; see
+	// the SQL99 rules described in analyzeExtraArgument). Otherwise, build a new
 	// projection.
-	if col := projectionsScope.findExistingCol(extraCol.getExpr()); col != nil {
+	if col := projectionsScope.findExistingCol(
+		extraCol.getExpr(),
+		true, /* allowSideEffects */
+	); col != nil {
 		extraCol.id = col.id
 	} else {
 		b.buildScalar(extraCol.getExpr(), inScope, extraColsScope, extraCol, nil)
@@ -174,7 +178,7 @@ func (b *Builder) buildOrderByArg(
 	inScope, projectionsScope, orderByScope *scope, orderByCol *scopeColumn,
 ) {
 	// Build the ORDER BY column.
-	b.addExtraColumn(inScope, projectionsScope, orderByScope, orderByCol)
+	b.addOrderByOrDistinctOnColumn(inScope, projectionsScope, orderByScope, orderByCol)
 
 	// Add the new column to the ordering.
 	orderByScope.ordering = append(orderByScope.ordering,
@@ -255,9 +259,9 @@ func (b *Builder) analyzeExtraArgument(
 func ensureColumnOrderable(e tree.TypedExpr) {
 	typ := e.ResolvedType()
 	if typ.Family() == types.ArrayFamily {
-		panic(unimplementedWithIssueDetailf(32707, "", "can't order by column type %s", typ))
+		panic(unimplementedWithIssueDetailf(35707, "", "can't order by column type %s", typ))
 	}
 	if typ.Family() == types.JsonFamily {
-		panic(unimplementedWithIssueDetailf(32706, "", "can't order by column type jsonb"))
+		panic(unimplementedWithIssueDetailf(35706, "", "can't order by column type jsonb"))
 	}
 }

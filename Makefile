@@ -80,6 +80,11 @@ BENCHTIMEOUT := 5m
 ## Extra flags to pass to the go test runner, e.g. "-v --vmodule=raft=1"
 TESTFLAGS :=
 
+## Flags to pass to `go test` invocations that actually run tests, but not
+## elsewhere. Used for the -json flag which we'll only want to pass
+## selectively.  There's likely a better solution.
+GOTESTFLAGS :=
+
 ## Extra flags to pass to `stress` during `make stress`.
 STRESSFLAGS :=
 
@@ -314,6 +319,7 @@ bin/.bootstrap: $(GITHOOKS) Gopkg.lock | bin/.submodules-initialized
 		./vendor/github.com/kisielk/errcheck \
 		./vendor/github.com/mattn/goveralls \
 		./vendor/github.com/mibk/dupl \
+		./vendor/github.com/mmatczuk/go_generics/cmd/go_generics \
 		./vendor/github.com/wadey/gocovmerge \
 		./vendor/golang.org/x/lint/golint \
 		./vendor/golang.org/x/perf/cmd/benchstat \
@@ -497,8 +503,9 @@ native-tag := $(subst -,_,$(TARGET_TRIPLE))$(if $(use-stdmalloc),_stdmalloc)$(if
 #
 # Suffixed flags files (e.g. zcgo_flags_{native-tag}.go) have the build
 # constraint `{native-tag}` and are built the first time a Make-driven build
-# encounters a given native tag. These tags are unset when building with the Go
-# toolchain directly, so these files are only compiled when building with Make.
+# encounters a given native tag or when the build signature changes (see
+# build/defs.mk.sig). These tags are unset when building with the Go toolchain
+# directly, so these files are only compiled when building with Make.
 CGO_PKGS := \
 	pkg/cli \
 	pkg/server/status \
@@ -512,9 +519,8 @@ CGO_SUFFIXED_FLAGS_FILES   := $(addprefix ./,$(addsuffix /zcgo_flags_$(native-ta
 BASE_CGO_FLAGS_FILES := $(CGO_UNSUFFIXED_FLAGS_FILES) $(CGO_SUFFIXED_FLAGS_FILES)
 CGO_FLAGS_FILES := $(BASE_CGO_FLAGS_FILES) vendor/github.com/knz/go-libedit/unix/zcgo_flags_extra.go
 
-$(CGO_UNSUFFIXED_FLAGS_FILES): build/defs.mk.sig
-
-$(BASE_CGO_FLAGS_FILES): Makefile | bin/.submodules-initialized
+$(BASE_CGO_FLAGS_FILES): Makefile build/defs.mk.sig | bin/.submodules-initialized
+	@echo "regenerating $@"
 	@echo '// GENERATED FILE DO NOT EDIT' > $@
 	@echo >> $@
 	@echo '// +build $(if $(findstring $(native-tag),$@),$(native-tag),!make)' >> $@
@@ -526,6 +532,7 @@ $(BASE_CGO_FLAGS_FILES): Makefile | bin/.submodules-initialized
 	@echo 'import "C"' >> $@
 
 vendor/github.com/knz/go-libedit/unix/zcgo_flags_extra.go: Makefile | bin/.submodules-initialized
+	@echo "regenerating $@"
 	@echo '// GENERATED FILE DO NOT EDIT' > $@
 	@echo >> $@
 	@echo 'package $($(@D)-package)' >> $@
@@ -768,7 +775,7 @@ endif
 # Go binary. It is not intended to be perfect. Upgrading the compiler toolchain
 # in place will go unnoticed, for example. Similar problems exist in all Make-
 # based build systems and are not worth solving.
-build/defs.mk.sig: sig = $(PATH):$(CURDIR):$(GO):$(GOPATH):$(CC):$(CXX):$(TARGET_TRIPLE):$(BUILDTYPE):$(IGNORE_GOVERS)
+build/defs.mk.sig: sig = $(PATH):$(CURDIR):$(GO):$(GOPATH):$(CC):$(CXX):$(TARGET_TRIPLE):$(BUILDTYPE):$(IGNORE_GOVERS):$(ENABLE_LIBROACH_ASSERTIONS):$(ENABLE_ROCKSDB_ASSERTIONS)
 build/defs.mk.sig: .ALWAYS_REBUILD
 	@echo '$(sig)' | cmp -s - $@ || echo '$(sig)' > $@
 
@@ -793,10 +800,14 @@ EXECGEN_TARGETS = \
   pkg/sql/colexec/and_or_projection.eg.go \
   pkg/sql/colexec/any_not_null_agg.eg.go \
   pkg/sql/colexec/avg_agg.eg.go \
+  pkg/sql/colexec/bool_and_or_agg.eg.go \
   pkg/sql/colexec/cast.eg.go \
   pkg/sql/colexec/const.eg.go \
+  pkg/sql/colexec/count_agg.eg.go \
   pkg/sql/colexec/distinct.eg.go \
   pkg/sql/colexec/hashjoiner.eg.go \
+  pkg/sql/colexec/hashtable.eg.go \
+  pkg/sql/colexec/hash_utils.eg.go \
   pkg/sql/colexec/like_ops.eg.go \
   pkg/sql/colexec/mergejoinbase.eg.go \
   pkg/sql/colexec/mergejoiner_fullouter.eg.go \
@@ -806,21 +817,22 @@ EXECGEN_TARGETS = \
   pkg/sql/colexec/mergejoiner_leftsemi.eg.go \
   pkg/sql/colexec/mergejoiner_rightouter.eg.go \
   pkg/sql/colexec/min_max_agg.eg.go \
+  pkg/sql/colexec/orderedsynchronizer.eg.go \
   pkg/sql/colexec/overloads_test_utils.eg.go \
   pkg/sql/colexec/proj_const_left_ops.eg.go \
   pkg/sql/colexec/proj_const_right_ops.eg.go \
   pkg/sql/colexec/proj_non_const_ops.eg.go \
+  pkg/sql/colexec/quicksort.eg.go \
   pkg/sql/colexec/rank.eg.go \
   pkg/sql/colexec/row_number.eg.go \
-  pkg/sql/colexec/quicksort.eg.go \
   pkg/sql/colexec/rowstovec.eg.go \
   pkg/sql/colexec/selection_ops.eg.go \
   pkg/sql/colexec/select_in.eg.go \
   pkg/sql/colexec/sort.eg.go \
+  pkg/sql/colexec/substring.eg.go \
   pkg/sql/colexec/sum_agg.eg.go \
   pkg/sql/colexec/tuples_differ.eg.go \
-  pkg/sql/colexec/vec_comparators.eg.go \
-  pkg/sql/colexec/zerocolumns.eg.go
+  pkg/sql/colexec/vec_comparators.eg.go
 
 execgen-exclusions = $(addprefix -not -path ,$(EXECGEN_TARGETS))
 
@@ -837,7 +849,9 @@ OPTGEN_TARGETS = \
 	pkg/sql/opt/rule_name_string.go
 
 go-targets-ccl := \
-	$(COCKROACH) $(COCKROACHSHORT) go-install \
+	$(COCKROACH) $(COCKROACHSHORT) \
+	bin/workload \
+	go-install \
 	bench benchshort \
 	check test testshort testslow testrace testraceslow testbuild \
 	stress stressrace \
@@ -968,13 +982,13 @@ benchshort: override TESTFLAGS += -benchtime=1ns -short
 .PHONY: check test testshort testrace testlogic testbaselogic testccllogic testoptlogic bench benchshort
 test: ## Run tests.
 check test testshort testrace bench benchshort:
-	$(xgo) test $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" $(if $(BENCHES),-bench "$(BENCHES)") -timeout $(TESTTIMEOUT) $(PKG) $(TESTFLAGS)
+	$(xgo) test $(GOTESTFLAGS) $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" $(if $(BENCHES),-bench "$(BENCHES)") -timeout $(TESTTIMEOUT) $(PKG) $(TESTFLAGS)
 
 .PHONY: stress stressrace
 stress: ## Run tests under stress.
 stressrace: ## Run tests under stress with the race detector enabled.
 stress stressrace:
-	$(xgo) test $(GOFLAGS) -exec 'stress $(STRESSFLAGS)' -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" -timeout 0 $(PKG) $(filter-out -v,$(TESTFLAGS)) -v -args -test.timeout $(TESTTIMEOUT)
+	$(xgo) test $(GOTESTFLAGS) $(GOFLAGS) -exec 'stress $(STRESSFLAGS)' -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" -timeout 0 $(PKG) $(filter-out -v,$(TESTFLAGS)) -v -args -test.timeout $(TESTTIMEOUT)
 
 .PHONY: roachprod-stress roachprod-stressrace
 roachprod-stress roachprod-stressrace: bin/roachprod-stress
@@ -984,7 +998,7 @@ roachprod-stress roachprod-stressrace: bin/roachprod-stress
 	@if [ -z "$(CLUSTER)" ]; then \
 	  echo "ERROR: missing or empty CLUSTER"; \
 	else \
-	  bin/roachprod-stress $(CLUSTER) $(STRESSFLAGS) $(patsubst github.com/cockroachdb/cockroach/%,./%,$(PKG)) \
+	  bin/roachprod-stress $(CLUSTER) $(patsubst github.com/cockroachdb/cockroach/%,./%,$(PKG)) $(STRESSFLAGS) -- \
 	    -test.run "$(TESTS)" $(filter-out -v,$(TESTFLAGS)) -test.v -test.timeout $(TESTTIMEOUT); \
 	fi
 
@@ -1020,7 +1034,7 @@ testraceslow: TESTTIMEOUT := $(RACETIMEOUT)
 .PHONY: testslow testraceslow
 testslow testraceslow: override TESTFLAGS += -v
 testslow testraceslow:
-	$(xgo) test $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" $(if $(BENCHES),-bench "$(BENCHES)") -timeout $(TESTTIMEOUT) $(PKG) $(TESTFLAGS) | grep -F ': Test' | sed -E 's/(--- PASS: |\(|\))//g' | awk '{ print $$2, $$1 }' | sort -rn | head -n 10
+	$(xgo) test $(GOTESTFLAGS) $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" $(if $(BENCHES),-bench "$(BENCHES)") -timeout $(TESTTIMEOUT) $(PKG) $(TESTFLAGS) | grep -F ': Test' | sed -E 's/(--- PASS: |\(|\))//g' | awk '{ print $$2, $$1 }' | sort -rn | head -n 10
 
 .PHONY: upload-coverage
 upload-coverage: bin/.bootstrap
@@ -1033,6 +1047,11 @@ acceptance: TESTTIMEOUT := $(ACCEPTANCETIMEOUT)
 acceptance: export TESTTIMEOUT := $(TESTTIMEOUT)
 acceptance: ## Run acceptance tests.
 	+@pkg/acceptance/run.sh
+
+.PHONY: compose
+compose: export TESTTIMEOUT := $(TESTTIMEOUT)
+compose: ## Run compose tests.
+	+@pkg/compose/run.sh
 
 .PHONY: dupl
 dupl: bin/.bootstrap
@@ -1057,19 +1076,19 @@ lint lintshort: TESTTIMEOUT := $(LINTTIMEOUT)
 .PHONY: lint
 lint: override TAGS += lint
 lint: ## Run all style checkers and linters.
-lint: bin/returncheck bin/roachlint
+lint: bin/returncheck bin/roachvet
 	@if [ -t 1 ]; then echo '$(yellow)NOTE: `make lint` is very slow! Perhaps `make lintshort`?$(term-reset)'; fi
 	@# Run 'go build -i' to ensure we have compiled object files available for all
 	@# packages. In Go 1.10, only 'go vet' recompiles on demand. For details:
 	@# https://groups.google.com/forum/#!msg/golang-dev/qfa3mHN4ZPA/X2UzjNV1BAAJ.
 	$(xgo) build -i -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' $(PKG)
-	$(xgo) test ./pkg/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -timeout $(TESTTIMEOUT) -run 'Lint/$(TESTS)'
+	$(xgo) test $(GOTESTFLAGS) ./pkg/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -timeout $(TESTTIMEOUT) -run 'Lint/$(TESTS)'
 
 .PHONY: lintshort
 lintshort: override TAGS += lint
 lintshort: ## Run a fast subset of the style checkers and linters.
-lintshort: bin/roachlint
-	$(xgo) test ./pkg/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -short -timeout $(TESTTIMEOUT) -run 'TestLint/$(TESTS)'
+lintshort: bin/roachvet
+	$(xgo) test $(GOTESTFLAGS) ./pkg/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -short -timeout $(TESTTIMEOUT) -run 'TestLint/$(TESTS)'
 
 .PHONY: protobuf
 protobuf: $(PROTOBUF_TARGETS)
@@ -1265,7 +1284,7 @@ STYLINT            := ./node_modules/.bin/stylint
 TSLINT             := ./node_modules/.bin/tslint
 TSC                := ./node_modules/.bin/tsc
 KARMA              := ./node_modules/.bin/karma
-WEBPACK            := ./node_modules/.bin/webpack $(if $(MAKE_TERMERR),--progress)
+WEBPACK            := ./node_modules/.bin/webpack
 WEBPACK_DEV_SERVER := ./node_modules/.bin/webpack-dev-server
 WEBPACK_DASHBOARD  := ./opt/node_modules/.bin/webpack-dashboard
 
@@ -1320,7 +1339,7 @@ pkg/ui/dist/%.ccl.dll.js pkg/ui/%.ccl.manifest.json: pkg/ui/webpack.%.js pkg/ui/
 
 .PHONY: ui-test
 ui-test: $(UI_CCL_DLLS) $(UI_CCL_MANIFESTS)
-	@echo "would run this but this is skipped pending #42365:" $(NODE_RUN) -C pkg/ui $(KARMA) start
+	$(NODE_RUN) -C pkg/ui $(KARMA) start
 
 .PHONY: ui-test-watch
 ui-test-watch: $(UI_CCL_DLLS) $(UI_CCL_MANIFESTS)
@@ -1355,7 +1374,7 @@ ui-watch-secure: export TARGET ?= https://localhost:8080/
 ui-watch: export TARGET ?= http://localhost:8080
 ui-watch ui-watch-secure: PORT := 3000
 ui-watch ui-watch-secure: $(UI_CCL_DLLS) pkg/ui/yarn.opt.installed
-	cd pkg/ui && $(WEBPACK_DASHBOARD) -- $(WEBPACK_DEV_SERVER) --config webpack.app.js --env.dist=ccl --port $(PORT) $(WEBPACK_DEV_SERVER_FLAGS)
+	cd pkg/ui && $(WEBPACK_DASHBOARD) -- $(WEBPACK_DEV_SERVER) --config webpack.app.js --env.dist=ccl --port $(PORT) --mode "development" $(WEBPACK_DEV_SERVER_FLAGS)
 
 .PHONY: ui-clean
 ui-clean: ## Remove build artifacts.
@@ -1476,10 +1495,15 @@ pkg/col/coldata/vec.eg.go: pkg/col/coldata/vec_tmpl.go
 pkg/sql/colexec/and_or_projection.eg.go: pkg/sql/colexec/and_or_projection_tmpl.go
 pkg/sql/colexec/any_not_null_agg.eg.go: pkg/sql/colexec/any_not_null_agg_tmpl.go
 pkg/sql/colexec/avg_agg.eg.go: pkg/sql/colexec/avg_agg_tmpl.go
+pkg/sql/colexec/bool_and_or_agg.eg.go: pkg/sql/colexec/bool_and_or_agg_tmpl.go
 pkg/sql/colexec/cast.eg.go: pkg/sql/colexec/cast_tmpl.go
 pkg/sql/colexec/const.eg.go: pkg/sql/colexec/const_tmpl.go
+pkg/sql/colexec/count_agg.eg.go: pkg/sql/colexec/count_agg_tmpl.go
 pkg/sql/colexec/distinct.eg.go: pkg/sql/colexec/distinct_tmpl.go
 pkg/sql/colexec/hashjoiner.eg.go: pkg/sql/colexec/hashjoiner_tmpl.go
+pkg/sql/colexec/hashtable.eg.go: pkg/sql/colexec/hashtable_tmpl.go
+pkg/sql/colexec/hash_utils.eg.go: pkg/sql/colexec/hash_utils_tmpl.go
+pkg/sql/colexec/like_ops.eg.go: pkg/sql/colexec/selection_ops_tmpl.go
 pkg/sql/colexec/mergejoinbase.eg.go: pkg/sql/colexec/mergejoinbase_tmpl.go
 pkg/sql/colexec/mergejoiner_fullouter.eg.go: pkg/sql/colexec/mergejoiner_tmpl.go
 pkg/sql/colexec/mergejoiner_inner.eg.go: pkg/sql/colexec/mergejoiner_tmpl.go
@@ -1488,6 +1512,8 @@ pkg/sql/colexec/mergejoiner_leftouter.eg.go: pkg/sql/colexec/mergejoiner_tmpl.go
 pkg/sql/colexec/mergejoiner_leftsemi.eg.go: pkg/sql/colexec/mergejoiner_tmpl.go
 pkg/sql/colexec/mergejoiner_rightouter.eg.go: pkg/sql/colexec/mergejoiner_tmpl.go
 pkg/sql/colexec/min_max_agg.eg.go: pkg/sql/colexec/min_max_agg_tmpl.go
+pkg/sql/colexec/orderedsynchronizer.eg.go: pkg/sql/colexec/orderedsynchronizer_tmpl.go
+pkg/sql/colexec/overloads_test_utils.eg.go: pkg/sql/colexec/selection_ops_tmpl.go
 pkg/sql/colexec/proj_const_left_ops.eg.go: pkg/sql/colexec/proj_const_ops_tmpl.go
 pkg/sql/colexec/proj_const_right_ops.eg.go: pkg/sql/colexec/proj_const_ops_tmpl.go
 pkg/sql/colexec/proj_non_const_ops.eg.go: pkg/sql/colexec/proj_non_const_ops_tmpl.go
@@ -1498,10 +1524,10 @@ pkg/sql/colexec/rowstovec.eg.go: pkg/sql/colexec/rowstovec_tmpl.go
 pkg/sql/colexec/select_in.eg.go: pkg/sql/colexec/select_in_tmpl.go
 pkg/sql/colexec/selection_ops.eg.go: pkg/sql/colexec/selection_ops_tmpl.go
 pkg/sql/colexec/sort.eg.go: pkg/sql/colexec/sort_tmpl.go
+pkg/sql/colexec/substring.eg.go: pkg/sql/colexec/substring_tmpl.go
 pkg/sql/colexec/sum_agg.eg.go: pkg/sql/colexec/sum_agg_tmpl.go
 pkg/sql/colexec/tuples_differ.eg.go: pkg/sql/colexec/tuples_differ_tmpl.go
 pkg/sql/colexec/vec_comparators.eg.go: pkg/sql/colexec/vec_comparators_tmpl.go
-pkg/sql/colexec/zerocolumns.eg.go: pkg/sql/colexec/zerocolumns_tmpl.go
 
 $(EXECGEN_TARGETS): bin/execgen
 	execgen $@
@@ -1601,7 +1627,7 @@ bins = \
   bin/publish-provisional-artifacts \
   bin/optgen \
   bin/returncheck \
-  bin/roachlint \
+  bin/roachvet \
   bin/roachprod \
   bin/roachprod-stress \
   bin/roachtest \
@@ -1631,8 +1657,7 @@ logictest-bins := bin/logictest bin/logictestopt bin/logictestccl
 # TODO(benesch): Derive this automatically. This is getting out of hand.
 bin/workload bin/docgen bin/execgen bin/roachtest $(logictest-bins): $(SQLPARSER_TARGETS) $(PROTOBUF_TARGETS)
 bin/workload bin/roachtest $(logictest-bins): $(EXECGEN_TARGETS)
-bin/roachtest $(logictest-bins): $(C_LIBS_CCL) $(CGO_FLAGS_FILES)
-bin/roachtest bin/logictestopt: $(OPTGEN_TARGETS)
+bin/roachtest $(logictest-bins): $(C_LIBS_CCL) $(CGO_FLAGS_FILES) $(OPTGEN_TARGETS)
 
 $(bins): bin/%: bin/%.d | bin/prereqs bin/.submodules-initialized
 	@echo go install -v $*

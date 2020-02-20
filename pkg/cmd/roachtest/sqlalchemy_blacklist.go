@@ -84,7 +84,7 @@ var sqlAlchemyBlacklist20_1 = blacklist{
 	"test/dialect/test_suite.py::ServerSideCursorsTest_cockroachdb+psycopg2_9_5_0::test_stmt_option":                          "41412",
 	"test/dialect/test_suite.py::ServerSideCursorsTest_cockroachdb+psycopg2_9_5_0::test_stmt_option_disabled":                 "41412",
 	"test/dialect/test_suite.py::ServerSideCursorsTest_cockroachdb+psycopg2_9_5_0::test_text_ss_option":                       "41412",
-	"test/dialect/test_suite.py::TableDDLTest_cockroachdb+psycopg2_9_5_0::test_create_table_schema":                           "26443",
+	"test/dialect/test_suite.py::TableDDLTest_cockroachdb+psycopg2_9_5_0::test_create_table_schema":                           "unknown",
 }
 
 var sqlAlchemyBlacklist = blacklist{

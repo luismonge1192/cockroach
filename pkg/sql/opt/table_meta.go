@@ -132,14 +132,20 @@ type TableMeta struct {
 	// the consistency of foreign keys.
 	IgnoreForeignKeys bool
 
-	// anns annotates the table metadata with arbitrary data.
-	anns [maxTableAnnIDCount]interface{}
-
-	// constraints stores the list of validated check constraints on the table
+	// Constraints stores the list of validated check constraints on the table
 	// stored in the ScalarExpr form so they can possibly be used as filters
 	// in certain queries. See comment above GenerateConstrainedScans for more
 	// detail.
-	constraints []ScalarExpr
+	Constraints []ScalarExpr
+
+	// ComputedCols stores ScalarExprs for each computed column on the table,
+	// indexed by ColumnID. These will be used when building mutation statements
+	// and constraining indexes. See comment above GenerateConstrainedScans for
+	// more detail.
+	ComputedCols map[ColumnID]ScalarExpr
+
+	// anns annotates the table metadata with arbitrary data.
+	anns [maxTableAnnIDCount]interface{}
 }
 
 // clearAnnotations resets all the table annotations; used when copying a
@@ -177,21 +183,17 @@ func (tm *TableMeta) IndexKeyColumns(indexOrd int) ColSet {
 	return indexCols
 }
 
-// ConstraintCount returns the number of validated check constraints that are
-// applied to the table.
-func (tm *TableMeta) ConstraintCount() int {
-	return len(tm.constraints)
-}
-
-// Constraint looks up the ith valid table constraint on the table where
-// i < ConstraintCount().
-func (tm *TableMeta) Constraint(i int) ScalarExpr {
-	return tm.constraints[i]
-}
-
 // AddConstraint adds a valid table constraint to the table's metadata.
 func (tm *TableMeta) AddConstraint(constraint ScalarExpr) {
-	tm.constraints = append(tm.constraints, constraint)
+	tm.Constraints = append(tm.Constraints, constraint)
+}
+
+// AddComputedCol adds a computed column expression to the table's metadata.
+func (tm *TableMeta) AddComputedCol(colID ColumnID, computedCol ScalarExpr) {
+	if tm.ComputedCols == nil {
+		tm.ComputedCols = make(map[ColumnID]ScalarExpr)
+	}
+	tm.ComputedCols[colID] = computedCol
 }
 
 // TableAnnotation returns the given annotation that is associated with the

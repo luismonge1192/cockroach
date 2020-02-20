@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/pkg/errors"
 )
 
@@ -78,8 +79,8 @@ func TestCreateStatsControlJob(t *testing.T) {
 
 		if _, err := jobutils.RunJob(
 			t, sqlDB, &allowRequest, []string{"cancel"}, query,
-		); !testutils.IsError(err, "job canceled") {
-			t.Fatalf("expected 'job canceled' error, but got %+v", err)
+		); err == nil {
+			t.Fatal("expected an error")
 		}
 
 		// There should be no results here.
@@ -95,7 +96,7 @@ func TestCreateStatsControlJob(t *testing.T) {
 		jobID, err := jobutils.RunJob(
 			t, sqlDB, &allowRequest, []string{"PAUSE"}, query,
 		)
-		if !testutils.IsError(err, "job paused") {
+		if !testutils.IsError(err, "pause") && !testutils.IsError(err, "liveness") {
 			t.Fatalf("unexpected: %v", err)
 		}
 
@@ -103,8 +104,18 @@ func TestCreateStatsControlJob(t *testing.T) {
 		sqlDB.CheckQueryResults(t,
 			`SELECT statistics_name, column_names, row_count FROM [SHOW STATISTICS FOR TABLE d.t]`,
 			[][]string{})
+		opts := retry.Options{
+			InitialBackoff: 1 * time.Millisecond,
+			MaxBackoff:     time.Second,
+			Multiplier:     2,
+		}
+		if err := retry.WithMaxAttempts(context.Background(), opts, 10, func() error {
+			_, err := sqlDB.DB.ExecContext(context.Background(), `RESUME JOB $1`, jobID)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
 
-		sqlDB.Exec(t, fmt.Sprintf(`RESUME JOB %d`, jobID))
 		jobutils.WaitForJob(t, sqlDB, jobID)
 
 		// Now the job should have succeeded in producing stats.
@@ -356,23 +367,52 @@ func TestAtMostOneRunningCreateStats(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Attempt to start an automatic stats run. It should fail.
-	_, err := conn.Exec(`CREATE STATISTICS __auto__ FROM d.t`)
-	expected := "another CREATE STATISTICS job is already running"
-	if !testutils.IsError(err, expected) {
-		t.Fatalf("expected '%s' error, but got %v", expected, err)
+	autoStatsRunShouldFail := func() {
+		expectErrCh := make(chan error, 1)
+		go func() {
+			_, err := conn.Exec(`CREATE STATISTICS __auto__ FROM d.t`)
+			expectErrCh <- err
+		}()
+		select {
+		case err := <-expectErrCh:
+			expected := "another CREATE STATISTICS job is already running"
+			if !testutils.IsError(err, expected) {
+				t.Fatalf("expected '%s' error, but got %v", expected, err)
+			}
+		case <-time.After(time.Second):
+			panic("CREATE STATISTICS job which was expected to fail, timed out instead")
+		}
 	}
 
-	// Pause the job. Starting another automatic stats run should still fail.
+	// Attempt to start an automatic stats run. It should fail.
+	autoStatsRunShouldFail()
+
+	// PAUSE JOB does not bloack until the job is paused but only requests it.
+	// Wait until the job is set to paused.
 	var jobID int64
 	sqlDB.QueryRow(t, `SELECT id FROM system.jobs ORDER BY created DESC LIMIT 1`).Scan(&jobID)
-	sqlDB.Exec(t, fmt.Sprintf("PAUSE JOB %d", jobID))
-
-	_, err = conn.Exec(`CREATE STATISTICS __auto__ FROM d.t`)
-	expected = "another CREATE STATISTICS job is already running"
-	if !testutils.IsError(err, expected) {
-		t.Fatalf("expected '%s' error, but got %v", expected, err)
+	opts := retry.Options{
+		InitialBackoff: 1 * time.Millisecond,
+		MaxBackoff:     time.Second,
+		Multiplier:     2,
 	}
+	if err := retry.WithMaxAttempts(context.Background(), opts, 10, func() error {
+		_, err := sqlDB.DB.ExecContext(context.Background(), `PAUSE JOB $1`, jobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var status string
+		sqlDB.QueryRow(t, `SELECT status FROM system.jobs WHERE id = $1 LIMIT 1`, jobID).Scan(&status)
+		if status != "paused" {
+			return errors.New("could not pause job")
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Starting another automatic stats run should still fail.
+	autoStatsRunShouldFail()
 
 	// Attempt to start a regular stats run. It should succeed.
 	errCh2 := make(chan error)
@@ -467,7 +507,7 @@ func TestCreateStatsProgress(t *testing.T) {
 	}(rowexec.SamplerProgressInterval)
 	rowexec.SamplerProgressInterval = 10
 
-	resetKVBatchSize := row.SetKVBatchSize(10)
+	resetKVBatchSize := row.TestingSetKVBatchSize(10)
 	defer resetKVBatchSize()
 
 	var allowRequest chan struct{}
@@ -627,7 +667,7 @@ func TestCreateStatsAsOfTime(t *testing.T) {
 // to CREATE STATISTICS, i.e. Scanning a user table. See discussion
 // on jobutils.RunJob for where this might be useful.
 func createStatsRequestFilter(allowProgressIota *chan struct{}) storagebase.ReplicaRequestFilter {
-	return func(ba roachpb.BatchRequest) *roachpb.Error {
+	return func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
 		if req, ok := ba.GetArg(roachpb.Scan); ok {
 			_, tableID, _ := encoding.DecodeUvarintAscending(req.(*roachpb.ScanRequest).Key)
 			// Ensure that the tableID is within the expected range for a table,

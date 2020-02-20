@@ -16,7 +16,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
@@ -423,6 +424,11 @@ func (s *Schema) ID() cat.StableID {
 	return s.SchemaID
 }
 
+// PostgresDescriptorID is part of the cat.Object interface.
+func (s *Schema) PostgresDescriptorID() cat.StableID {
+	return s.SchemaID
+}
+
 // Equals is part of the cat.Object interface.
 func (s *Schema) Equals(other cat.Object) bool {
 	otherSchema, ok := other.(*Schema)
@@ -470,6 +476,11 @@ func (tv *View) String() string {
 
 // ID is part of the cat.DataSource interface.
 func (tv *View) ID() cat.StableID {
+	return tv.ViewID
+}
+
+// PostgresDescriptorID is part of the cat.Object interface.
+func (tv *View) PostgresDescriptorID() cat.StableID {
 	return tv.ViewID
 }
 
@@ -551,6 +562,11 @@ func (tt *Table) String() string {
 
 // ID is part of the cat.DataSource interface.
 func (tt *Table) ID() cat.StableID {
+	return tt.TabID
+}
+
+// PostgresDescriptorID is part of the cat.Object interface.
+func (tt *Table) PostgresDescriptorID() cat.StableID {
 	return tt.TabID
 }
 
@@ -710,7 +726,7 @@ type Index struct {
 
 	// IdxZone is the zone associated with the index. This may be inherited from
 	// the parent table, database, or even the default zone.
-	IdxZone *config.ZoneConfig
+	IdxZone *zonepb.ZoneConfig
 
 	// Ordinal is the ordinal of this index in the table.
 	ordinal int
@@ -984,7 +1000,7 @@ func (ts *TableStat) Histogram() []cat.HistogramBucket {
 	histogram := make([]cat.HistogramBucket, len(ts.js.HistogramBuckets))
 	for i := range histogram {
 		bucket := &ts.js.HistogramBuckets[i]
-		datum, err := tree.ParseStringAs(colType, bucket.UpperBound, &evalCtx)
+		datum, err := sqlbase.ParseDatumStringAs(colType, bucket.UpperBound, &evalCtx)
 		if err != nil {
 			panic(err)
 		}
@@ -1111,6 +1127,11 @@ var _ cat.Sequence = &Sequence{}
 
 // ID is part of the cat.DataSource interface.
 func (ts *Sequence) ID() cat.StableID {
+	return ts.SeqID
+}
+
+// PostgresDescriptorID is part of the cat.Object interface.
+func (ts *Sequence) PostgresDescriptorID() cat.StableID {
 	return ts.SeqID
 }
 

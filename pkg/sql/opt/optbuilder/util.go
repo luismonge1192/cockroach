@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
@@ -215,6 +216,21 @@ func (b *Builder) projectColumn(dst *scopeColumn, src *scopeColumn) {
 	dst.id = src.id
 }
 
+// shouldCreateDefaultColumn decides if we need to create a default
+// column and default label for a function expression.
+// Returns true if the function's return type is not an empty tuple and
+// doesn't declare any tuple labels.
+func (b *Builder) shouldCreateDefaultColumn(texpr tree.TypedExpr) bool {
+	if texpr.ResolvedType() == types.EmptyTuple {
+		// This is only to support crdb_internal.unary_table().
+		return false
+	}
+
+	// We need to create a default column with a default name when
+	// the function return type doesn't declare any return labels.
+	return len(texpr.ResolvedType().TupleLabels()) == 0
+}
+
 // addColumn adds a column to scope with the given alias, type, and
 // expression. It returns a pointer to the new column. The column ID and group
 // are left empty so they can be filled in later.
@@ -409,6 +425,18 @@ func (b *Builder) resolveAndBuildScalar(
 	inScope.context = context
 	texpr := inScope.resolveAndRequireType(expr, requiredType)
 	return b.buildScalar(texpr, inScope, nil, nil, nil)
+}
+
+// In Postgres, qualifying an object name with pg_temp is equivalent to explicitly
+// specifying TEMP/TEMPORARY in the CREATE syntax. resolveTemporaryStatus returns
+// true if either(or both) of these conditions are true.
+func resolveTemporaryStatus(name *tree.TableName, explicitTemp bool) bool {
+	// An explicit schema can only be provided in the CREATE TEMP TABLE statement
+	// iff it is pg_temp.
+	if explicitTemp && name.ExplicitSchema && name.SchemaName != sessiondata.PgTempSchemaName {
+		panic(pgerror.New(pgcode.InvalidTableDefinition, "cannot create temporary relation in non-temporary schema"))
+	}
+	return name.SchemaName == sessiondata.PgTempSchemaName || explicitTemp
 }
 
 // resolveSchemaForCreate returns the schema that will contain a newly created

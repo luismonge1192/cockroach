@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/pkg/errors"
 )
 
@@ -36,6 +37,9 @@ var _ apd.Decimal
 
 // Dummy import to pull in "tree" package.
 var _ tree.Datum
+
+// Dummy import to pull in "duration" package.
+var _ duration.Duration
 
 // _ASSIGN_ADD is the template addition function for assigning the first input
 // to the result of the second input + the third input.
@@ -87,8 +91,6 @@ func (a *sum_TYPEAgg) Init(groups []bool, v coldata.Vec) {
 }
 
 func (a *sum_TYPEAgg) Reset() {
-	copy(a.scratch.vec, zero_TYPEColumn)
-	a.scratch.curAgg = a.scratch.vec[0]
 	a.scratch.curIdx = -1
 	a.scratch.foundNonNullForCurrentGroup = false
 	a.scratch.nulls.UnsetNulls()
@@ -102,7 +104,6 @@ func (a *sum_TYPEAgg) CurrentOutputIndex() int {
 func (a *sum_TYPEAgg) SetOutputIndex(idx int) {
 	if a.scratch.curIdx != -1 {
 		a.scratch.curIdx = idx
-		copy(a.scratch.vec[idx+1:], zero_TYPEColumn)
 		a.scratch.nulls.UnsetNullsAfter(uint16(idx + 1))
 	}
 }
@@ -118,8 +119,9 @@ func (a *sum_TYPEAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 		// null.
 		if !a.scratch.foundNonNullForCurrentGroup {
 			a.scratch.nulls.SetNull(uint16(a.scratch.curIdx))
+		} else {
+			a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
 		}
-		a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
 		a.scratch.curIdx++
 		a.done = true
 		return
@@ -174,15 +176,14 @@ func _ACCUMULATE_SUM(a *sum_TYPEAgg, nulls *coldata.Nulls, i int, _HAS_NULLS boo
 		if a.scratch.curIdx >= 0 {
 			if !a.scratch.foundNonNullForCurrentGroup {
 				a.scratch.nulls.SetNull(uint16(a.scratch.curIdx))
+			} else {
+				a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
 			}
-			a.scratch.vec[a.scratch.curIdx] = a.scratch.curAgg
 		}
 		a.scratch.curIdx++
-
-		// The next element of vec is guaranteed  to be initialized to the zero
-		// value. We can't use zero_TYPEColumn here because this is outside of
-		// the earlier template block.
-		a.scratch.curAgg = a.scratch.vec[a.scratch.curIdx]
+		// {{with .Global}}
+		a.scratch.curAgg = zero_TYPEValue
+		// {{end}}
 
 		// {{/*
 		// We only need to reset this flag if there are nulls. If there are no

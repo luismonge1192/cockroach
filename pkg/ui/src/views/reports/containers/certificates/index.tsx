@@ -12,14 +12,15 @@ import _ from "lodash";
 import React, { Fragment } from "react";
 import { Helmet } from "react-helmet";
 import { connect } from "react-redux";
-import { RouterState } from "react-router";
-import { bindActionCreators, Dispatch } from "redux";
+import { RouteComponentProps, withRouter } from "react-router-dom";
+
 import * as protos from "src/js/protos";
 import { certificatesRequestKey, refreshCertificates } from "src/redux/apiReducers";
 import { AdminUIState } from "src/redux/state";
 import { nodeIDAttr } from "src/util/constants";
 import { LongToMoment } from "src/util/convert";
 import Loading from "src/views/shared/components/loading";
+import { getMatchParamByName } from "src/util/query";
 
 interface CertificatesOwnProps {
   certificates: protos.cockroach.server.serverpb.CertificatesResponse;
@@ -29,7 +30,7 @@ interface CertificatesOwnProps {
 
 const dateFormat = "Y-MM-DD HH:mm:ss";
 
-type CertificatesProps = CertificatesOwnProps & RouterState;
+type CertificatesProps = CertificatesOwnProps & RouteComponentProps;
 
 const emptyRow = (
   <tr className="certs-table__row">
@@ -40,14 +41,14 @@ const emptyRow = (
 
 function certificatesRequestFromProps(props: CertificatesProps) {
   return new protos.cockroach.server.serverpb.CertificatesRequest({
-    node_id: props.params[nodeIDAttr],
+    node_id: getMatchParamByName(props.match, nodeIDAttr),
   });
 }
 
 /**
  * Renders the Certificate Report page.
  */
-class Certificates extends React.Component<CertificatesProps, {}> {
+export class Certificates extends React.Component<CertificatesProps, {}> {
   refresh(props = this.props) {
     props.refreshCertificates(certificatesRequestFromProps(props));
   }
@@ -162,23 +163,23 @@ class Certificates extends React.Component<CertificatesProps, {}> {
   }
 
   renderContent = () => {
-    const { certificates } = this.props;
-    const nodeID = this.props.params[nodeIDAttr];
+    const { certificates, match } = this.props;
+    const nodeId = getMatchParamByName(match, nodeIDAttr);
 
     if (_.isEmpty(certificates.certificates)) {
-      return <h2>No certificates were found on node {this.props.params[nodeIDAttr]}.</h2>;
+      return <h2 className="base-heading">No certificates were found on node {nodeId}.</h2>;
     }
 
     let header: string = null;
-    if (_.isNaN(parseInt(nodeID, 10))) {
+    if (_.isNaN(parseInt(nodeId, 10))) {
       header = "Local Node";
     } else {
-      header = `Node ${nodeID}`;
+      header = `Node ${nodeId}`;
     }
 
     return (
       <Fragment>
-        <h2>{header} certificates</h2>
+        <h2 className="base-heading">{header} certificates</h2>
         {
           _.map(certificates.certificates, (cert, key) => (
             this.renderCert(cert, key)
@@ -191,10 +192,8 @@ class Certificates extends React.Component<CertificatesProps, {}> {
   render() {
     return (
       <div className="section">
-        <Helmet>
-          <title>Certificates | Debug</title>
-        </Helmet>
-        <h1>Certificates</h1>
+        <Helmet title="Certificates | Debug" />
+        <h1 className="base-heading page-title">Certificates</h1>
 
         <section className="section">
           <Loading
@@ -216,12 +215,8 @@ const mapStateToProps = (state: AdminUIState, props: CertificatesProps) => {
   };
 };
 
-const mapDispatchToProps = (dispatch: Dispatch<AdminUIState>) =>
-  bindActionCreators(
-    {
-      refreshCertificates,
-    },
-    dispatch,
-  );
+const mapDispatchToProps = {
+  refreshCertificates,
+};
 
-export default connect(mapStateToProps, mapDispatchToProps)(Certificates);
+export default withRouter(connect(mapStateToProps, mapDispatchToProps)(Certificates));

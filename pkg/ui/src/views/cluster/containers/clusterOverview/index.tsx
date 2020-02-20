@@ -12,7 +12,6 @@ import classNames from "classnames";
 import d3 from "d3";
 import React from "react";
 import { Helmet } from "react-helmet";
-import { RouterState } from "react-router";
 import { connect } from "react-redux";
 import { createSelector } from "reselect";
 
@@ -189,7 +188,7 @@ class ClusterSummary extends React.Component<ClusterSummaryProps, {}> {
       );
     }
 
-    return <section className="cluster-summary" children={children} />;
+    return <section className="cluster-summary" children={React.Children.toArray(children)} />;
   }
 }
 
@@ -213,32 +212,19 @@ const ClusterSummaryConnected = connect(mapStateToClusterSummaryProps, actions)(
 /**
  * Renders the main content of the cluster visualization page.
  */
-class ClusterOverview extends React.Component<RouterState, {}> {
+export default class ClusterOverview extends React.Component<any, any> {
   render() {
     return (
-      <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
-        <Helmet>
-          <title>Cluster Overview</title>
-        </Helmet>
-        <section className="section"><h1>Cluster Overview</h1></section>
+      <div className="cluster-page">
+        <Helmet title="Cluster Overview" />
+        <section className="section"><h1 className="base-heading page-title">Cluster Overview</h1></section>
         <section className="cluster-overview">
           <ClusterSummaryConnected />
         </section>
-        <div style={{
-          flexGrow: 1,
-          position: "relative",
-          margin: "18px 24px",
-          border: "1px solid #EDEDED",
-          borderRadius: 3,
-          backgroundColor: "white",
-        }}>
-          <div style={{ position: "absolute", width: "100%", height: "100%" }}>
-            { this.props.children }
-          </div>
+        <div className="cluster-overview--fixed">
+          { this.props.children }
         </div>
       </div>
     );
   }
 }
-
-export { ClusterOverview as default };

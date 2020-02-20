@@ -425,21 +425,31 @@ func (r *testRunner) runWorker(
 		// Prepare the test's logger.
 		logPath := ""
 		var artifactsDir string
+		var artifactsSpec string
 		if artifactsRootDir != "" {
-			artifactsSuffix := "run_" + strconv.Itoa(testToRun.runNum)
-			artifactsDir = filepath.Join(
-				artifactsRootDir, teamCityNameEscape(testToRun.spec.Name), artifactsSuffix)
+			escapedTestName := teamCityNameEscape(testToRun.spec.Name)
+			runSuffix := "run_" + strconv.Itoa(testToRun.runNum)
+
+			base := filepath.Join(artifactsRootDir, escapedTestName)
+
+			artifactsDir = filepath.Join(base, runSuffix)
 			logPath = filepath.Join(artifactsDir, "test.log")
+
+			// Map artifacts/TestFoo/** => TestFoo/**, i.e. collect the artifacts
+			// for this test exactly as they are laid out on disk (when the time
+			// comes).
+			artifactsSpec = fmt.Sprintf("%s/** => %s", base, escapedTestName)
 		}
 		testL, err := rootLogger(logPath, teeOpt)
 		if err != nil {
 			return err
 		}
 		t := &test{
-			spec:         &testToRun.spec,
-			buildVersion: r.buildVersion,
-			artifactsDir: artifactsDir,
-			l:            testL,
+			spec:          &testToRun.spec,
+			buildVersion:  r.buildVersion,
+			artifactsDir:  artifactsDir,
+			artifactsSpec: artifactsSpec,
+			l:             testL,
 		}
 		// Tell the cluster that, from now on, it will be run "on behalf of this
 		// test".
@@ -505,13 +515,29 @@ func getPerfArtifacts(ctx context.Context, l *logger, c *cluster, t *test) {
 	g := ctxgroup.WithContext(ctx)
 	fetchNode := func(node int) func(context.Context) error {
 		return func(ctx context.Context) error {
-			// RunWithBuffer to toss the output.
-			if _, err := c.RunWithBuffer(ctx, l, c.Node(node), "ls", perfArtifactsDir); err != nil {
-				// perfArtifactsDir doesn't exist, nothing to fetch.
-				return nil
+			testCmd := `'PERF_ARTIFACTS="` + perfArtifactsDir + `"
+if [[ -d "${PERF_ARTIFACTS}" ]]; then
+    echo true
+elif [[ -e "${PERF_ARTIFACTS}" ]]; then
+    ls -la "${PERF_ARTIFACTS}"
+    exit 1
+else
+    echo false
+fi'`
+			out, err := c.RunWithBuffer(ctx, l, c.Node(node), "bash", "-c", testCmd)
+			if err != nil {
+				return errors.Wrapf(err, "failed to check for perf artifacts: %v", string(out))
 			}
-			dst := fmt.Sprintf("%s/%d.%s", t.artifactsDir, node, perfArtifactsDir)
-			return c.Get(ctx, l, perfArtifactsDir, dst, c.Node(node))
+			switch out := strings.TrimSpace(string(out)); out {
+			case "true":
+				dst := fmt.Sprintf("%s/%d.%s", t.artifactsDir, node, perfArtifactsDir)
+				return c.Get(ctx, l, perfArtifactsDir, dst, c.Node(node))
+			case "false":
+				l.PrintfCtx(ctx, "no perf artifacts exist on node %v", c.Node(node))
+				return nil
+			default:
+				return errors.Errorf("unexpected output when checking for perf artifacts: %s", out)
+			}
 		}
 	}
 	for _, i := range c.All() {
@@ -592,7 +618,7 @@ func (r *testRunner) runTest(
 				}
 			}
 
-			shout(ctx, l, stdout, "--- FAIL: %s %s\n%s", t.Name(), durationStr, output)
+			shout(ctx, l, stdout, "--- FAIL: %s (%s)\n%s", t.Name(), durationStr, output)
 			// NB: check NodeCount > 0 to avoid posting issues from this pkg's unit tests.
 			if issues.CanPost() && t.spec.Run != nil && t.spec.Cluster.NodeCount > 0 {
 				authorEmail := getAuthorEmail(t.spec.Tags, failLoc.file, failLoc.line)
@@ -605,13 +631,19 @@ func (r *testRunner) runTest(
 				artifacts := fmt.Sprintf("/%s", t.Name())
 
 				req := issues.PostRequest{
-					Title:       fmt.Sprintf("roachtest: %s failed", t.Name()),
-					PackageName: "roachtest",
-					TestName:    t.Name(),
-					Message:     msg,
-					Artifacts:   artifacts,
-					AuthorEmail: authorEmail,
-					ExtraLabels: []string{"O-roachtest"},
+					// TODO(tbg): actually use this as a template.
+					TitleTemplate: fmt.Sprintf("roachtest: %s failed", t.Name()),
+					// TODO(tbg): make a template better adapted to roachtest.
+					BodyTemplate: issues.UnitTestFailureBody,
+					PackageName:  "roachtest",
+					TestName:     t.Name(),
+					Message:      msg,
+					Artifacts:    artifacts,
+					AuthorEmail:  authorEmail,
+					// Issues posted from roachtest are identifiable as such and
+					// they are also release blockers (this label may be removed
+					// by a human upon closer investigation).
+					ExtraLabels: []string{"O-roachtest", "release-blocker"},
 				}
 				if err := issues.Post(
 					context.Background(),
@@ -621,7 +653,7 @@ func (r *testRunner) runTest(
 				}
 			}
 		} else {
-			shout(ctx, l, stdout, "--- PASS: %s %s", t.Name(), durationStr)
+			shout(ctx, l, stdout, "--- PASS: %s (%s)", t.Name(), durationStr)
 			// If `##teamcity[testFailed ...]` is not present before `##teamCity[testFinished ...]`,
 			// TeamCity regards the test as successful.
 		}
@@ -629,10 +661,15 @@ func (r *testRunner) runTest(
 		if teamCity {
 			shout(ctx, l, stdout, "##teamcity[testFinished name='%s' flowId='%s']", t.Name(), t.Name())
 
-			artifactsGlobPath := filepath.Join(t.ArtifactsDir(), "**")
-			escapedTestName := teamCityNameEscape(t.Name())
-			artifactsSpec := fmt.Sprintf("%s => %s", artifactsGlobPath, escapedTestName)
-			shout(ctx, l, stdout, "##teamcity[publishArtifacts '%s']", artifactsSpec)
+			if t.artifactsSpec != "" {
+				// Tell TeamCity to collect this test's artifacts now. The TC job
+				// also collects the artifacts directory wholesale at the end, but
+				// here we make sure that the artifacts for any test that has already
+				// finished are available in the UI even before the job as a whole
+				// has completed. We're using the exact same destination to avoid
+				// duplication of any of the artifacts.
+				shout(ctx, l, stdout, "##teamcity[publishArtifacts '%s']", t.artifactsSpec)
+			}
 		}
 
 		r.recordTestFinish(completedTestInfo{
@@ -694,6 +731,13 @@ func (r *testRunner) runTest(
 		defer close(done) // closed only after we've grabbed the debug info below
 
 		// This is the call to actually run the test.
+		defer func() {
+			if r := recover(); r != nil {
+				// TODO(andreimatei): prevent the cluster from being reused.
+				t.Fatalf("test panicked: %v", r)
+			}
+		}()
+
 		t.spec.Run(runCtx, t, c)
 	}()
 
@@ -749,11 +793,8 @@ func (r *testRunner) collectClusterLogs(ctx context.Context, c *cluster, l *logg
 	// below has problems. For example, `debug zip` is known to
 	// hang sometimes at the time of writing, see:
 	// https://github.com/cockroachdb/cockroach/issues/39620
-	if err := c.FetchLogs(ctx); err != nil {
-		l.Printf("failed to download logs: %s", err)
-	}
 	l.PrintfCtx(ctx, "collecting cluster logs")
-	if err := c.FetchDebugZip(ctx); err != nil {
+	if err := c.FetchLogs(ctx); err != nil {
 		l.Printf("failed to download logs: %s", err)
 	}
 	if err := c.FetchDmesg(ctx); err != nil {
@@ -767,6 +808,9 @@ func (r *testRunner) collectClusterLogs(ctx context.Context, c *cluster, l *logg
 	}
 	if err := c.CopyRoachprodState(ctx); err != nil {
 		l.Printf("failed to copy roachprod state: %s", err)
+	}
+	if err := c.FetchDebugZip(ctx); err != nil {
+		l.Printf("failed to collect zip: %s", err)
 	}
 }
 
@@ -1046,10 +1090,10 @@ func PredecessorVersion(buildVersion version.Version) (string, error) {
 	buildVersionMajorMinor := fmt.Sprintf("%d.%d", buildVersion.Major(), buildVersion.Minor())
 
 	verMap := map[string]string{
-		"20.1": "19.2.0",
+		"20.1": "19.2.1",
 		"19.2": "19.1.5",
-		"19.1": "2.1.8",
-		"2.2":  "2.1.8",
+		"19.1": "2.1.9",
+		"2.2":  "2.1.9",
 		"2.1":  "2.0.7",
 	}
 	v, ok := verMap[buildVersionMajorMinor]

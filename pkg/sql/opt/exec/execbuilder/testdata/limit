@@ -29,7 +29,7 @@ EXPLAIN (VERBOSE) SELECT DISTINCT w FROM (SELECT w FROM t ORDER BY w LIMIT 100) 
 ----
 tree                      field        description  columns  ordering
 ·                         distributed  false        ·        ·
-·                         vectorized   true         ·        ·
+·                         vectorized   false        ·        ·
 limit                     ·            ·            (w)      +w
  │                        count        25           ·        ·
  └── distinct             ·            ·            (w)      +w

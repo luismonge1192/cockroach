@@ -14,10 +14,12 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"math/rand"
+	"net/http/httptest"
 	"regexp"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
@@ -55,20 +57,22 @@ const retryCount = 20
 
 // Smither is a sqlsmith generator.
 type Smither struct {
-	rnd            *rand.Rand
-	db             *gosql.DB
-	lock           syncutil.RWMutex
-	tables         []*tableRef
-	columns        map[tree.TableName]map[tree.Name]*tree.ColumnTableDef
-	indexes        map[tree.TableName]map[tree.Name]*tree.CreateIndex
-	nameCounts     map[string]int
-	alters         *WeightedSampler
-	scalars, bools *WeightedSampler
-	selectStmts    *WeightedSampler
+	rnd        *rand.Rand
+	db         *gosql.DB
+	lock       syncutil.RWMutex
+	tables     []*tableRef
+	columns    map[tree.TableName]map[tree.Name]*tree.ColumnTableDef
+	indexes    map[tree.TableName]map[tree.Name]*tree.CreateIndex
+	nameCounts map[string]int
 
-	stmtSampler, tableExprSampler *WeightedSampler
-	statements                    statementWeights
-	tableExprs                    tableExprWeights
+	stmtWeights, alterWeights          []statementWeight
+	stmtSampler, alterSampler          *statementSampler
+	tableExprWeights                   []tableExprWeight
+	tableExprSampler                   *tableExprSampler
+	selectStmtWeights                  []selectStatementWeight
+	selectStmtSampler                  *selectStatementSampler
+	scalarExprWeights, boolExprWeights []scalarExprWeight
+	scalarExprSampler, boolExprSampler *scalarExprSampler
 
 	disableWith        bool
 	disableImpureFns   bool
@@ -81,30 +85,55 @@ type Smither struct {
 	postgres           bool
 	ignoreFNs          []*regexp.Regexp
 	complexity         float64
+
+	bulkSrv     *httptest.Server
+	bulkFiles   map[string][]byte
+	bulkBackups map[string]tree.TargetList
+	bulkExports []string
 }
+
+type (
+	statement       func(*Smither) (tree.Statement, bool)
+	tableExpr       func(s *Smither, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool)
+	selectStatement func(s *Smither, desiredTypes []*types.T, refs colRefs, withTables tableRefs) (tree.SelectStatement, colRefs, bool)
+	scalarExpr      func(*Smither, Context, *types.T, colRefs) (expr tree.TypedExpr, ok bool)
+)
 
 // NewSmither creates a new Smither. db is used to populate existing tables
 // for use as column references. It can be nil to skip table population.
 func NewSmither(db *gosql.DB, rnd *rand.Rand, opts ...SmitherOption) (*Smither, error) {
 	s := &Smither{
-		rnd:         rnd,
-		db:          db,
-		nameCounts:  map[string]int{},
-		scalars:     NewWeightedSampler(scalarWeights, rnd.Int63()),
-		bools:       NewWeightedSampler(boolWeights, rnd.Int63()),
-		selectStmts: NewWeightedSampler(selectStmtWeights, rnd.Int63()),
-		alters:      NewWeightedSampler(alterWeights, rnd.Int63()),
+		rnd:        rnd,
+		db:         db,
+		nameCounts: map[string]int{},
 
-		statements: allStatements,
-		tableExprs: allTableExprs,
+		stmtWeights:       allStatements,
+		alterWeights:      alters,
+		tableExprWeights:  allTableExprs,
+		selectStmtWeights: selectStmts,
+		scalarExprWeights: scalars,
+		boolExprWeights:   bools,
+
 		complexity: 0.2,
 	}
 	for _, opt := range opts {
 		opt.Apply(s)
 	}
-	s.stmtSampler = NewWeightedSampler(s.statements.Weights(), rnd.Int63())
-	s.tableExprSampler = NewWeightedSampler(s.tableExprs.Weights(), rnd.Int63())
+	s.stmtSampler = newWeightedStatementSampler(s.stmtWeights, rnd.Int63())
+	s.alterSampler = newWeightedStatementSampler(s.alterWeights, rnd.Int63())
+	s.tableExprSampler = newWeightedTableExprSampler(s.tableExprWeights, rnd.Int63())
+	s.selectStmtSampler = newWeightedSelectStatementSampler(s.selectStmtWeights, rnd.Int63())
+	s.scalarExprSampler = newWeightedScalarExprSampler(s.scalarExprWeights, rnd.Int63())
+	s.boolExprSampler = newWeightedScalarExprSampler(s.boolExprWeights, rnd.Int63())
+	s.enableBulkIO()
 	return s, s.ReloadSchemas()
+}
+
+// Close closes resources used by the Smither.
+func (s *Smither) Close() {
+	if s.bulkSrv != nil {
+		s.bulkSrv.Close()
+	}
 }
 
 var prettyCfg = func() tree.PrettyCfg {
@@ -199,19 +228,31 @@ func (o option) Apply(s *Smither) {
 // DisableMutations causes the Smither to not emit statements that could
 // mutate any on-disk data.
 var DisableMutations = simpleOption("disable mutations", func(s *Smither) {
-	s.statements = nonMutatingStatements
-	s.tableExprs = nonMutatingTableExprs
+	s.stmtWeights = nonMutatingStatements
+	s.tableExprWeights = nonMutatingTableExprs
 })
 
 // DisableDDLs causes the Smither to not emit statements that change table
 // schema (CREATE, DROP, ALTER, etc.)
 var DisableDDLs = simpleOption("disable DDLs", func(s *Smither) {
-	s.statements = statementWeights{
+	s.stmtWeights = []statementWeight{
 		{20, makeSelect},
 		{5, makeInsert},
 		{5, makeUpdate},
 		{1, makeDelete},
 	}
+})
+
+// OnlyNoDropDDLs causes the Smither to only emit DDLs, but won't ever drop
+// a table.
+var OnlyNoDropDDLs = simpleOption("only DDLs", func(s *Smither) {
+	s.stmtWeights = append([]statementWeight{
+		{1, makeBegin},
+		{2, makeRollback},
+		{6, makeCommit},
+	},
+		altersExistingTable...,
+	)
 })
 
 // DisableWith causes the Smither to not emit WITH clauses.
@@ -273,8 +314,8 @@ var Vectorizable = multiOption(
 	// exprs and statements.
 	simpleOption("vectorizable", func(s *Smither) {
 		s.vectorizable = true
-		s.statements = nonMutatingStatements
-		s.tableExprs = vectorizableTableExprs
+		s.stmtWeights = nonMutatingStatements
+		s.tableExprWeights = vectorizableTableExprs
 	})(),
 )
 
@@ -289,6 +330,8 @@ var CompareMode = multiOption(
 	"compare mode",
 	DisableMutations(),
 	DisableImpureFns(),
+	DisableCRDBFns(),
+	IgnoreFNs("^version"),
 	DisableLimits(),
 	OutputSort(),
 )
@@ -299,10 +342,8 @@ var PostgresMode = multiOption(
 	"postgres mode",
 	CompareMode(),
 	DisableWith(),
-	DisableCRDBFns(),
 	SimpleDatums(),
 	IgnoreFNs("^current_"),
-	IgnoreFNs("^version"),
 	simpleOption("postgres", func(s *Smither) {
 		s.postgres = true
 	})(),
@@ -310,6 +351,8 @@ var PostgresMode = multiOption(
 	// Some func impls differ from postgres, so skip them here.
 	// #41709
 	IgnoreFNs("^sha"),
-	// #41707
-	IgnoreFNs("^to_hex"),
+	// We use e'XX' instead of E'XX' for hex strings, so ignore these.
+	IgnoreFNs("^quote"),
+	// We have some differences here with empty string and "default"; skip until fixed.
+	IgnoreFNs("^pg_collation_for"),
 )

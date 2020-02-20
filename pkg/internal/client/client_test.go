@@ -23,7 +23,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -247,8 +247,8 @@ func TestClientRunTransaction(t *testing.T) {
 				return err
 			}
 			// Attempt to read in another txn.
-			conflictTxn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */, client.RootTxn)
-			conflictTxn.InternalSetPriority(enginepb.MaxTxnPriority)
+			conflictTxn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */)
+			conflictTxn.TestingSetPriority(enginepb.MaxTxnPriority)
 			if gr, err := conflictTxn.Get(ctx, key); err != nil {
 				return err
 			} else if gr.Value != nil {
@@ -294,9 +294,9 @@ func TestClientGetAndPutProto(t *testing.T) {
 	defer s.Stopper().Stop(context.TODO())
 	db := createTestClient(t, s)
 
-	zoneConfig := config.ZoneConfig{
+	zoneConfig := zonepb.ZoneConfig{
 		NumReplicas:   proto.Int32(2),
-		Constraints:   []config.Constraints{{Constraints: []config.Constraint{{Value: "mem"}}}},
+		Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "mem"}}}},
 		RangeMinBytes: proto.Int64(1 << 10), // 1k
 		RangeMaxBytes: proto.Int64(1 << 18), // 256k
 	}
@@ -306,7 +306,7 @@ func TestClientGetAndPutProto(t *testing.T) {
 		t.Fatalf("unable to put proto: %s", err)
 	}
 
-	var readZoneConfig config.ZoneConfig
+	var readZoneConfig zonepb.ZoneConfig
 	if err := db.GetProto(context.TODO(), key, &readZoneConfig); err != nil {
 		t.Fatalf("unable to get proto: %s", err)
 	}
@@ -846,8 +846,10 @@ func TestNodeIDAndObservedTimestamps(t *testing.T) {
 	}
 	for i, test := range directCases {
 		t.Run(fmt.Sprintf("direct-txn-%d", i), func(t *testing.T) {
-			txn := client.NewTxn(ctx, db, test.nodeID, test.typ)
-			ots := txn.Serialize().ObservedTimestamps
+			now := db.Clock().Now()
+			kvTxn := roachpb.MakeTransaction("unnamed", nil /*baseKey*/, roachpb.NormalUserPriority, now, db.Clock().MaxOffset().Nanoseconds())
+			txn := client.NewTxnFromProto(ctx, db, test.nodeID, now, test.typ, &kvTxn)
+			ots := txn.TestingCloneTxn().ObservedTimestamps
 			if (len(ots) == 1 && ots[0].NodeID == test.nodeID) != test.expObserved {
 				t.Errorf("expected observed ts %t; got %+v", test.expObserved, ots)
 			}
@@ -869,7 +871,7 @@ func TestNodeIDAndObservedTimestamps(t *testing.T) {
 			}
 			if err := db.Txn(
 				ctx, func(_ context.Context, txn *client.Txn) error {
-					ots := txn.Serialize().ObservedTimestamps
+					ots := txn.TestingCloneTxn().ObservedTimestamps
 					if (len(ots) == 1 && ots[0].NodeID == test.nodeID) != test.expObserved {
 						t.Errorf("expected observed ts %t; got %+v", test.expObserved, ots)
 					}
@@ -990,11 +992,11 @@ func TestRollbackWithCanceledContextInsidious(t *testing.T) {
 	key := roachpb.Key("a")
 	ctx, cancel := context.WithCancel(context.Background())
 	var rollbacks int
-	storeKnobs.TestingRequestFilter = func(ba roachpb.BatchRequest) *roachpb.Error {
-		if !ba.IsSingleEndTransactionRequest() {
+	storeKnobs.TestingRequestFilter = func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+		if !ba.IsSingleEndTxnRequest() {
 			return nil
 		}
-		et := ba.Requests[0].GetInner().(*roachpb.EndTransactionRequest)
+		et := ba.Requests[0].GetInner().(*roachpb.EndTxnRequest)
 		if !et.Commit && et.Key.Equal(key) {
 			rollbacks++
 			cancel()

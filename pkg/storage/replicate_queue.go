@@ -19,6 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -162,11 +163,16 @@ func newReplicateQueue(store *Store, g *gossip.Gossip, allocator Allocator) *rep
 			needsLease:           true,
 			needsSystemConfig:    true,
 			acceptsUnsplitRanges: store.TestingKnobs().ReplicateQueueAcceptsUnsplit,
-			successes:            store.metrics.ReplicateQueueSuccesses,
-			failures:             store.metrics.ReplicateQueueFailures,
-			pending:              store.metrics.ReplicateQueuePending,
-			processingNanos:      store.metrics.ReplicateQueueProcessingNanos,
-			purgatory:            store.metrics.ReplicateQueuePurgatory,
+			// The processing of the replicate queue often needs to send snapshots
+			// so we use the raftSnapshotQueueTimeoutFunc. This function sets a
+			// timeout based on the range size and the sending rate in addition
+			// to consulting the setting which controls the minimum timeout.
+			processTimeoutFunc: makeQueueSnapshotTimeoutFunc(rebalanceSnapshotRate),
+			successes:          store.metrics.ReplicateQueueSuccesses,
+			failures:           store.metrics.ReplicateQueueFailures,
+			pending:            store.metrics.ReplicateQueuePending,
+			processingNanos:    store.metrics.ReplicateQueueProcessingNanos,
+			purgatory:          store.metrics.ReplicateQueuePurgatory,
 		},
 	)
 
@@ -565,7 +571,7 @@ func (rq *replicateQueue) addOrReplace(
 func (rq *replicateQueue) findRemoveTarget(
 	ctx context.Context,
 	repl interface {
-		DescAndZone() (*roachpb.RangeDescriptor, *config.ZoneConfig)
+		DescAndZone() (*roachpb.RangeDescriptor, *zonepb.ZoneConfig)
 		LastReplicaAdded() (roachpb.ReplicaID, time.Time)
 		RaftStatus() *raft.Status
 	},
@@ -597,7 +603,7 @@ func (rq *replicateQueue) findRemoveTarget(
 			// If we've lost raft leadership, we're unlikely to regain it so give up immediately.
 			return roachpb.ReplicaDescriptor{}, "", &benignError{errors.Errorf("not raft leader while range needs removal")}
 		}
-		candidates = filterUnremovableReplicas(raftStatus, existingReplicas, lastReplAdded)
+		candidates = filterUnremovableReplicas(ctx, raftStatus, existingReplicas, lastReplAdded)
 		log.VEventf(ctx, 3, "filtered unremovable replicas from %v to get %v as candidates for removal: %s",
 			existingReplicas, candidates, rangeRaftProgress(raftStatus, existingReplicas))
 		if len(candidates) > 0 {
@@ -936,7 +942,7 @@ func (rq *replicateQueue) findTargetAndTransferLease(
 	ctx context.Context,
 	repl *Replica,
 	desc *roachpb.RangeDescriptor,
-	zone *config.ZoneConfig,
+	zone *zonepb.ZoneConfig,
 	opts transferLeaseOptions,
 ) (bool, error) {
 	// Learner replicas aren't allowed to become the leaseholder or raft leader,

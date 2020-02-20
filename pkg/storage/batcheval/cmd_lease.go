@@ -90,7 +90,7 @@ func checkCanReceiveLease(newLease *roachpb.Lease, rec EvalContext) error {
 func evalNewLease(
 	ctx context.Context,
 	rec EvalContext,
-	batch engine.ReadWriter,
+	readWriter engine.ReadWriter,
 	ms *enginepb.MVCCStats,
 	lease roachpb.Lease,
 	prevLease roachpb.Lease,
@@ -101,7 +101,7 @@ func evalNewLease(
 	// a newFailedLeaseTrigger() to satisfy stats.
 
 	// Ensure either an Epoch is set or Start < Expiration.
-	if (lease.Type() == roachpb.LeaseExpiration && !lease.Start.Less(lease.GetExpiration())) ||
+	if (lease.Type() == roachpb.LeaseExpiration && lease.GetExpiration().LessEq(lease.Start)) ||
 		(lease.Type() == roachpb.LeaseEpoch && lease.Expiration != nil) {
 		// This amounts to a bug.
 		return newFailedLeaseTrigger(isTransfer),
@@ -157,21 +157,11 @@ func evalNewLease(
 	}
 
 	// Store the lease to disk & in-memory.
-	if err := MakeStateLoader(rec).SetLease(ctx, batch, ms, lease); err != nil {
+	if err := MakeStateLoader(rec).SetLease(ctx, readWriter, ms, lease); err != nil {
 		return newFailedLeaseTrigger(isTransfer), err
 	}
 
 	var pd result.Result
-	// If we didn't block concurrent reads here, there'd be a chance that
-	// reads could sneak in on a new lease holder between setting the lease
-	// and updating the low water mark. This in itself isn't a consistency
-	// violation, but it's a bit suspicious and did make
-	// TestRangeTransferLease flaky. We err on the side of caution for now, but
-	// at least we don't do it in case of an extension.
-	//
-	// TODO(tschottdorf): Maybe we shouldn't do this at all. Need to think
-	// through potential consequences.
-	pd.Replicated.BlockReads = !isExtension
 	pd.Replicated.State = &storagepb.ReplicaState{
 		Lease: &lease,
 	}

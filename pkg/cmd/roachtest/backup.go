@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/pkg/errors"
 )
 
@@ -24,6 +25,7 @@ func registerBackup(r *testRegistry) {
 	backup2TBSpec := makeClusterSpec(10)
 	r.Add(testSpec{
 		Name:       fmt.Sprintf("backup2TB/%s", backup2TBSpec),
+		Owner:      OwnerBulkIO,
 		Cluster:    backup2TBSpec,
 		MinVersion: "v2.1.0",
 		Run: func(ctx context.Context, t *test, c *cluster) {
@@ -64,6 +66,7 @@ func registerBackup(r *testRegistry) {
 	// verifies them with a fingerprint.
 	r.Add(testSpec{
 		Name:    `backupTPCC`,
+		Owner:   OwnerBulkIO,
 		Cluster: makeClusterSpec(3),
 		Timeout: 1 * time.Hour,
 		Run: func(ctx context.Context, t *test, c *cluster) {
@@ -76,8 +79,13 @@ func registerBackup(r *testRegistry) {
 			if local {
 				duration = 5 * time.Second
 			}
-			warehouses := 1
+			warehouses := 10
+
 			backupDir := "gs://cockroachdb-backup-testing/" + c.name
+			// Use inter-node file sharing on 20.1+.
+			if r.buildVersion.AtLeast(version.MustParse(`v20.1.0-0`)) {
+				backupDir = "nodelocal://1/" + c.name
+			}
 			fullDir := backupDir + "/full"
 			incDir := backupDir + "/inc"
 

@@ -19,7 +19,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -142,7 +142,7 @@ const (
 // can be retried quickly as soon as new stores come online, or additional
 // space frees up.
 type allocatorError struct {
-	constraints      []config.Constraints
+	constraints      []zonepb.Constraints
 	existingReplicas int
 	aliveStores      int
 	throttledStores  int
@@ -300,7 +300,7 @@ func GetNeededReplicas(zoneConfigReplicaCount int32, clusterNodes int) int {
 // supplied range, as governed by the supplied zone configuration. It
 // returns the required action that should be taken and a priority.
 func (a *Allocator) ComputeAction(
-	ctx context.Context, zone *config.ZoneConfig, desc *roachpb.RangeDescriptor,
+	ctx context.Context, zone *zonepb.ZoneConfig, desc *roachpb.RangeDescriptor,
 ) (AllocatorAction, float64) {
 	if a.storePool == nil {
 		// Do nothing if storePool is nil for some unittests.
@@ -360,7 +360,7 @@ func (a *Allocator) ComputeAction(
 
 func (a *Allocator) computeAction(
 	ctx context.Context,
-	zone *config.ZoneConfig,
+	zone *zonepb.ZoneConfig,
 	rangeID roachpb.RangeID,
 	voterReplicas []roachpb.ReplicaDescriptor,
 ) (AllocatorAction, float64) {
@@ -470,7 +470,7 @@ type decisionDetails struct {
 // TODO(tbg): AllocateReplacement?
 func (a *Allocator) AllocateTarget(
 	ctx context.Context,
-	zone *config.ZoneConfig,
+	zone *zonepb.ZoneConfig,
 	rangeID roachpb.RangeID,
 	existingReplicas []roachpb.ReplicaDescriptor,
 ) (*roachpb.StoreDescriptor, string, error) {
@@ -501,7 +501,7 @@ func (a *Allocator) AllocateTarget(
 func (a *Allocator) allocateTargetFromList(
 	ctx context.Context,
 	sl StoreList,
-	zone *config.ZoneConfig,
+	zone *zonepb.ZoneConfig,
 	candidateReplicas []roachpb.ReplicaDescriptor,
 	options scorerOptions,
 ) (*roachpb.StoreDescriptor, string) {
@@ -528,7 +528,7 @@ func (a *Allocator) allocateTargetFromList(
 func (a Allocator) simulateRemoveTarget(
 	ctx context.Context,
 	targetStore roachpb.StoreID,
-	zone *config.ZoneConfig,
+	zone *zonepb.ZoneConfig,
 	candidates []roachpb.ReplicaDescriptor,
 	existingReplicas []roachpb.ReplicaDescriptor,
 	rangeUsageInfo RangeUsageInfo,
@@ -553,7 +553,7 @@ func (a Allocator) simulateRemoveTarget(
 // replicas.
 func (a Allocator) RemoveTarget(
 	ctx context.Context,
-	zone *config.ZoneConfig,
+	zone *zonepb.ZoneConfig,
 	candidates []roachpb.ReplicaDescriptor,
 	existingReplicas []roachpb.ReplicaDescriptor,
 ) (roachpb.ReplicaDescriptor, string, error) {
@@ -623,7 +623,7 @@ func (a Allocator) RemoveTarget(
 //    opportunity was found).
 func (a Allocator) RebalanceTarget(
 	ctx context.Context,
-	zone *config.ZoneConfig,
+	zone *zonepb.ZoneConfig,
 	raftStatus *raft.Status,
 	rangeID roachpb.RangeID,
 	existingReplicas []roachpb.ReplicaDescriptor,
@@ -699,16 +699,16 @@ func (a Allocator) RebalanceTarget(
 			ReplicaID: maxReplicaID(existingReplicas) + 1,
 		}
 		// Deep-copy the Replicas slice since we'll mutate it below.
-		replicaCandidates := append([]roachpb.ReplicaDescriptor(nil), existingReplicas...)
-		replicaCandidates = append(replicaCandidates, newReplica)
-
+		existingPlusOneNew := append([]roachpb.ReplicaDescriptor(nil), existingReplicas...)
+		existingPlusOneNew = append(existingPlusOneNew, newReplica)
+		replicaCandidates := existingPlusOneNew
 		// If we can, filter replicas as we would if we were actually removing one.
 		// If we can't (e.g. because we're the leaseholder but not the raft leader),
 		// it's better to simulate the removal with the info that we do have than to
 		// assume that the rebalance is ok (#20241).
 		if raftStatus != nil && raftStatus.Progress != nil {
 			replicaCandidates = simulateFilterUnremovableReplicas(
-				raftStatus, replicaCandidates, newReplica.ReplicaID)
+				ctx, raftStatus, replicaCandidates, newReplica.ReplicaID)
 		}
 		if len(replicaCandidates) == 0 {
 			// No existing replicas are suitable to remove.
@@ -724,7 +724,7 @@ func (a Allocator) RebalanceTarget(
 			target.store.StoreID,
 			zone,
 			replicaCandidates,
-			replicaCandidates,
+			existingPlusOneNew,
 			rangeUsageInfo,
 		)
 		if err != nil {
@@ -775,7 +775,7 @@ func (a *Allocator) scorerOptions() scorerOptions {
 // unless asked to do otherwise by the checkTransferLeaseSource parameter.
 func (a *Allocator) TransferLeaseTarget(
 	ctx context.Context,
-	zone *config.ZoneConfig,
+	zone *zonepb.ZoneConfig,
 	existing []roachpb.ReplicaDescriptor,
 	leaseStoreID roachpb.StoreID,
 	rangeID roachpb.RangeID,
@@ -853,6 +853,7 @@ func (a *Allocator) TransferLeaseTarget(
 
 	// Short-circuit if there are no valid targets out there.
 	if len(existing) == 0 || (len(existing) == 1 && existing[0].StoreID == leaseStoreID) {
+		log.VEventf(ctx, 2, "no lease transfer target found")
 		return roachpb.ReplicaDescriptor{}
 	}
 
@@ -922,7 +923,7 @@ func (a *Allocator) TransferLeaseTarget(
 // attributes.
 func (a *Allocator) ShouldTransferLease(
 	ctx context.Context,
-	zone *config.ZoneConfig,
+	zone *zonepb.ZoneConfig,
 	existing []roachpb.ReplicaDescriptor,
 	leaseStoreID roachpb.StoreID,
 	rangeID roachpb.RangeID,
@@ -1227,7 +1228,7 @@ func (a Allocator) shouldTransferLeaseWithoutStats(
 }
 
 func (a Allocator) preferredLeaseholders(
-	zone *config.ZoneConfig, existing []roachpb.ReplicaDescriptor,
+	zone *zonepb.ZoneConfig, existing []roachpb.ReplicaDescriptor,
 ) []roachpb.ReplicaDescriptor {
 	// Go one preference at a time. As soon as we've found replicas that match a
 	// preference, we don't need to look at the later preferences, because
@@ -1262,7 +1263,7 @@ func computeQuorum(nodes int) int {
 // slice. A "behind" replica is one which is not at or past the quorum commit
 // index.
 func filterBehindReplicas(
-	raftStatus *raft.Status, replicas []roachpb.ReplicaDescriptor,
+	ctx context.Context, raftStatus *raft.Status, replicas []roachpb.ReplicaDescriptor,
 ) []roachpb.ReplicaDescriptor {
 	if raftStatus == nil || len(raftStatus.Progress) == 0 {
 		// raftStatus.Progress is only populated on the Raft leader which means we
@@ -1303,6 +1304,7 @@ func replicaIsBehind(raftStatus *raft.Status, replicaID roachpb.ReplicaID) bool 
 // considered up-to-date (and thus can participate in quorum), but is not
 // considered a candidate for removal.
 func simulateFilterUnremovableReplicas(
+	ctx context.Context,
 	raftStatus *raft.Status,
 	replicas []roachpb.ReplicaDescriptor,
 	brandNewReplicaID roachpb.ReplicaID,
@@ -1312,7 +1314,7 @@ func simulateFilterUnremovableReplicas(
 		State: tracker.StateReplicate,
 		Match: status.Commit,
 	}
-	return filterUnremovableReplicas(&status, replicas, brandNewReplicaID)
+	return filterUnremovableReplicas(ctx, &status, replicas, brandNewReplicaID)
 }
 
 // filterUnremovableReplicas removes any unremovable replicas from the supplied
@@ -1322,11 +1324,12 @@ func simulateFilterUnremovableReplicas(
 // This is important when we've just added a replica in order to rebalance to
 // it (#17879).
 func filterUnremovableReplicas(
+	ctx context.Context,
 	raftStatus *raft.Status,
 	replicas []roachpb.ReplicaDescriptor,
 	brandNewReplicaID roachpb.ReplicaID,
 ) []roachpb.ReplicaDescriptor {
-	upToDateReplicas := filterBehindReplicas(raftStatus, replicas)
+	upToDateReplicas := filterBehindReplicas(ctx, raftStatus, replicas)
 	oldQuorum := computeQuorum(len(replicas))
 	if len(upToDateReplicas) < oldQuorum {
 		// The number of up-to-date replicas is less than the old quorum. No

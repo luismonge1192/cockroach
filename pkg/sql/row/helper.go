@@ -16,7 +16,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
-	"github.com/pkg/errors"
 )
 
 // rowHelper has the common methods for table row manipulations.
@@ -59,12 +58,7 @@ func newRowHelper(
 func (rh *rowHelper) encodeIndexes(
 	colIDtoRowIndex map[sqlbase.ColumnID]int, values []tree.Datum,
 ) (primaryIndexKey []byte, secondaryIndexEntries []sqlbase.IndexEntry, err error) {
-	if rh.primaryIndexKeyPrefix == nil {
-		rh.primaryIndexKeyPrefix = sqlbase.MakeIndexKeyPrefix(rh.TableDesc.TableDesc(),
-			rh.TableDesc.PrimaryIndex.ID)
-	}
-	primaryIndexKey, _, err = sqlbase.EncodeIndexKey(
-		rh.TableDesc.TableDesc(), &rh.TableDesc.PrimaryIndex, colIDtoRowIndex, values, rh.primaryIndexKeyPrefix)
+	primaryIndexKey, err = rh.encodePrimaryIndex(colIDtoRowIndex, values)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -73,6 +67,19 @@ func (rh *rowHelper) encodeIndexes(
 		return nil, nil, err
 	}
 	return primaryIndexKey, secondaryIndexEntries, nil
+}
+
+// encodePrimaryIndex encodes the primary index key.
+func (rh *rowHelper) encodePrimaryIndex(
+	colIDtoRowIndex map[sqlbase.ColumnID]int, values []tree.Datum,
+) (primaryIndexKey []byte, err error) {
+	if rh.primaryIndexKeyPrefix == nil {
+		rh.primaryIndexKeyPrefix = sqlbase.MakeIndexKeyPrefix(rh.TableDesc.TableDesc(),
+			rh.TableDesc.PrimaryIndex.ID)
+	}
+	primaryIndexKey, _, err = sqlbase.EncodeIndexKey(
+		rh.TableDesc.TableDesc(), &rh.TableDesc.PrimaryIndex, colIDtoRowIndex, values, rh.primaryIndexKeyPrefix)
+	return primaryIndexKey, err
 }
 
 // encodeSecondaryIndexes encodes the secondary index keys. The
@@ -108,9 +115,6 @@ func (rh *rowHelper) skipColumnInPK(
 	}
 	if _, ok := rh.primaryIndexCols[colID]; !ok {
 		return false, nil
-	}
-	if family != 0 {
-		return false, errors.Errorf("primary index column %d must be in family 0, was %d", colID, family)
 	}
 	if cdatum, ok := value.(tree.CompositeDatum); ok {
 		// Composite columns are encoded in both the key and the value.

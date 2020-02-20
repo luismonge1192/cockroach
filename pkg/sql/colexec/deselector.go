@@ -44,32 +44,40 @@ func NewDeselectorOp(allocator *Allocator, input Operator, colTypes []coltypes.T
 
 func (p *deselectorOp) Init() {
 	p.input.Init()
-	p.output = p.allocator.NewMemBatch(p.inputTypes)
 }
 
 func (p *deselectorOp) Next(ctx context.Context) coldata.Batch {
+	p.resetOutput()
 	batch := p.input.Next(ctx)
 	if batch.Selection() == nil {
 		return batch
 	}
 
-	p.output.SetLength(batch.Length())
-	p.output.ResetInternalBatch()
 	sel := batch.Selection()
-	for i, t := range p.inputTypes {
-		toCol := p.output.ColVec(i)
-		fromCol := batch.ColVec(i)
-		p.allocator.Copy(
-			toCol,
-			coldata.CopySliceArgs{
-				SliceArgs: coldata.SliceArgs{
-					ColType:   t,
-					Src:       fromCol,
-					Sel:       sel,
-					SrcEndIdx: uint64(batch.Length()),
+	p.allocator.PerformOperation(p.output.ColVecs(), func() {
+		for i, t := range p.inputTypes {
+			toCol := p.output.ColVec(i)
+			fromCol := batch.ColVec(i)
+			toCol.Copy(
+				coldata.CopySliceArgs{
+					SliceArgs: coldata.SliceArgs{
+						ColType:   t,
+						Src:       fromCol,
+						Sel:       sel,
+						SrcEndIdx: uint64(batch.Length()),
+					},
 				},
-			},
-		)
-	}
+			)
+		}
+	})
+	p.output.SetLength(batch.Length())
 	return p.output
+}
+
+func (p *deselectorOp) resetOutput() {
+	if p.output == nil {
+		p.output = p.allocator.NewMemBatch(p.inputTypes)
+	} else {
+		p.output.ResetInternalBatch()
+	}
 }

@@ -21,13 +21,13 @@ import (
 )
 
 func init() {
-	RegisterCommand(roachpb.Refresh, DefaultDeclareKeys, Refresh)
+	RegisterReadOnlyCommand(roachpb.Refresh, DefaultDeclareKeys, Refresh)
 }
 
 // Refresh checks whether the key has any values written in the interval
 // [args.RefreshFrom, header.Timestamp].
 func Refresh(
-	ctx context.Context, batch engine.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, reader engine.Reader, cArgs CommandArgs, resp roachpb.Response,
 ) (result.Result, error) {
 	args := cArgs.Args.(*roachpb.RefreshRequest)
 	h := cArgs.Header
@@ -55,7 +55,7 @@ func Refresh(
 	// specifying consistent=false. Note that we include tombstones,
 	// which must be considered as updates on refresh.
 	log.VEventf(ctx, 2, "refresh %s @[%s-%s]", args.Span(), refreshFrom, refreshTo)
-	val, intent, err := engine.MVCCGet(ctx, batch, args.Key, refreshTo, engine.MVCCGetOptions{
+	val, intent, err := engine.MVCCGet(ctx, reader, args.Key, refreshTo, engine.MVCCGetOptions{
 		Inconsistent: true,
 		Tombstones:   true,
 	})
@@ -63,7 +63,7 @@ func Refresh(
 	if err != nil {
 		return result.Result{}, err
 	} else if val != nil {
-		if ts := val.Timestamp; !ts.Less(refreshFrom) {
+		if ts := val.Timestamp; refreshFrom.LessEq(ts) {
 			return result.Result{}, errors.Errorf("encountered recently written key %s @%s", args.Key, ts)
 		}
 	}

@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
 )
 
 // ClientVisibleRetryError is to be implemented by errors visible by
@@ -62,14 +63,22 @@ const (
 	// ErrorScoreTxnRestart indicates that the transaction should be restarted
 	// with an incremented epoch.
 	ErrorScoreTxnRestart
-	// ErrorScoreTxnAbort indicates that the transaction is aborted. The
-	// operation can only try again under the purview of a new transaction.
-	ErrorScoreTxnAbort
 	// ErrorScoreNonRetriable indicates that the transaction performed an
 	// operation that does not warrant a retry. Often this indicates that the
 	// operation ran into a logic error. The error should be propagated to the
 	// client and the transaction should terminate immediately.
 	ErrorScoreNonRetriable
+	// ErrorScoreTxnAbort indicates that the transaction is aborted. The
+	// operation can only try again under the purview of a new transaction.
+	//
+	// This error has the highest priority because, as far as KV is concerned, a
+	// TransactionAbortedError is impossible to recover from (whereas
+	// non-retriable errors could conceivably be recovered if the client wanted to
+	// ignore them). Also, the TxnCoordSender likes to assume that a
+	// TransactionAbortedError is the only way it finds about an aborted
+	// transaction, and so it benefits from all other errors being merged into a
+	// TransactionAbortedError instead of the other way around.
+	ErrorScoreTxnAbort
 )
 
 // ErrPriority computes the priority of the given error.
@@ -283,12 +292,22 @@ func (e *NotLeaseHolderError) message(_ *Error) string {
 	if e.CustomMsg != "" {
 		return prefix + e.CustomMsg
 	}
-	if e.LeaseHolder == nil {
-		return fmt.Sprintf("%sr%d: replica %s not lease holder; lease holder unknown", prefix, e.RangeID, e.Replica)
-	} else if e.Lease != nil {
-		return fmt.Sprintf("%sr%d: replica %s not lease holder; current lease is %s", prefix, e.RangeID, e.Replica, e.Lease)
+	var buf strings.Builder
+	buf.WriteString(prefix)
+	fmt.Fprintf(&buf, "r%d: ", e.RangeID)
+	if e.Replica != (ReplicaDescriptor{}) {
+		fmt.Fprintf(&buf, "replica %s not lease holder; ", e.Replica)
+	} else {
+		fmt.Fprint(&buf, "replica not lease holder; ")
 	}
-	return fmt.Sprintf("%sr%d: replica %s not lease holder; replica %s is", prefix, e.RangeID, e.Replica, *e.LeaseHolder)
+	if e.LeaseHolder == nil {
+		fmt.Fprint(&buf, "lease holder unknown")
+	} else if e.Lease != nil {
+		fmt.Fprintf(&buf, "current lease is %s", e.Lease)
+	} else {
+		fmt.Fprintf(&buf, "replica %s is", *e.LeaseHolder)
+	}
+	return buf.String()
 }
 
 var _ ErrorDetailInterface = &NotLeaseHolderError{}
@@ -484,7 +503,11 @@ func NewTransactionRetryError(
 }
 
 func (e *TransactionRetryError) Error() string {
-	return fmt.Sprintf("TransactionRetryError: retry txn (%s)", e.Reason)
+	msg := ""
+	if e.ExtraMsg != "" {
+		msg = " - " + e.ExtraMsg
+	}
+	return fmt.Sprintf("TransactionRetryError: retry txn (%s%s)", e.Reason, msg)
 }
 
 func (e *TransactionRetryError) message(pErr *Error) string {
@@ -564,6 +587,17 @@ func (e *WriteIntentError) message(_ *Error) string {
 }
 
 var _ ErrorDetailInterface = &WriteIntentError{}
+
+// NewWriteTooOldError creates a new write too old error. The function accepts
+// the timestamp of the operation that hit the error, along with the timestamp
+// immediately after the existing write which had a higher timestamp and which
+// caused the error.
+func NewWriteTooOldError(operationTS, actualTS hlc.Timestamp) *WriteTooOldError {
+	return &WriteTooOldError{
+		Timestamp:       operationTS,
+		ActualTimestamp: actualTS,
+	}
+}
 
 func (e *WriteTooOldError) Error() string {
 	return e.message(nil)
@@ -828,3 +862,13 @@ func (e *IndeterminateCommitError) message(pErr *Error) string {
 }
 
 var _ ErrorDetailInterface = &IndeterminateCommitError{}
+
+// IsRangeNotFoundError returns true if err contains a *RangeNotFoundError.
+func IsRangeNotFoundError(err error) bool {
+	// TODO(ajwerner): adopt errors.IsType once the pull request to add it merges.
+	_, isRangeNotFound := errors.If(err, func(err error) (interface{}, bool) {
+		_, isRangeNotFound := err.(*RangeNotFoundError)
+		return err, isRangeNotFound
+	})
+	return isRangeNotFound
+}

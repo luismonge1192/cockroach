@@ -83,20 +83,12 @@ func (s *Store) removeInitializedReplicaRaftMuLocked(
 			return nil // already removed, noop
 		}
 
-		// We check both rep.mu.ReplicaID and rep.mu.state.Desc's replica ID because
-		// they can differ in cases when a replica's ID is increased due to an
-		// incoming raft message (see #14231 for background).
-		replicaID = rep.mu.replicaID
-		if rep.mu.replicaID >= nextReplicaID {
-			rep.mu.Unlock()
-			return errors.Errorf("cannot remove replica %s; replica ID has changed (%s >= %s)",
-				rep, rep.mu.replicaID, nextReplicaID)
-		}
 		desc = rep.mu.state.Desc
 		if repDesc, ok := desc.GetReplicaDescriptor(s.StoreID()); ok && repDesc.ReplicaID >= nextReplicaID {
 			rep.mu.Unlock()
-			return errors.Errorf("cannot remove replica %s; replica descriptor's ID has changed (%s >= %s)",
-				rep, repDesc.ReplicaID, nextReplicaID)
+			// NB: This should not in any way be possible starting in 20.1.
+			log.Fatalf(ctx, "replica descriptor's ID has changed (%s >= %s)",
+				repDesc.ReplicaID, nextReplicaID)
 		}
 
 		// This is a fatal error as an initialized replica can never become
@@ -110,6 +102,7 @@ func (s *Store) removeInitializedReplicaRaftMuLocked(
 		// Mark the replica as removed before deleting data.
 		rep.mu.destroyStatus.Set(roachpb.NewRangeNotFoundError(rep.RangeID, rep.StoreID()),
 			destroyReasonRemoved)
+		replicaID = rep.mu.replicaID
 		rep.mu.Unlock()
 	}
 
@@ -152,14 +145,7 @@ func (s *Store) removeInitializedReplicaRaftMuLocked(
 	// while not holding Store.mu. This is safe because we're holding
 	// Replica.raftMu and the replica is present in Store.mu.replicasByKey
 	// (preventing any concurrent access to the replica's key range).
-
-	rep.readOnlyCmdMu.Lock()
-	rep.mu.Lock()
-	rep.cancelPendingCommandsLocked()
-	rep.mu.internalRaftGroup = nil
-	rep.mu.Unlock()
-	rep.readOnlyCmdMu.Unlock()
-
+	rep.disconnectReplicationRaftMuLocked(ctx)
 	if opts.DestroyData {
 		if err := rep.destroyRaftMuLocked(ctx, nextReplicaID); err != nil {
 			return err
@@ -219,13 +205,7 @@ func (s *Store) removeUninitializedReplicaRaftMuLocked(
 
 	// Proceed with the removal.
 
-	rep.readOnlyCmdMu.Lock()
-	rep.mu.Lock()
-	rep.cancelPendingCommandsLocked()
-	rep.mu.internalRaftGroup = nil
-	rep.mu.Unlock()
-	rep.readOnlyCmdMu.Unlock()
-
+	rep.disconnectReplicationRaftMuLocked(ctx)
 	if err := rep.destroyRaftMuLocked(ctx, nextReplicaID); err != nil {
 		log.Fatalf(ctx, "failed to remove uninitialized replica %v: %v", rep, err)
 	}

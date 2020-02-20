@@ -11,12 +11,17 @@
 package mutations
 
 import (
+	"bytes"
 	"encoding/json"
 	"math/rand"
+	"sort"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 )
 
 var (
@@ -28,20 +33,37 @@ var (
 
 	// ColumnFamilyMutator modifies a CREATE TABLE statement without any FAMILY
 	// definitions to have random FAMILY definitions.
-	ColumnFamilyMutator StatementMutator = columnFamilyMutator
+	ColumnFamilyMutator StatementMutator = sqlbase.ColumnFamilyMutator
+
+	// IndexStoringMutator modifies the STORING clause of CREATE INDEX and
+	// indexes in CREATE TABLE.
+	IndexStoringMutator MultiStatementMutation = sqlbase.IndexStoringMutator
+
+	// PostgresMutator modifies strings such that they execute identically
+	// in both Postgres and Cockroach (however this mutator does not remove
+	// features not supported by Postgres; use PostgresCreateTableMutator
+	// for those).
+	PostgresMutator StatementStringMutator = postgresMutator
+
+	// PostgresCreateTableMutator modifies CREATE TABLE statements to
+	// remove any features not supported by Postgres that would change
+	// results (like descending primary keys). This should be used on the
+	// output of sqlbase.RandCreateTable.
+	PostgresCreateTableMutator MultiStatementMutation = postgresCreateTableMutator
+)
+
+var (
+	// These are used in pkg/compose/compare/compare/compare_test.go, but
+	// it has a build tag so it's not detected by the linter.
+	_ = IndexStoringMutator
+	_ = PostgresCreateTableMutator
 )
 
 // StatementMutator defines a func that can change a statement.
 type StatementMutator func(rng *rand.Rand, stmt tree.Statement) (changed bool)
 
-// MultiStatementMutation defines a func that returns additional statements,
-// but must not change any of the statements passed.
-type MultiStatementMutation func(rng *rand.Rand, stmts []tree.Statement) (additional []tree.Statement)
-
-// Mutator defines a method that can mutate or add SQL statements.
-type Mutator interface {
-	Mutate(rng *rand.Rand, stmts []tree.Statement) (mutated []tree.Statement, changed bool)
-}
+// MultiStatementMutation defines a func that can return a list of new and/or mutated statements.
+type MultiStatementMutation func(rng *rand.Rand, stmts []tree.Statement) (mutated []tree.Statement, changed bool)
 
 // Mutate implements the Mutator interface.
 func (sm StatementMutator) Mutate(
@@ -58,18 +80,14 @@ func (sm StatementMutator) Mutate(
 func (msm MultiStatementMutation) Mutate(
 	rng *rand.Rand, stmts []tree.Statement,
 ) (mutated []tree.Statement, changed bool) {
-	additional := msm(rng, stmts)
-	if len(additional) == 0 {
-		return stmts, false
-	}
-	return append(stmts, additional...), true
+	return msm(rng, stmts)
 }
 
 // Apply executes all mutators on stmts. It returns the (possibly mutated and
 // changed in place) statements and a boolean indicating whether any changes
 // were made.
 func Apply(
-	rng *rand.Rand, stmts []tree.Statement, mutators ...Mutator,
+	rng *rand.Rand, stmts []tree.Statement, mutators ...sqlbase.Mutator,
 ) (mutated []tree.Statement, changed bool) {
 	var mc bool
 	for _, m := range mutators {
@@ -79,8 +97,34 @@ func Apply(
 	return stmts, changed
 }
 
-// ApplyString executes all mutators on input.
-func ApplyString(rng *rand.Rand, input string, mutators ...Mutator) (output string, changed bool) {
+// StringMutator defines a mutator that works on strings.
+type StringMutator interface {
+	MutateString(*rand.Rand, string) (mutated string, changed bool)
+}
+
+// StatementStringMutator defines a func that mutates a string.
+type StatementStringMutator func(*rand.Rand, string) string
+
+// Mutate implements the Mutator interface.
+func (sm StatementStringMutator) Mutate(
+	rng *rand.Rand, stmts []tree.Statement,
+) (mutated []tree.Statement, changed bool) {
+	panic("can only be used with MutateString")
+}
+
+// MutateString implements the StringMutator interface.
+func (sm StatementStringMutator) MutateString(
+	rng *rand.Rand, q string,
+) (mutated string, changed bool) {
+	newq := sm(rng, q)
+	return newq, newq != q
+}
+
+// ApplyString executes all mutators on input. A mutator can also be a
+// StringMutator which will operate after all other mutators.
+func ApplyString(
+	rng *rand.Rand, input string, mutators ...sqlbase.Mutator,
+) (output string, changed bool) {
 	parsed, err := parser.Parse(input)
 	if err != nil {
 		return input, false
@@ -91,33 +135,54 @@ func ApplyString(rng *rand.Rand, input string, mutators ...Mutator) (output stri
 		stmts[i] = p.AST
 	}
 
-	stmts, changed = Apply(rng, stmts, mutators...)
-	if !changed {
-		return input, false
+	var normalMutators []sqlbase.Mutator
+	var stringMutators []StringMutator
+	for _, m := range mutators {
+		if sm, ok := m.(StringMutator); ok {
+			stringMutators = append(stringMutators, sm)
+		} else {
+			normalMutators = append(normalMutators, m)
+		}
 	}
-
-	var sb strings.Builder
-	for _, s := range stmts {
-		sb.WriteString(s.String())
-		sb.WriteString(";\n")
+	stmts, changed = Apply(rng, stmts, normalMutators...)
+	if changed {
+		var sb strings.Builder
+		for _, s := range stmts {
+			sb.WriteString(s.String())
+			sb.WriteString(";\n")
+		}
+		input = sb.String()
 	}
-	return sb.String(), true
+	for _, m := range stringMutators {
+		s, ch := m.MutateString(rng, input)
+		if ch {
+			input = s
+			changed = true
+		}
+	}
+	return input, changed
 }
 
-// TODO(mjibson): This type is copied from sql/stats, but due to that package
-// depending on sqlbase, which depends on this package, a cycle would be
-// created. Refactor something such that we avoid the cycle. This probably
-// means moving all of the rand table/datum stuff out of sqlbase.
-type jsonStatistic struct {
-	Name          string   `json:"name,omitempty"`
-	CreatedAt     string   `json:"created_at"`
-	Columns       []string `json:"columns"`
-	RowCount      uint64   `json:"row_count"`
-	DistinctCount uint64   `json:"distinct_count"`
-	NullCount     uint64   `json:"null_count"`
+// randNonNegInt returns a random non-negative integer. It attempts to
+// distribute it over powers of 10.
+func randNonNegInt(rng *rand.Rand) int64 {
+	var v int64
+	if n := rng.Intn(20); n == 0 {
+		// v == 0
+	} else if n <= 10 {
+		v = rng.Int63n(10) + 1
+		for i := 0; i < n; i++ {
+			v *= 10
+		}
+	} else {
+		v = rng.Int63()
+	}
+	return v
 }
 
-func statisticsMutator(rng *rand.Rand, stmts []tree.Statement) (additional []tree.Statement) {
+func statisticsMutator(
+	rng *rand.Rand, stmts []tree.Statement,
+) (mutated []tree.Statement, changed bool) {
 	for _, stmt := range stmts {
 		create, ok := stmt.(*tree.CreateTable)
 		if !ok {
@@ -126,44 +191,101 @@ func statisticsMutator(rng *rand.Rand, stmts []tree.Statement) (additional []tre
 		alter := &tree.AlterTable{
 			Table: create.Table.ToUnresolvedObjectName(),
 		}
-		// rowCount should be the same for all columns in a
-		// table. Attempt to distribute it over powers of 10.
-		var rowCount int64
-		if n := rng.Intn(20); n == 0 {
-			// ignore
-		} else if n <= 10 {
-			rowCount = rng.Int63n(10) + 1
+		rowCount := randNonNegInt(rng)
+		cols := map[tree.Name]*tree.ColumnTableDef{}
+		colStats := map[tree.Name]*stats.JSONStatistic{}
+		makeHistogram := func(col *tree.ColumnTableDef) {
+			// If an index appeared before a column definition, col
+			// can be nil.
+			if col == nil {
+				return
+			}
+			n := rng.Intn(10)
+			seen := map[string]bool{}
+			h := stats.HistogramData{
+				ColumnType: *col.Type,
+			}
 			for i := 0; i < n; i++ {
-				rowCount *= 10
-			}
-		} else {
-			rowCount = rng.Int63()
-		}
-		var stats []jsonStatistic
-		for _, def := range create.Defs {
-			col, ok := def.(*tree.ColumnTableDef)
-			if !ok {
-				continue
-			}
-			var nullCount, distinctCount uint64
-			if rowCount > 0 {
-				if col.Nullable.Nullability != tree.NotNull {
-					nullCount = uint64(rng.Int63n(rowCount))
+				upper := sqlbase.RandDatumWithNullChance(rng, col.Type, 0)
+				if upper == tree.DNull {
+					continue
 				}
-				distinctCount = uint64(rng.Int63n(rowCount))
+				enc, err := sqlbase.EncodeTableKey(nil, upper, encoding.Ascending)
+				if err != nil {
+					panic(err)
+				}
+				if es := string(enc); seen[es] {
+					continue
+				} else {
+					seen[es] = true
+				}
+				numRange := randNonNegInt(rng)
+				var distinctRange float64
+				// distinctRange should be <= numRange.
+				switch rng.Intn(3) {
+				case 0:
+					// 0
+				case 1:
+					distinctRange = float64(numRange)
+				default:
+					distinctRange = rng.Float64() * float64(numRange)
+				}
+
+				h.Buckets = append(h.Buckets, stats.HistogramData_Bucket{
+					NumEq:         randNonNegInt(rng),
+					NumRange:      numRange,
+					DistinctRange: distinctRange,
+					UpperBound:    enc,
+				})
 			}
-			// TODO(mjibson): Generate histograms for the first column of indexes.
-			stats = append(stats, jsonStatistic{
-				Name:          "__auto__",
-				CreatedAt:     "2000-01-01 00:00:00+00:00",
-				RowCount:      uint64(rowCount),
-				Columns:       []string{col.Name.String()},
-				DistinctCount: distinctCount,
-				NullCount:     nullCount,
+			sort.Slice(h.Buckets, func(i, j int) bool {
+				return bytes.Compare(h.Buckets[i].UpperBound, h.Buckets[j].UpperBound) < 0
 			})
+			// The first bucket must have numrange = 0, and thus
+			// distinctrange = 0 as well.
+			if len(h.Buckets) > 0 {
+				h.Buckets[0].NumRange = 0
+				h.Buckets[0].DistinctRange = 0
+			}
+			stat := colStats[col.Name]
+			if err := stat.SetHistogram(&h); err != nil {
+				panic(err)
+			}
 		}
-		if len(stats) > 0 {
-			b, err := json.Marshal(stats)
+		for _, def := range create.Defs {
+			switch def := def.(type) {
+			case *tree.ColumnTableDef:
+				var nullCount, distinctCount uint64
+				if rowCount > 0 {
+					if def.Nullable.Nullability != tree.NotNull {
+						nullCount = uint64(rng.Int63n(rowCount))
+					}
+					distinctCount = uint64(rng.Int63n(rowCount))
+				}
+				cols[def.Name] = def
+				colStats[def.Name] = &stats.JSONStatistic{
+					Name:          "__auto__",
+					CreatedAt:     "2000-01-01 00:00:00+00:00",
+					RowCount:      uint64(rowCount),
+					Columns:       []string{def.Name.String()},
+					DistinctCount: distinctCount,
+					NullCount:     nullCount,
+				}
+				if def.Unique || def.PrimaryKey.IsPrimaryKey {
+					makeHistogram(def)
+				}
+			case *tree.IndexTableDef:
+				makeHistogram(cols[def.Columns[0].Column])
+			case *tree.UniqueConstraintTableDef:
+				makeHistogram(cols[def.Columns[0].Column])
+			}
+		}
+		if len(colStats) > 0 {
+			var allStats []*stats.JSONStatistic
+			for _, cs := range colStats {
+				allStats = append(allStats, cs)
+			}
+			b, err := json.Marshal(allStats)
 			if err != nil {
 				// Should not happen.
 				panic(err)
@@ -171,13 +293,16 @@ func statisticsMutator(rng *rand.Rand, stmts []tree.Statement) (additional []tre
 			alter.Cmds = append(alter.Cmds, &tree.AlterTableInjectStats{
 				Stats: tree.NewDString(string(b)),
 			})
-			additional = append(additional, alter)
+			stmts = append(stmts, alter)
+			changed = true
 		}
 	}
-	return additional
+	return stmts, changed
 }
 
-func foreignKeyMutator(rng *rand.Rand, stmts []tree.Statement) (additional []tree.Statement) {
+func foreignKeyMutator(
+	rng *rand.Rand, stmts []tree.Statement,
+) (mutated []tree.Statement, changed bool) {
 	// Find columns in the tables.
 	cols := map[tree.TableName][]*tree.ColumnTableDef{}
 	byName := map[tree.TableName]*tree.CreateTable{}
@@ -205,6 +330,9 @@ func foreignKeyMutator(rng *rand.Rand, stmts []tree.Statement) (additional []tre
 				cols[table.Table] = append(cols[table.Table], def)
 			}
 		}
+	}
+	if len(tables) == 0 {
+		return stmts, false
 	}
 
 	toNames := func(cols []*tree.ColumnTableDef) tree.NameList {
@@ -332,7 +460,7 @@ func foreignKeyMutator(rng *rand.Rand, stmts []tree.Statement) (additional []tre
 			if rng.Intn(2) == 0 {
 				actions.Update = randAction(rng, table)
 			}
-			additional = append(additional, &tree.AlterTable{
+			stmts = append(stmts, &tree.AlterTable{
 				Table: table.Table.ToUnresolvedObjectName(),
 				Cmds: tree.AlterTableCmds{&tree.AlterTableAddConstraint{
 					ConstraintDef: &tree.ForeignKeyConstraintTableDef{
@@ -344,11 +472,12 @@ func foreignKeyMutator(rng *rand.Rand, stmts []tree.Statement) (additional []tre
 					},
 				}},
 			})
+			changed = true
 			break
 		}
 	}
 
-	return additional
+	return stmts, changed
 }
 
 func randAction(rng *rand.Rand, table *tree.CreateTable) tree.ReferenceAction {
@@ -378,81 +507,141 @@ Loop:
 	}
 }
 
-func columnFamilyMutator(rng *rand.Rand, stmt tree.Statement) (changed bool) {
-	ast, ok := stmt.(*tree.CreateTable)
-	if !ok {
-		return false
-	}
+func postgresMutator(rng *rand.Rand, q string) string {
+	q, _ = ApplyString(rng, q, postgresStatementMutator)
 
-	var columns []tree.Name
-	isPKCol := map[tree.Name]bool{}
-	for _, def := range ast.Defs {
-		switch def := def.(type) {
-		case *tree.FamilyTableDef:
-			return false
-		case *tree.ColumnTableDef:
-			if def.HasColumnFamily() {
-				return false
+	for from, to := range map[string]string{
+		":::":     "::",
+		"STRING":  "TEXT",
+		"BYTES":   "BYTEA",
+		"FLOAT4":  "FLOAT8",
+		"INT2":    "INT8",
+		"INT4":    "INT8",
+		"STORING": "INCLUDE",
+	} {
+		q = strings.Replace(q, from, to, -1)
+	}
+	return q
+}
+
+// postgresStatementMutator removes cockroach-only things from CREATE TABLE and
+// ALTER TABLE.
+var postgresStatementMutator MultiStatementMutation = func(rng *rand.Rand, stmts []tree.Statement) (mutated []tree.Statement, changed bool) {
+	for _, stmt := range stmts {
+		switch stmt := stmt.(type) {
+		case *tree.SetClusterSetting:
+			continue
+		case *tree.CreateTable:
+			if stmt.Interleave != nil {
+				stmt.Interleave = nil
+				changed = true
 			}
-			// Primary keys must be in the first
-			// column family, so don't add them to
-			// the list.
-			if def.PrimaryKey {
-				continue
+			if stmt.PartitionBy != nil {
+				stmt.PartitionBy = nil
+				changed = true
 			}
-			columns = append(columns, def.Name)
-		case *tree.UniqueConstraintTableDef:
-			// If there's an explicit PK index
-			// definition, save the columns from it
-			// and remove them later.
-			if def.PrimaryKey {
-				for _, col := range def.Columns {
-					isPKCol[col.Column] = true
+			for i := 0; i < len(stmt.Defs); i++ {
+				switch def := stmt.Defs[i].(type) {
+				case *tree.FamilyTableDef:
+					// Remove.
+					stmt.Defs = append(stmt.Defs[:i], stmt.Defs[i+1:]...)
+					i--
+					changed = true
+				case *tree.ColumnTableDef:
+					if def.HasColumnFamily() {
+						def.Family.Name = ""
+						def.Family.Create = false
+						changed = true
+					}
+				case *tree.UniqueConstraintTableDef:
+					if def.Interleave != nil {
+						def.Interleave = nil
+						changed = true
+					}
+					if def.PartitionBy != nil {
+						def.PartitionBy = nil
+						changed = true
+					}
 				}
 			}
-		}
-	}
-
-	if len(columns) <= 1 {
-		return false
-	}
-
-	// Any columns not specified in column families
-	// are auto assigned to the first family, so
-	// there's no requirement to exhaust columns here.
-
-	// Remove columns specified in PK index
-	// definitions. We need to do this here because
-	// index defs and columns can appear in any
-	// order in the CREATE TABLE.
-	{
-		n := 0
-		for _, x := range columns {
-			if !isPKCol[x] {
-				columns[n] = x
-				n++
+		case *tree.AlterTable:
+			for i := 0; i < len(stmt.Cmds); i++ {
+				// Postgres doesn't have alter stats.
+				if _, ok := stmt.Cmds[i].(*tree.AlterTableInjectStats); ok {
+					stmt.Cmds = append(stmt.Cmds[:i], stmt.Cmds[i+1:]...)
+					i--
+					changed = true
+				}
+			}
+			// If there are no commands, don't add this statement.
+			if len(stmt.Cmds) == 0 {
+				continue
 			}
 		}
-		columns = columns[:n]
+		mutated = append(mutated, stmt)
 	}
-	rng.Shuffle(len(columns), func(i, j int) {
-		columns[i], columns[j] = columns[j], columns[i]
-	})
-	fd := &tree.FamilyTableDef{}
-	for {
-		if len(columns) == 0 {
-			if len(fd.Columns) > 0 {
-				ast.Defs = append(ast.Defs, fd)
+	return mutated, changed
+}
+
+func postgresCreateTableMutator(
+	rng *rand.Rand, stmts []tree.Statement,
+) (mutated []tree.Statement, changed bool) {
+	for _, stmt := range stmts {
+		mutated = append(mutated, stmt)
+		switch stmt := stmt.(type) {
+		case *tree.CreateTable:
+			var newdefs tree.TableDefs
+			for _, def := range stmt.Defs {
+				switch def := def.(type) {
+				case *tree.IndexTableDef:
+					// Postgres doesn't support
+					// indexes in CREATE TABLE,
+					// so split them out to their
+					// own statement.
+					mutated = append(mutated, &tree.CreateIndex{
+						Name:     def.Name,
+						Table:    stmt.Table,
+						Inverted: def.Inverted,
+						Columns:  def.Columns,
+						Storing:  def.Storing,
+					})
+					changed = true
+				case *tree.UniqueConstraintTableDef:
+					if def.PrimaryKey {
+						// Postgres doesn't support descending PKs.
+						for i, col := range def.Columns {
+							if col.Direction != tree.DefaultDirection {
+								def.Columns[i].Direction = tree.DefaultDirection
+								changed = true
+							}
+						}
+						if def.Name != "" {
+							// Unset Name here because
+							// constaint names cannot
+							// be shared among tables,
+							// so multiple PK constraints
+							// named "primary" is an error.
+							def.Name = ""
+							changed = true
+						}
+						newdefs = append(newdefs, def)
+						break
+					}
+					mutated = append(mutated, &tree.CreateIndex{
+						Name:     def.Name,
+						Table:    stmt.Table,
+						Unique:   true,
+						Inverted: def.Inverted,
+						Columns:  def.Columns,
+						Storing:  def.Storing,
+					})
+					changed = true
+				default:
+					newdefs = append(newdefs, def)
+				}
 			}
-			break
-		}
-		fd.Columns = append(fd.Columns, columns[0])
-		columns = columns[1:]
-		// 50% chance to make a new column family.
-		if rng.Intn(2) != 0 {
-			ast.Defs = append(ast.Defs, fd)
-			fd = &tree.FamilyTableDef{}
+			stmt.Defs = newdefs
 		}
 	}
-	return true
+	return mutated, changed
 }

@@ -17,6 +17,7 @@ func registerTests(r *testRegistry) {
 
 	registerAcceptance(r)
 	registerAllocator(r)
+	registerAlterPK(r)
 	registerBackup(r)
 	registerCancel(r)
 	registerCDC(r)
@@ -72,12 +73,14 @@ func registerTests(r *testRegistry) {
 	registerSchemaChangeInvertedIndex(r)
 	registerScrubAllChecksTPCC(r)
 	registerScrubIndexOnlyTPCC(r)
+	registerSecondaryIndexesMultiVersionCluster(r)
 	registerSQLAlchemy(r)
 	registerSQLSmith(r)
 	registerSyncTest(r)
 	registerSysbench(r)
 	registerTPCC(r)
 	registerTPCHVec(r)
+	registerKVBench(r)
 	registerTypeORM(r)
 	registerLoadSplits(r)
 	registerUpgrade(r)
@@ -94,5 +97,6 @@ func registerBenchmarks(r *testRegistry) {
 
 	registerIndexesBench(r)
 	registerTPCCBench(r)
+	registerKVBench(r)
 	registerTPCHBench(r)
 }

@@ -39,7 +39,7 @@ scan a
 memo
 SELECT k FROM a WHERE k = 1
 ----
-memo (optimized, ~4KB, required=[presentation: k:1])
+memo (optimized, ~5KB, required=[presentation: k:1])
  ├── G1: (select G2 G3) (scan a,cols=(1),constrained)
  │    └── [presentation: k:1]
  │         ├── best: (scan a,cols=(1),constrained)
@@ -151,7 +151,7 @@ project
 memo
 SELECT k FROM a WHERE u = 1 AND k+u = 1
 ----
-memo (optimized, ~7KB, required=[presentation: k:1])
+memo (optimized, ~8KB, required=[presentation: k:1])
  ├── G1: (project G2 G3 k)
  │    └── [presentation: k:1]
  │         ├── best: (project G2 G3 k)
@@ -620,6 +620,57 @@ memo (optimized, ~5KB, required=[presentation: k:1,u:2,v:3,j:4])
  ├── G21: (const 9)
  └── G22: (const 10)
 
+# GenerateConstrainedScans propagates row-level locking information.
+opt
+SELECT k FROM a WHERE k = 1 FOR UPDATE
+----
+scan a
+ ├── columns: k:1(int!null)
+ ├── constraint: /1: [/1 - /1]
+ ├── locking: for-update
+ ├── cardinality: [0 - 1]
+ ├── key: ()
+ └── fd: ()-->(1)
+
+opt
+SELECT * FROM b WHERE v >= 1 AND v <= 10 FOR UPDATE
+----
+index-join b
+ ├── columns: k:1(int!null) u:2(int) v:3(int!null) j:4(jsonb)
+ ├── cardinality: [0 - 10]
+ ├── key: (1)
+ ├── fd: (1)-->(2-4), (3)-->(1,2,4)
+ └── scan b@v
+      ├── columns: k:1(int!null) v:3(int!null)
+      ├── constraint: /3: [/1 - /10]
+      ├── locking: for-update
+      ├── cardinality: [0 - 10]
+      ├── key: (1)
+      └── fd: (1)-->(3), (3)-->(1)
+
+opt
+SELECT * FROM b WHERE v >= 1 AND v <= 10 AND k+u = 1 FOR UPDATE
+----
+select
+ ├── columns: k:1(int!null) u:2(int) v:3(int!null) j:4(jsonb)
+ ├── cardinality: [0 - 10]
+ ├── key: (1)
+ ├── fd: (1)-->(2-4), (3)-->(1,2,4)
+ ├── index-join b
+ │    ├── columns: k:1(int!null) u:2(int) v:3(int) j:4(jsonb)
+ │    ├── cardinality: [0 - 10]
+ │    ├── key: (1)
+ │    ├── fd: (1)-->(2-4), (3)-->(1), (3)~~>(1,2,4)
+ │    └── scan b@v
+ │         ├── columns: k:1(int!null) v:3(int!null)
+ │         ├── constraint: /3: [/1 - /10]
+ │         ├── locking: for-update
+ │         ├── cardinality: [0 - 10]
+ │         ├── key: (1)
+ │         └── fd: (1)-->(3), (3)-->(1)
+ └── filters
+      └── (k + u) = 1 [type=bool, outer=(1,2)]
+
 # --------------------------------------------------
 # GenerateInvertedIndexScans
 # --------------------------------------------------
@@ -677,6 +728,7 @@ project
  └── inner-join (lookup b)
       ├── columns: k:1(int!null) j:4(jsonb)
       ├── key columns: [1] = [1]
+      ├── lookup columns are key
       ├── key: (1)
       ├── fd: (1)-->(4)
       ├── inner-join (zigzag b@inv_idx b@inv_idx)
@@ -737,6 +789,7 @@ SELECT j, k FROM b WHERE j @> '{"a": "b", "c": "d"}'
 inner-join (lookup b)
  ├── columns: j:4(jsonb) k:1(int!null)
  ├── key columns: [1] = [1]
+ ├── lookup columns are key
  ├── key: (1)
  ├── fd: (1)-->(4)
  ├── inner-join (zigzag b@inv_idx b@inv_idx)
@@ -754,6 +807,7 @@ SELECT * FROM b WHERE j @> '{"a": {"b": "c", "d": "e"}, "f": "g"}'
 inner-join (lookup b)
  ├── columns: k:1(int!null) u:2(int) v:3(int) j:4(jsonb)
  ├── key columns: [1] = [1]
+ ├── lookup columns are key
  ├── key: (1)
  ├── fd: (1)-->(2-4), (3)~~>(1,2,4)
  ├── inner-join (zigzag b@inv_idx b@inv_idx)
@@ -802,7 +856,9 @@ index-join b
  ├── fd: (1)-->(2-4), (3)~~>(1,2,4)
  └── scan b@inv_idx
       ├── columns: k:1(int!null)
-      ├── constraint: /4/1: [/'2' - /'2'] [/'[2]' - /'[2]']
+      ├── constraint: /4/1
+      │    ├── [/'2' - /'2']
+      │    └── [/'[2]' - /'[2]']
       └── key: (1)
 
 opt
@@ -846,3 +902,20 @@ select
  │    └── fd: (1)-->(2-4), (3)~~>(1,2,4)
  └── filters
       └── j @> '{"a": []}' [type=bool, outer=(4)]
+
+# GenerateInvertedIndexScans propagates row-level locking information.
+opt
+SELECT k FROM b WHERE j @> '{"a": "b"}' FOR UPDATE
+----
+project
+ ├── columns: k:1(int!null)
+ ├── key: (1)
+ └── index-join b
+      ├── columns: k:1(int!null) j:4(jsonb)
+      ├── key: (1)
+      ├── fd: (1)-->(4)
+      └── scan b@inv_idx
+           ├── columns: k:1(int!null)
+           ├── constraint: /4/1: [/'{"a": "b"}' - /'{"a": "b"}']
+           ├── locking: for-update
+           └── key: (1)

@@ -166,6 +166,25 @@ func (s *scope) appendColumnsFromScope(src *scope) {
 	}
 }
 
+// appendColumnsFromTable adds all columns from the given table metadata to this
+// scope.
+func (s *scope) appendColumnsFromTable(tabMeta *opt.TableMeta, alias *tree.TableName) {
+	tab := tabMeta.Table
+	if s.cols == nil {
+		s.cols = make([]scopeColumn, 0, tab.ColumnCount())
+	}
+	for i, n := 0, tab.ColumnCount(); i < n; i++ {
+		tabCol := tab.Column(i)
+		s.cols = append(s.cols, scopeColumn{
+			name:   tabCol.ColName(),
+			table:  *alias,
+			typ:    tabCol.DatumType(),
+			id:     tabMeta.MetaID.ColumnID(i),
+			hidden: tabCol.IsHidden(),
+		})
+	}
+}
+
 // appendColumns adds newly bound variables to this scope.
 // The expressions in the new columns are reset to nil.
 func (s *scope) appendColumns(cols []scopeColumn) {
@@ -477,21 +496,35 @@ func (s *scope) setTableAlias(alias tree.Name) {
 	}
 }
 
-func (s *scope) findExistingColInList(expr tree.TypedExpr, cols []scopeColumn) *scopeColumn {
+// See (*scope).findExistingCol.
+func findExistingColInList(
+	expr tree.TypedExpr, cols []scopeColumn, allowSideEffects bool,
+) *scopeColumn {
 	exprStr := symbolicExprStr(expr)
 	for i := range cols {
 		col := &cols[i]
-		if expr == col || exprStr == col.getExprStr() {
+		if expr == col {
 			return col
+		}
+		if exprStr == col.getExprStr() {
+			if allowSideEffects || col.scalar == nil {
+				return col
+			}
+			var p props.Shared
+			memo.BuildSharedProps(col.scalar, &p)
+			if !p.CanHaveSideEffects {
+				return col
+			}
 		}
 	}
 	return nil
 }
 
-// findExistingCol finds the given expression among the bound variables
-// in this scope. Returns nil if the expression is not found.
-func (s *scope) findExistingCol(expr tree.TypedExpr) *scopeColumn {
-	return s.findExistingColInList(expr, s.cols)
+// findExistingCol finds the given expression among the bound variables in this
+// scope. Returns nil if the expression is not found (or an expression is found
+// but it has side-effects and allowSideEffects is false).
+func (s *scope) findExistingCol(expr tree.TypedExpr, allowSideEffects bool) *scopeColumn {
+	return findExistingColInList(expr, s.cols, allowSideEffects)
 }
 
 // startAggFunc is called when the builder starts building an aggregate
@@ -895,12 +928,14 @@ func (s *scope) replaceSRF(f *tree.FuncExpr, def *tree.FunctionDefinition) *srf 
 
 	srfScope := s.push()
 	var outCol *scopeColumn
-	if len(def.ReturnLabels) == 1 {
+
+	var typedFuncExpr = typedFunc.(*tree.FuncExpr)
+	if s.builder.shouldCreateDefaultColumn(typedFuncExpr) {
 		outCol = s.builder.addColumn(srfScope, def.Name, typedFunc)
 	}
-	out := s.builder.buildFunction(typedFunc.(*tree.FuncExpr), s, srfScope, outCol, nil)
+	out := s.builder.buildFunction(typedFuncExpr, s, srfScope, outCol, nil)
 	srf := &srf{
-		FuncExpr: typedFunc.(*tree.FuncExpr),
+		FuncExpr: typedFuncExpr,
 		cols:     srfScope.cols,
 		fn:       out,
 	}
@@ -1067,7 +1102,7 @@ func (s *scope) replaceWindowFn(f *tree.FuncExpr, def *tree.FunctionDefinition) 
 		},
 	}
 
-	if col := s.findExistingColInList(&info, s.windows); col != nil {
+	if col := findExistingColInList(&info, s.windows, false /* allowSideEffects */); col != nil {
 		return col.expr
 	}
 

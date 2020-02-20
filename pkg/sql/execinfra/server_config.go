@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/storage/diskmap"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine/fs"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -58,7 +59,7 @@ import (
 //
 // ATTENTION: When updating these fields, add to version_history.txt explaining
 // what changed.
-const Version execinfrapb.DistSQLVersion = 24
+const Version execinfrapb.DistSQLVersion = 25
 
 // MinAcceptedVersion is the oldest version that the server is
 // compatible with; see above.
@@ -124,6 +125,14 @@ type ServerConfig struct {
 	// working set is larger than can be stored in memory.
 	TempStorage diskmap.Factory
 
+	// TempStoragePath is the path where the vectorized execution engine should
+	// create files using TempFS.
+	TempStoragePath string
+
+	// TempFS is used by the vectorized execution engine to store columns when the
+	// working set is larger than can be stored in memory.
+	TempFS fs.FS
+
 	// BulkAdder is used by some processors to bulk-ingest data as SSTs.
 	BulkAdder storagebase.BulkAdderFactory
 
@@ -185,10 +194,16 @@ type TestingKnobs struct {
 	// function returns an error, or if the table has already been dropped.
 	RunAfterBackfillChunk func()
 
+	// ForceDiskSpill forces any processors/operators that can fall back to disk
+	// to fall back to disk immediately.
+	ForceDiskSpill bool
+
 	// MemoryLimitBytes specifies a maximum amount of working memory that a
 	// processor that supports falling back to disk can use. Must be >= 1 to
-	// enable. Once this limit is hit, processors employ their on-disk
-	// implementation regardless of applicable cluster settings.
+	// enable. This is a more fine-grained knob than ForceDiskSpill when the
+	// available memory needs to be controlled. Once this limit is hit, processors
+	// employ their on-disk implementation regardless of applicable cluster
+	// settings.
 	MemoryLimitBytes int64
 
 	// DrainFast, if enabled, causes the server to not wait for any currently
@@ -211,6 +226,9 @@ type TestingKnobs struct {
 	// EnableVectorizedInvariantsChecker, if enabled, will allow for planning
 	// the invariant checkers between all columnar operators.
 	EnableVectorizedInvariantsChecker bool
+
+	// Forces bulk adder flush every time a KV batch is processed.
+	BulkAdderFlushesEveryBatch bool
 }
 
 // MetadataTestLevel represents the types of queries where metadata test
@@ -229,3 +247,13 @@ const (
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.
 func (*TestingKnobs) ModuleTestingKnobs() {}
+
+// GetWorkMemLimit returns the number of bytes determining the amount of RAM
+// available to a single processor or operator.
+func GetWorkMemLimit(config *ServerConfig) int64 {
+	limit := config.TestingKnobs.MemoryLimitBytes
+	if limit <= 0 {
+		limit = SettingWorkMemBytes.Get(&config.Settings.SV)
+	}
+	return limit
+}

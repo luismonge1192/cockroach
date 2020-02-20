@@ -34,7 +34,7 @@ func declareKeysTransferLease(
 }
 
 func init() {
-	RegisterCommand(roachpb.TransferLease, declareKeysTransferLease, TransferLease)
+	RegisterReadWriteCommand(roachpb.TransferLease, declareKeysTransferLease, TransferLease)
 }
 
 // TransferLease sets the lease holder for the range.
@@ -43,7 +43,7 @@ func init() {
 // ex-) lease holder which must have dropped all of its lease holder powers
 // before proposing.
 func TransferLease(
-	ctx context.Context, batch engine.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, readWriter engine.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
 ) (result.Result, error) {
 	// When returning an error from this method, must always return
 	// a newFailedLeaseTrigger() to satisfy stats.
@@ -65,9 +65,7 @@ func TransferLease(
 	}
 
 	prevLease, _ := cArgs.EvalCtx.GetLease()
-	if log.V(2) {
-		log.Infof(ctx, "lease transfer: prev lease: %+v, new lease: %+v", prevLease, args.Lease)
-	}
-	return evalNewLease(ctx, cArgs.EvalCtx, batch, cArgs.Stats,
+	log.VEventf(ctx, 2, "lease transfer: prev lease: %+v, new lease: %+v", prevLease, args.Lease)
+	return evalNewLease(ctx, cArgs.EvalCtx, readWriter, cArgs.Stats,
 		args.Lease, prevLease, false /* isExtension */, true /* isTransfer */)
 }

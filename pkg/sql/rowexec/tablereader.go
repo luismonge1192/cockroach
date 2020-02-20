@@ -49,7 +49,7 @@ type tableReader struct {
 
 	// fetcher wraps a row.Fetcher, allowing the tableReader to add a stat
 	// collection layer.
-	fetcher execinfra.RowFetcher
+	fetcher rowFetcher
 	alloc   sqlbase.DatumAlloc
 
 	// rowsRead is the number of rows read and is tracked unconditionally.
@@ -114,9 +114,9 @@ func newTableReader(
 
 	var fetcher row.Fetcher
 	columnIdxMap := spec.Table.ColumnIdxMapWithMutations(returnMutations)
-	if _, _, err := execinfra.InitRowFetcher(
+	if _, _, err := initRowFetcher(
 		&fetcher, &spec.Table, int(spec.IndexIdx), columnIdxMap, spec.Reverse,
-		neededColumns, spec.IsCheck, &tr.alloc, spec.Visibility,
+		neededColumns, spec.IsCheck, &tr.alloc, spec.Visibility, spec.LockingStrength,
 	); err != nil {
 		return nil, err
 	}
@@ -132,7 +132,7 @@ func newTableReader(
 	}
 
 	if sp := opentracing.SpanFromContext(flowCtx.EvalCtx.Ctx()); sp != nil && tracing.IsRecording(sp) {
-		tr.fetcher = execinfra.NewRowFetcherStatCollector(&fetcher)
+		tr.fetcher = newRowFetcherStatCollector(&fetcher)
 		tr.FinishTrace = tr.outputStatsToTrace
 	} else {
 		tr.fetcher = &fetcher
@@ -164,7 +164,7 @@ func (tr *tableReader) Start(ctx context.Context) context.Context {
 			limitBatches, tr.limitHint, tr.FlowCtx.TraceKV,
 		)
 	} else {
-		initialTS := tr.FlowCtx.Txn.GetTxnCoordMeta(ctx).Txn.ReadTimestamp
+		initialTS := tr.FlowCtx.Txn.ReadTimestamp()
 		err = tr.fetcher.StartInconsistentScan(
 			ctx, tr.FlowCtx.Cfg.DB, initialTS,
 			tr.maxTimestampAge, tr.spans,
@@ -191,9 +191,28 @@ func (tr *tableReader) Release() {
 	trPool.Put(tr)
 }
 
+var tableReaderProgressFrequency int64 = 5000
+
+// TestingSetScannedRowProgressFrequency changes the frequency at which
+// row-scanned progress metadata is emitted by table readers.
+func TestingSetScannedRowProgressFrequency(val int64) func() {
+	oldVal := tableReaderProgressFrequency
+	tableReaderProgressFrequency = val
+	return func() { tableReaderProgressFrequency = oldVal }
+}
+
 // Next is part of the RowSource interface.
 func (tr *tableReader) Next() (sqlbase.EncDatumRow, *execinfrapb.ProducerMetadata) {
 	for tr.State == execinfra.StateRunning {
+		// Check if it is time to emit a progress update.
+		if tr.rowsRead >= tableReaderProgressFrequency {
+			meta := execinfrapb.GetProducerMeta()
+			meta.Metrics = execinfrapb.GetMetricsMeta()
+			meta.Metrics.RowsRead = tr.rowsRead
+			tr.rowsRead = 0
+			return nil, meta
+		}
+
 		row, _, _, err := tr.fetcher.NextRow(tr.Ctx)
 		if row == nil || err != nil {
 			tr.MoveToDraining(err)
@@ -225,7 +244,7 @@ const tableReaderTagPrefix = "tablereader."
 // Stats implements the SpanStats interface.
 func (trs *TableReaderStats) Stats() map[string]string {
 	inputStatsMap := trs.InputStats.Stats(tableReaderTagPrefix)
-	inputStatsMap[tableReaderTagPrefix+execinfra.BytesReadTagSuffix] = humanizeutil.IBytes(trs.BytesRead)
+	inputStatsMap[tableReaderTagPrefix+bytesReadTagSuffix] = humanizeutil.IBytes(trs.BytesRead)
 	return inputStatsMap
 }
 
@@ -233,14 +252,14 @@ func (trs *TableReaderStats) Stats() map[string]string {
 func (trs *TableReaderStats) StatsForQueryPlan() []string {
 	return append(
 		trs.InputStats.StatsForQueryPlan("" /* prefix */),
-		fmt.Sprintf("%s: %s", execinfra.BytesReadQueryPlanSuffix, humanizeutil.IBytes(trs.BytesRead)),
+		fmt.Sprintf("%s: %s", bytesReadQueryPlanSuffix, humanizeutil.IBytes(trs.BytesRead)),
 	)
 }
 
 // outputStatsToTrace outputs the collected tableReader stats to the trace. Will
 // fail silently if the tableReader is not collecting stats.
 func (tr *tableReader) outputStatsToTrace() {
-	is, ok := execinfra.GetFetcherInputStats(tr.FlowCtx, tr.fetcher)
+	is, ok := getFetcherInputStats(tr.FlowCtx, tr.fetcher)
 	if !ok {
 		return
 	}
@@ -260,8 +279,8 @@ func (tr *tableReader) generateMeta(ctx context.Context) []execinfrapb.ProducerM
 			trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{Ranges: ranges})
 		}
 	}
-	if meta := execinfra.GetTxnCoordMeta(ctx, tr.FlowCtx.Txn); meta != nil {
-		trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{TxnCoordMeta: meta})
+	if tfs := execinfra.GetLeafTxnFinalState(ctx, tr.FlowCtx.Txn); tfs != nil {
+		trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{LeafTxnFinalState: tfs})
 	}
 
 	meta := execinfrapb.GetProducerMeta()

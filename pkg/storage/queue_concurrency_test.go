@@ -19,7 +19,9 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -29,6 +31,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"golang.org/x/sync/errgroup"
 )
+
+func constantTimeoutFunc(d time.Duration) func(*cluster.Settings, replicaInQueue) time.Duration {
+	return func(*cluster.Settings, replicaInQueue) time.Duration { return d }
+}
 
 // TestBaseQueueConcurrent verifies that under concurrent adds/removes of ranges
 // to the queue including purgatory errors and regular errors, the queue
@@ -49,7 +55,7 @@ func TestBaseQueueConcurrent(t *testing.T) {
 		maxSize:              num / 2,
 		maxConcurrency:       4,
 		acceptsUnsplitRanges: true,
-		processTimeout:       time.Millisecond,
+		processTimeoutFunc:   constantTimeoutFunc(time.Millisecond),
 		// We don't care about these, but we don't want to crash.
 		successes:       metric.NewCounter(metric.Metadata{Name: "processed"}),
 		failures:        metric.NewCounter(metric.Metadata{Name: "failures"}),
@@ -65,7 +71,7 @@ func TestBaseQueueConcurrent(t *testing.T) {
 		cfg: StoreConfig{
 			Clock:             hlc.NewClock(hlc.UnixNano, time.Second),
 			AmbientCtx:        log.AmbientContext{Tracer: tracing.NewTracer()},
-			DefaultZoneConfig: config.DefaultZoneConfigRef(),
+			DefaultZoneConfig: zonepb.DefaultZoneConfigRef(),
 		},
 	}
 

@@ -15,7 +15,6 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -72,6 +71,11 @@ func (p *planner) RenameTable(ctx context.Context, n *tree.RenameTable) (planNod
 	return &renameTableNode{n: n, oldTn: &oldTn, newTn: &newTn, tableDesc: tableDesc}, nil
 }
 
+// ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
+// This is because RENAME DATABASE performs multiple KV operations on descriptors
+// and expects to see its own writes.
+func (n *renameTableNode) ReadingOwnWrites() {}
+
 func (n *renameTableNode) startExec(params runParams) error {
 	p := params.p
 	ctx := params.ctx
@@ -106,17 +110,20 @@ func (n *renameTableNode) startExec(params runParams) error {
 	tableDesc.SetName(newTn.Table())
 	tableDesc.ParentID = targetDbDesc.ID
 
-	newTbKey := sqlbase.NewTableKey(targetDbDesc.ID, newTn.Table()).Key()
+	newTbKey := sqlbase.MakePublicTableNameKey(ctx, params.ExecCfg().Settings,
+		targetDbDesc.ID, newTn.Table()).Key()
 
 	if err := tableDesc.Validate(ctx, p.txn); err != nil {
 		return err
 	}
 
 	descID := tableDesc.GetID()
+	parentSchemaID := tableDesc.GetParentSchemaID()
 
 	renameDetails := sqlbase.TableDescriptor_NameInfo{
-		ParentID: prevDbDesc.ID,
-		Name:     oldTn.Table()}
+		ParentID:       prevDbDesc.ID,
+		ParentSchemaID: parentSchemaID,
+		Name:           oldTn.Table()}
 	tableDesc.DrainingNames = append(tableDesc.DrainingNames, renameDetails)
 	if err := p.writeSchemaChange(ctx, tableDesc, sqlbase.InvalidMutationID); err != nil {
 		return err
@@ -129,19 +136,23 @@ func (n *renameTableNode) startExec(params runParams) error {
 	if p.extendedEvalCtx.Tracing.KVTracingEnabled() {
 		log.VEventf(ctx, 2, "CPut %s -> %d", newTbKey, descID)
 	}
-	if err := writeDescToBatch(ctx, p.extendedEvalCtx.Tracing.KVTracingEnabled(), p.EvalContext().Settings, b, descID, tableDesc.TableDesc()); err != nil {
+	err = writeDescToBatch(ctx, p.extendedEvalCtx.Tracing.KVTracingEnabled(),
+		p.EvalContext().Settings, b, descID, tableDesc.TableDesc())
+	if err != nil {
 		return err
 	}
+
+	exists, _, err := sqlbase.LookupPublicTableID(
+		params.ctx, params.p.txn, targetDbDesc.ID, newTn.Table(),
+	)
+	if err == nil && exists {
+		return sqlbase.NewRelationAlreadyExistsError(newTn.Table())
+	} else if err != nil {
+		return err
+	}
+
 	b.CPut(newTbKey, descID, nil)
-
-	if err := p.txn.Run(ctx, b); err != nil {
-		if _, ok := err.(*roachpb.ConditionFailedError); ok {
-			return sqlbase.NewRelationAlreadyExistsError(newTn.Table())
-		}
-		return err
-	}
-
-	return nil
+	return p.txn.Run(ctx, b)
 }
 
 func (n *renameTableNode) Next(runParams) (bool, error) { return false, nil }

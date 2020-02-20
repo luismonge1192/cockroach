@@ -72,6 +72,7 @@ type createStatsRun struct {
 }
 
 func (n *createStatsNode) startExec(params runParams) error {
+	telemetry.Inc(sqltelemetry.SchemaChangeCreate("stats"))
 	n.run.resultsCh = make(chan tree.Datums)
 	n.run.errCh = make(chan error)
 	go func() {
@@ -265,7 +266,8 @@ const maxNonIndexCols = 100
 // collect statistics on a, {a, b}, b, and {b, c}.
 //
 // In addition to the index columns, we collect stats on up to maxNonIndexCols
-// other columns from the table. We only collect histograms for index columns.
+// other columns from the table. We only collect histograms for index columns,
+// plus any other boolean columns (where the "histogram" is tiny).
 //
 // TODO(rytaft): This currently only generates one single-column stat per
 // index. Add code to collect multi-column stats once they are supported.
@@ -307,7 +309,7 @@ func createStatsDefaultColumns(
 		if col.Type.Family() != types.JsonFamily && !requestedCols.Contains(int(col.ID)) {
 			colStats = append(colStats, jobspb.CreateStatsDetails_ColStat{
 				ColumnIDs:    []sqlbase.ColumnID{col.ID},
-				HasHistogram: false,
+				HasHistogram: col.Type.Family() == types.BoolFamily,
 			})
 			nonIdxCols++
 		}
@@ -455,9 +457,7 @@ func checkRunningJobs(ctx context.Context, job *jobs.Job, p *planner) error {
 }
 
 // OnFailOrCancel is part of the jobs.Resumer interface.
-func (r *createStatsResumer) OnFailOrCancel(ctx context.Context, txn *client.Txn) error {
-	return nil
-}
+func (r *createStatsResumer) OnFailOrCancel(context.Context, interface{}) error { return nil }
 
 // OnSuccess is part of the jobs.Resumer interface.
 func (r *createStatsResumer) OnSuccess(ctx context.Context, _ *client.Txn) error {

@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/pkg/errors"
 )
 
@@ -48,6 +49,9 @@ var _ apd.Decimal
 
 // Dummy import to pull in "time" package.
 var _ time.Time
+
+// Dummy import to pull in "duration" package.
+var _ duration.Duration
 
 // Dummy import to pull in "coltypes" package
 var _ coltypes.T
@@ -198,7 +202,7 @@ func (si *selectInOp_TYPE) Next(ctx context.Context) coldata.Batch {
 	for {
 		batch := si.input.Next(ctx)
 		if batch.Length() == 0 {
-			return batch
+			return coldata.ZeroBatch
 		}
 
 		vec := batch.ColVec(si.colIdx)
@@ -226,7 +230,7 @@ func (si *selectInOp_TYPE) Next(ctx context.Context) coldata.Batch {
 				batch.SetSelection(true)
 				sel := batch.Selection()
 				col = execgen.SLICE(col, 0, int(n))
-				for execgen.RANGE(i, col) {
+				for execgen.RANGE(i, col, 0, int(n)) {
 					v := execgen.UNSAFEGET(col, i)
 					if !nulls.NullAt(uint16(i)) && cmpIn_TYPE(v, si.filterRow, si.hasNulls) == compVal {
 						sel[idx] = uint16(i)
@@ -248,7 +252,7 @@ func (si *selectInOp_TYPE) Next(ctx context.Context) coldata.Batch {
 				batch.SetSelection(true)
 				sel := batch.Selection()
 				col = execgen.SLICE(col, 0, int(n))
-				for execgen.RANGE(i, col) {
+				for execgen.RANGE(i, col, 0, int(n)) {
 					v := execgen.UNSAFEGET(col, i)
 					if cmpIn_TYPE(v, si.filterRow, si.hasNulls) == compVal {
 						sel[idx] = uint16(i)
@@ -267,12 +271,10 @@ func (si *selectInOp_TYPE) Next(ctx context.Context) coldata.Batch {
 
 func (pi *projectInOp_TYPE) Next(ctx context.Context) coldata.Batch {
 	batch := pi.input.Next(ctx)
-	if pi.outputIdx == batch.Width() {
-		pi.allocator.AppendColumn(batch, coltypes.Bool)
-	}
 	if batch.Length() == 0 {
-		return batch
+		return coldata.ZeroBatch
 	}
+	pi.allocator.MaybeAddColumn(batch, coltypes.Bool, pi.outputIdx)
 
 	vec := batch.ColVec(pi.colIdx)
 	col := vec._TemplateType()
@@ -307,7 +309,7 @@ func (pi *projectInOp_TYPE) Next(ctx context.Context) coldata.Batch {
 			}
 		} else {
 			col = execgen.SLICE(col, 0, int(n))
-			for execgen.RANGE(i, col) {
+			for execgen.RANGE(i, col, 0, int(n)) {
 				if nulls.NullAt(uint16(i)) {
 					projNulls.SetNull(uint16(i))
 				} else {
@@ -335,7 +337,7 @@ func (pi *projectInOp_TYPE) Next(ctx context.Context) coldata.Batch {
 			}
 		} else {
 			col = execgen.SLICE(col, 0, int(n))
-			for execgen.RANGE(i, col) {
+			for execgen.RANGE(i, col, 0, int(n)) {
 				v := execgen.UNSAFEGET(col, i)
 				cmpRes := cmpIn_TYPE(v, pi.filterRow, pi.hasNulls)
 				if cmpRes == siNull {

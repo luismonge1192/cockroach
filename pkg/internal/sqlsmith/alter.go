@@ -17,34 +17,26 @@ import (
 )
 
 var (
-	alters       []statementWeight
-	alterWeights []int
-)
-
-func init() {
-	alters = []statementWeight{
-		{1, makeRenameTable},
-		{1, makeCreateTable},
+	alters               = append(altersTableExistence, altersExistingTable...)
+	altersTableExistence = []statementWeight{
+		{10, makeCreateTable},
 		{1, makeDropTable},
-
-		{1, makeAddColumn},
-		{1, makeJSONComputedColumn},
-		{1, makeDropColumn},
-		{1, makeRenameColumn},
-		{1, makeAlterColumnType},
-
-		{1, makeCreateIndex},
-		{1, makeDropIndex},
-		{1, makeRenameIndex},
 	}
-	alterWeights = func() []int {
-		m := make([]int, len(alters))
-		for i, s := range alters {
-			m[i] = s.weight
-		}
-		return m
-	}()
-}
+	altersExistingTable = []statementWeight{
+		{5, makeRenameTable},
+
+		{10, makeAddColumn},
+		{10, makeJSONComputedColumn},
+		{10, makeAlterPrimaryKey},
+		{1, makeDropColumn},
+		{5, makeRenameColumn},
+		{5, makeAlterColumnType},
+
+		{10, makeCreateIndex},
+		{1, makeDropIndex},
+		{5, makeRenameIndex},
+	}
+)
 
 func makeAlter(s *Smither) (tree.Statement, bool) {
 	if s.canRecurse() {
@@ -57,8 +49,7 @@ func makeAlter(s *Smither) (tree.Statement, bool) {
 		// test some additional logic.
 		_ = s.ReloadSchemas()
 		for i := 0; i < retryCount; i++ {
-			idx := s.alters.Next()
-			stmt, ok := alters[idx].fn(s)
+			stmt, ok := s.alterSampler.Next()(s)
 			if ok {
 				return stmt, ok
 			}
@@ -222,6 +213,40 @@ func makeDropColumn(s *Smither) (tree.Statement, bool) {
 			&tree.AlterTableDropColumn{
 				Column:       col.Name,
 				DropBehavior: s.randDropBehavior(),
+			},
+		},
+	}, true
+}
+
+func makeAlterPrimaryKey(s *Smither) (tree.Statement, bool) {
+	_, _, tableRef, _, ok := s.getSchemaTable()
+	if !ok {
+		return nil, false
+	}
+	// Collect all columns that are NOT NULL to be candidate new primary keys.
+	var candidateColumns tree.IndexElemList
+	for _, c := range tableRef.Columns {
+		if c.Nullable.Nullability == tree.NotNull {
+			candidateColumns = append(candidateColumns, tree.IndexElem{Column: c.Name})
+		}
+	}
+	if len(candidateColumns) == 0 {
+		return nil, false
+	}
+	s.rnd.Shuffle(len(candidateColumns), func(i, j int) {
+		candidateColumns[i], candidateColumns[j] = candidateColumns[j], candidateColumns[i]
+	})
+	// Pick some randomly short prefix of the candidate columns as a potential new primary key.
+	i := 1
+	for len(candidateColumns) > i && s.rnd.Intn(2) == 0 {
+		i++
+	}
+	candidateColumns = candidateColumns[:i]
+	return &tree.AlterTable{
+		Table: tableRef.TableName.ToUnresolvedObjectName(),
+		Cmds: tree.AlterTableCmds{
+			&tree.AlterTableAlterPrimaryKey{
+				Columns: candidateColumns,
 			},
 		},
 	}, true

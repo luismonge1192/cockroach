@@ -121,9 +121,13 @@ Examples:
 				registerBenchmarks(&r)
 			}
 
-			names := r.List(context.Background(), args)
-			for _, name := range names {
-				fmt.Println(name)
+			matchedTests := r.List(context.Background(), args)
+			for _, test := range matchedTests {
+				var skip string
+				if test.Skip != "" {
+					skip = " (skipped: " + test.Skip + ")"
+				}
+				fmt.Printf("%s [%s]%s\n", test.Name, test.Owner, skip)
 			}
 			return nil
 		},
@@ -190,7 +194,7 @@ the test tags.
 		cmd.Flags().StringVar(
 			&artifacts, "artifacts", "artifacts", "path to artifacts directory")
 		cmd.Flags().StringVar(
-			&cloud, "cloud", cloud, "cloud provider to use (aws or gce)")
+			&cloud, "cloud", cloud, "cloud provider to use (aws, azure, or gce)")
 		cmd.Flags().StringVar(
 			&clusterID, "cluster-id", "", "an identifier to use in the test cluster's name")
 		cmd.Flags().IntVar(
@@ -205,7 +209,12 @@ the test tags.
 			&clusterWipe, "wipe", true,
 			"wipe existing cluster before starting test (for use with --cluster)")
 		cmd.Flags().StringVar(
-			&zonesF, "zones", "", "Zones for the cluster (use roachprod defaults if empty)")
+			&zonesF, "zones", "",
+			"Zones for the cluster. (non-geo tests use the first zone, geo tests use all zones) "+
+				"(uses roachprod defaults if empty)")
+		cmd.Flags().StringVar(
+			&instanceType, "instance-type", instanceType,
+			"the instance type to use (see https://aws.amazon.com/ec2/instance-types/, https://cloud.google.com/compute/docs/machine-types or https://docs.microsoft.com/en-us/azure/virtual-machines/windows/sizes)")
 		cmd.Flags().IntVar(
 			&cpuQuota, "cpu-quota", 300,
 			"The number of cloud CPUs roachtest is allowed to use at any one time.")

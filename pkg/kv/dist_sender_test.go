@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/gossip/simulation"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
@@ -176,7 +176,7 @@ func makeGossip(t *testing.T, stopper *stop.Stopper, rpcContext *rpc.Context) *g
 	server := rpc.NewServer(rpcContext)
 
 	const nodeID = 1
-	g := gossip.NewTest(nodeID, rpcContext, server, stopper, metric.NewRegistry(), config.DefaultZoneConfigRef())
+	g := gossip.NewTest(nodeID, rpcContext, server, stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 	if err := g.SetNodeDescriptor(newNodeDesc(nodeID)); err != nil {
 		t.Fatal(err)
 	}
@@ -1280,7 +1280,7 @@ func TestGetFirstRangeDescriptor(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
 
-	n := simulation.NewNetwork(stopper, 3, true, config.DefaultZoneConfigRef())
+	n := simulation.NewNetwork(stopper, 3, true, zonepb.DefaultZoneConfigRef())
 	for _, node := range n.Nodes {
 		// TODO(spencer): remove the use of gossip/simulation here.
 		node.Gossip.EnableSimulationCycler(false)
@@ -2041,12 +2041,12 @@ func TestTruncateWithLocalSpanAndDescriptor(t *testing.T) {
 	}
 }
 
-// TestMultiRangeWithEndTransaction verifies that when a chunk of batch looks
-// like it's going to be dispatched to more than one range, it will be split up
-// if it contains an EndTransaction that is not performing a parallel commit.
-// However, it will not be split up if it contains an EndTransaction that is
-// performing a parallel commit.
-func TestMultiRangeWithEndTransaction(t *testing.T) {
+// TestMultiRangeWithEndTxn verifies that when a chunk of batch looks like it's
+// going to be dispatched to more than one range, it will be split up if it
+// contains an EndTxn that is not performing a parallel commit. However, it will
+// not be split up if it contains an EndTxn that is performing a parallel
+// commit.
+func TestMultiRangeWithEndTxn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
@@ -2065,7 +2065,7 @@ func TestMultiRangeWithEndTransaction(t *testing.T) {
 			put2:      roachpb.Key("a2"),
 			et:        roachpb.Key("a3"),
 			parCommit: false,
-			exp:       [][]roachpb.Method{{roachpb.Put, roachpb.Put, roachpb.EndTransaction}},
+			exp:       [][]roachpb.Method{{roachpb.Put, roachpb.Put, roachpb.EndTxn}},
 		},
 		{
 			// Everything hits the first range, so we get a 1PC txn.
@@ -2074,69 +2074,69 @@ func TestMultiRangeWithEndTransaction(t *testing.T) {
 			put2:      roachpb.Key("a2"),
 			et:        roachpb.Key("a3"),
 			parCommit: true,
-			exp:       [][]roachpb.Method{{roachpb.Put, roachpb.Put, roachpb.EndTransaction}},
+			exp:       [][]roachpb.Method{{roachpb.Put, roachpb.Put, roachpb.EndTxn}},
 		},
 		{
-			// Only EndTransaction hits the second range.
+			// Only EndTxn hits the second range.
 			put1:      roachpb.Key("a1"),
 			put2:      roachpb.Key("a2"),
 			et:        roachpb.Key("b"),
 			parCommit: false,
-			exp:       [][]roachpb.Method{{roachpb.Put, roachpb.Put}, {roachpb.EndTransaction}},
+			exp:       [][]roachpb.Method{{roachpb.Put, roachpb.Put}, {roachpb.EndTxn}},
 		},
 		{
-			// Only EndTransaction hits the second range. However, since the
-			// EndTransaction is performing a parallel commit, it is sent in
-			// parallel, which we can't detect directly because the
-			// EndTransaction batch is sent to the second range and a strict
-			// ordering of batches is enforced by DisableParallelBatches.
+			// Only EndTxn hits the second range. However, since the EndTxn is
+			// performing a parallel commit, it is sent in parallel, which we
+			// can't detect directly because the EndTxn batch is sent to the
+			// second range and a strict ordering of batches is enforced by
+			// DisableParallelBatches.
 			put1:      roachpb.Key("a1"),
 			put2:      roachpb.Key("a2"),
 			et:        roachpb.Key("b"),
 			parCommit: true,
-			exp:       [][]roachpb.Method{{roachpb.Put, roachpb.Put}, {roachpb.EndTransaction}},
+			exp:       [][]roachpb.Method{{roachpb.Put, roachpb.Put}, {roachpb.EndTxn}},
 		},
 		{
-			// One write hits the second range, so EndTransaction has to be
-			// split off. In this case, going in the usual order without
-			// splitting off would actually be fine, but it doesn't seem worth
-			// optimizing at this point.
+			// One write hits the second range, so EndTxn has to be split off.
+			// In this case, going in the usual order without splitting off
+			// would actually be fine, but it doesn't seem worth optimizing at
+			// this point.
 			put1:      roachpb.Key("a1"),
 			put2:      roachpb.Key("b1"),
 			et:        roachpb.Key("a1"),
 			parCommit: false,
-			exp:       [][]roachpb.Method{{roachpb.Put}, {roachpb.Put}, {roachpb.EndTransaction}},
+			exp:       [][]roachpb.Method{{roachpb.Put}, {roachpb.Put}, {roachpb.EndTxn}},
 		},
 		{
-			// One write hits the second range. Again, EndTransaction does not
-			// need to be split off because it is performing a parallel commit,
-			// so the only split is due to the range boundary.
+			// One write hits the second range. Again, EndTxn does not need to
+			// be split off because it is performing a parallel commit, so the
+			// only split is due to the range boundary.
 			put1:      roachpb.Key("a1"),
 			put2:      roachpb.Key("b1"),
 			et:        roachpb.Key("a1"),
 			parCommit: true,
-			exp:       [][]roachpb.Method{{roachpb.Put, roachpb.EndTransaction}, {roachpb.Put}},
+			exp:       [][]roachpb.Method{{roachpb.Put, roachpb.EndTxn}, {roachpb.Put}},
 		},
 		{
-			// Both writes go to the second range, but not EndTransaction. It is
-			// split from the writes and sent after.
+			// Both writes go to the second range, but not EndTxn. It is split
+			// from the writes and sent after.
 			put1:      roachpb.Key("b1"),
 			put2:      roachpb.Key("b2"),
 			et:        roachpb.Key("a1"),
 			parCommit: false,
-			exp:       [][]roachpb.Method{{roachpb.Put, roachpb.Put}, {roachpb.EndTransaction}},
+			exp:       [][]roachpb.Method{{roachpb.Put, roachpb.Put}, {roachpb.EndTxn}},
 		},
 		{
-			// Both writes go to the second range, but not EndTransaction. Since
-			// the EndTransaction is performing a parallel commit, it is sent in
-			// parallel. We can tell this because the EndTransaction batch is
-			// sent to the first range and ends up being delivered first, unlike
-			// in the previous case.
+			// Both writes go to the second range, but not EndTxn. Since the
+			// EndTxn is performing a parallel commit, it is sent in parallel.
+			// We can tell this because the EndTxn batch is sent to the first
+			// range and ends up being delivered first, unlike in the previous
+			// case.
 			put1:      roachpb.Key("b1"),
 			put2:      roachpb.Key("b2"),
 			et:        roachpb.Key("a1"),
 			parCommit: true,
-			exp:       [][]roachpb.Method{{roachpb.EndTransaction}, {roachpb.Put, roachpb.Put}},
+			exp:       [][]roachpb.Method{{roachpb.EndTxn}, {roachpb.Put, roachpb.Put}},
 		},
 	}
 
@@ -2214,7 +2214,7 @@ func TestMultiRangeWithEndTransaction(t *testing.T) {
 		ba.Txn = &roachpb.Transaction{Name: "test"}
 		ba.Add(roachpb.NewPut(test.put1, roachpb.MakeValueFromString("val1")))
 		ba.Add(roachpb.NewPut(test.put2, roachpb.MakeValueFromString("val2")))
-		et := &roachpb.EndTransactionRequest{
+		et := &roachpb.EndTxnRequest{
 			RequestHeader: roachpb.RequestHeader{Key: test.et},
 			Commit:        true,
 		}
@@ -2242,9 +2242,9 @@ func TestMultiRangeWithEndTransaction(t *testing.T) {
 // requests and one containing everything else.
 //
 // The test only uses a single range, so it only tests the split of ranges in
-// divideAndSendParallelCommit. See TestMultiRangeWithEndTransaction for a test
-// that verifies proper behavior of batches containing EndTransaction requests
-// which span ranges.
+// divideAndSendParallelCommit. See TestMultiRangeWithEndTxn for a test that
+// verifies proper behavior of batches containing EndTxn requests which span
+// ranges.
 func TestParallelCommitSplitFromQueryIntents(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
@@ -2258,11 +2258,11 @@ func TestParallelCommitSplitFromQueryIntents(t *testing.T) {
 	put1 := roachpb.NewPut(keyA, roachpb.MakeValueFromString("val1"))
 	put2 := roachpb.NewPut(keyB, roachpb.MakeValueFromString("val2"))
 	qi := &roachpb.QueryIntentRequest{RequestHeader: roachpb.RequestHeader{Key: keyA}}
-	et := &roachpb.EndTransactionRequest{
+	et := &roachpb.EndTxnRequest{
 		RequestHeader: roachpb.RequestHeader{Key: keyA},
 		Commit:        true,
 	}
-	etPar := &roachpb.EndTransactionRequest{
+	etPar := &roachpb.EndTxnRequest{
 		RequestHeader:  roachpb.RequestHeader{Key: keyA},
 		Commit:         true,
 		InFlightWrites: []roachpb.SequencedWrite{{Key: keyA, Sequence: 1}, {Key: keyB, Sequence: 2}},
@@ -2276,33 +2276,33 @@ func TestParallelCommitSplitFromQueryIntents(t *testing.T) {
 		{
 			name: "no parallel commits or query intents",
 			reqs: []roachpb.Request{put1, put2, et},
-			exp:  [][]roachpb.Method{{roachpb.Put, roachpb.Put, roachpb.EndTransaction}},
+			exp:  [][]roachpb.Method{{roachpb.Put, roachpb.Put, roachpb.EndTxn}},
 		},
 		{
 			name: "no parallel commits, but regular and pre-commit query intents",
 			reqs: []roachpb.Request{qi, put1, put2, qi, et},
 			exp: [][]roachpb.Method{
-				{roachpb.QueryIntent, roachpb.Put, roachpb.Put, roachpb.QueryIntent, roachpb.EndTransaction},
+				{roachpb.QueryIntent, roachpb.Put, roachpb.Put, roachpb.QueryIntent, roachpb.EndTxn},
 			},
 		},
 		{
 			name: "parallel commits without query intents",
 			reqs: []roachpb.Request{put1, put2, etPar},
-			exp:  [][]roachpb.Method{{roachpb.Put, roachpb.Put, roachpb.EndTransaction}},
+			exp:  [][]roachpb.Method{{roachpb.Put, roachpb.Put, roachpb.EndTxn}},
 		},
 		{
 			name: "parallel commits with pre-commit query intents",
 			reqs: []roachpb.Request{put1, put2, qi, qi, etPar},
 			exp: [][]roachpb.Method{
 				{roachpb.QueryIntent, roachpb.QueryIntent},
-				{roachpb.Put, roachpb.Put, roachpb.EndTransaction},
+				{roachpb.Put, roachpb.Put, roachpb.EndTxn},
 			},
 		},
 		{
 			name: "parallel commits with regular query intents",
 			reqs: []roachpb.Request{qi, put1, qi, put2, etPar},
 			exp: [][]roachpb.Method{
-				{roachpb.QueryIntent, roachpb.Put, roachpb.QueryIntent, roachpb.Put, roachpb.EndTransaction},
+				{roachpb.QueryIntent, roachpb.Put, roachpb.QueryIntent, roachpb.Put, roachpb.EndTxn},
 			},
 		},
 		{
@@ -2310,7 +2310,7 @@ func TestParallelCommitSplitFromQueryIntents(t *testing.T) {
 			reqs: []roachpb.Request{qi, put1, put2, qi, qi, qi, etPar},
 			exp: [][]roachpb.Method{
 				{roachpb.QueryIntent, roachpb.QueryIntent, roachpb.QueryIntent},
-				{roachpb.QueryIntent, roachpb.Put, roachpb.Put, roachpb.EndTransaction},
+				{roachpb.QueryIntent, roachpb.Put, roachpb.Put, roachpb.EndTxn},
 			},
 		},
 	}
@@ -2439,7 +2439,7 @@ func TestParallelCommitsDetectIntentMissingCause(t *testing.T) {
 						respTxn.Status = status
 						br.Responses[0].GetQueryTxn().QueriedTxn = respTxn
 					}
-				case roachpb.EndTransaction:
+				case roachpb.EndTxn:
 					br.Txn = ba.Txn.Clone()
 					br.Txn.Status = roachpb.STAGING
 				}
@@ -2465,7 +2465,7 @@ func TestParallelCommitsDetectIntentMissingCause(t *testing.T) {
 				Txn:            txn.TxnMeta,
 				ErrorIfMissing: true,
 			})
-			ba.Add(&roachpb.EndTransactionRequest{
+			ba.Add(&roachpb.EndTxnRequest{
 				RequestHeader:  roachpb.RequestHeader{Key: key},
 				Commit:         true,
 				InFlightWrites: []roachpb.SequencedWrite{{Key: key, Sequence: 1}},
@@ -2702,7 +2702,7 @@ func TestMultipleErrorsMerged(t *testing.T) {
 		{
 			err1:   retryErr,
 			err2:   nil,
-			expErr: "TransactionRetryError: retry txn (RETRY_SERIALIZABLE)",
+			expErr: "TransactionRetryError: retry txn (RETRY_SERIALIZABLE - test err)",
 		},
 		{
 			err1:   abortErr,
@@ -2717,7 +2717,7 @@ func TestMultipleErrorsMerged(t *testing.T) {
 		{
 			err1:   retryErr,
 			err2:   retryErr,
-			expErr: "TransactionRetryError: retry txn (RETRY_SERIALIZABLE)",
+			expErr: "TransactionRetryError: retry txn (RETRY_SERIALIZABLE - test err)",
 		},
 		{
 			err1:   retryErr,
@@ -2737,7 +2737,7 @@ func TestMultipleErrorsMerged(t *testing.T) {
 		{
 			err1:   abortErr,
 			err2:   conditionFailedErr,
-			expErr: "unexpected value",
+			expErr: "TransactionAbortedError(ABORT_REASON_ABORTED_RECORD_FOUND)",
 		},
 		{
 			err1:   conditionFailedErr,

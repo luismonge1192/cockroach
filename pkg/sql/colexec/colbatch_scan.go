@@ -69,7 +69,9 @@ func (s *colBatchScan) Next(ctx context.Context) coldata.Batch {
 	if err != nil {
 		execerror.VectorizedInternalPanic(err)
 	}
-	bat.SetSelection(false)
+	if bat.Selection() != nil {
+		execerror.VectorizedInternalPanic("unexpectedly a selection vector is set on the batch coming from CFetcher")
+	}
 	return bat
 }
 
@@ -88,8 +90,8 @@ func (s *colBatchScan) DrainMeta(ctx context.Context) []execinfrapb.ProducerMeta
 			trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{Ranges: ranges})
 		}
 	}
-	if meta := execinfra.GetTxnCoordMeta(ctx, s.flowCtx.Txn); meta != nil {
-		trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{TxnCoordMeta: meta})
+	if tfs := execinfra.GetLeafTxnFinalState(ctx, s.flowCtx.Txn); tfs != nil {
+		trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{LeafTxnFinalState: tfs})
 	}
 	return trailingMeta
 }
@@ -125,7 +127,7 @@ func newColBatchScan(
 	fetcher := cFetcher{}
 	if _, _, err := initCRowFetcher(
 		allocator, &fetcher, &spec.Table, int(spec.IndexIdx), columnIdxMap, spec.Reverse,
-		neededColumns, spec.IsCheck, spec.Visibility,
+		neededColumns, spec.IsCheck, spec.Visibility, spec.LockingStrength,
 	); err != nil {
 		return nil, err
 	}
@@ -155,6 +157,7 @@ func initCRowFetcher(
 	valNeededForCol util.FastIntSet,
 	isCheck bool,
 	scanVisibility execinfrapb.ScanVisibility,
+	lockStr sqlbase.ScanLockingStrength,
 ) (index *sqlbase.IndexDescriptor, isSecondaryIndex bool, err error) {
 	immutDesc := sqlbase.NewImmutableTableDescriptor(*desc)
 	index, isSecondaryIndex, err = immutDesc.FindIndexByIndexIdx(indexIdx)
@@ -175,7 +178,7 @@ func initCRowFetcher(
 		ValNeededForCol:  valNeededForCol,
 	}
 	if err := fetcher.Init(
-		allocator, reverseScan, true /* returnRangeInfo */, isCheck, tableArgs,
+		allocator, reverseScan, lockStr, true /* returnRangeInfo */, isCheck, tableArgs,
 	); err != nil {
 		return nil, false, err
 	}

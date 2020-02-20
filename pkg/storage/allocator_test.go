@@ -23,7 +23,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -51,22 +51,22 @@ import (
 
 const firstRangeID = roachpb.RangeID(1)
 
-var simpleZoneConfig = config.ZoneConfig{
+var simpleZoneConfig = zonepb.ZoneConfig{
 	NumReplicas: proto.Int32(1),
-	Constraints: []config.Constraints{
+	Constraints: []zonepb.Constraints{
 		{
-			Constraints: []config.Constraint{
-				{Value: "a", Type: config.Constraint_REQUIRED},
-				{Value: "ssd", Type: config.Constraint_REQUIRED},
+			Constraints: []zonepb.Constraint{
+				{Value: "a", Type: zonepb.Constraint_REQUIRED},
+				{Value: "ssd", Type: zonepb.Constraint_REQUIRED},
 			},
 		},
 	},
 }
 
-var multiDCConfig = config.ZoneConfig{
+var multiDCConfig = zonepb.ZoneConfig{
 	NumReplicas: proto.Int32(2),
-	Constraints: []config.Constraints{
-		{Constraints: []config.Constraint{{Value: "ssd", Type: config.Constraint_REQUIRED}}},
+	Constraints: []zonepb.Constraints{
+		{Constraints: []zonepb.Constraint{{Value: "ssd", Type: zonepb.Constraint_REQUIRED}}},
 	},
 }
 
@@ -482,13 +482,13 @@ func TestAllocatorExistingReplica(t *testing.T) {
 	gossiputil.NewStoreGossiper(g).GossipStores(sameDCStores, t)
 	result, _, err := a.AllocateTarget(
 		context.Background(),
-		&config.ZoneConfig{
+		&zonepb.ZoneConfig{
 			NumReplicas: proto.Int32(0),
-			Constraints: []config.Constraints{
+			Constraints: []zonepb.Constraints{
 				{
-					Constraints: []config.Constraint{
-						{Value: "a", Type: config.Constraint_REQUIRED},
-						{Value: "hdd", Type: config.Constraint_REQUIRED},
+					Constraints: []zonepb.Constraint{
+						{Value: "a", Type: zonepb.Constraint_REQUIRED},
+						{Value: "hdd", Type: zonepb.Constraint_REQUIRED},
 					},
 				},
 			},
@@ -595,7 +595,7 @@ func TestAllocatorMultipleStoresPerNode(t *testing.T) {
 		{
 			result, _, err := a.AllocateTarget(
 				context.Background(),
-				config.EmptyCompleteZoneConfig(),
+				zonepb.EmptyCompleteZoneConfig(),
 				firstRangeID,
 				tc.existing,
 			)
@@ -609,7 +609,7 @@ func TestAllocatorMultipleStoresPerNode(t *testing.T) {
 			var rangeUsageInfo RangeUsageInfo
 			target, _, details, ok := a.RebalanceTarget(
 				context.Background(),
-				config.EmptyCompleteZoneConfig(),
+				zonepb.EmptyCompleteZoneConfig(),
 				nil, /* raftStatus */
 				firstRangeID,
 				tc.existing,
@@ -683,7 +683,7 @@ func TestAllocatorRebalance(t *testing.T) {
 		var rangeUsageInfo RangeUsageInfo
 		target, _, _, ok := a.RebalanceTarget(
 			ctx,
-			config.EmptyCompleteZoneConfig(),
+			zonepb.EmptyCompleteZoneConfig(),
 			nil,
 			firstRangeID,
 			[]roachpb.ReplicaDescriptor{{NodeID: 3, StoreID: 3}},
@@ -834,7 +834,7 @@ func TestAllocatorRebalanceTarget(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		result, _, details, ok := a.RebalanceTarget(
 			context.Background(),
-			config.EmptyCompleteZoneConfig(),
+			zonepb.EmptyCompleteZoneConfig(),
 			status,
 			firstRangeID,
 			replicas,
@@ -855,7 +855,7 @@ func TestAllocatorRebalanceTarget(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		target, _, details, ok := a.RebalanceTarget(
 			context.Background(),
-			config.EmptyCompleteZoneConfig(),
+			zonepb.EmptyCompleteZoneConfig(),
 			status,
 			firstRangeID,
 			replicas,
@@ -873,7 +873,7 @@ func TestAllocatorRebalanceTarget(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		target, origin, details, ok := a.RebalanceTarget(
 			context.Background(),
-			config.EmptyCompleteZoneConfig(),
+			zonepb.EmptyCompleteZoneConfig(),
 			status,
 			firstRangeID,
 			replicas,
@@ -881,8 +881,8 @@ func TestAllocatorRebalanceTarget(t *testing.T) {
 			storeFilterThrottled,
 		)
 		expTo := stores[1].StoreID
-		expFrom := map[roachpb.StoreID]bool{stores[3].StoreID: true, stores[4].StoreID: true}
-		if !ok || target.StoreID != expTo || !expFrom[origin.StoreID] {
+		expFrom := stores[0].StoreID
+		if !ok || target.StoreID != expTo || origin.StoreID != expFrom {
 			t.Fatalf("%d: expected rebalance from either of %v to s%d, but got %v->%v; details: %s",
 				i, expFrom, expTo, origin, target, details)
 		}
@@ -953,7 +953,7 @@ func TestAllocatorRebalanceDeadNodes(t *testing.T) {
 			var rangeUsageInfo RangeUsageInfo
 			target, _, _, ok := a.RebalanceTarget(
 				ctx,
-				config.EmptyCompleteZoneConfig(),
+				zonepb.EmptyCompleteZoneConfig(),
 				nil,
 				firstRangeID,
 				c.existing,
@@ -1148,7 +1148,7 @@ func TestAllocatorRebalanceByCount(t *testing.T) {
 		var rangeUsageInfo RangeUsageInfo
 		result, _, _, ok := a.RebalanceTarget(
 			ctx,
-			config.EmptyCompleteZoneConfig(),
+			zonepb.EmptyCompleteZoneConfig(),
 			nil,
 			firstRangeID,
 			[]roachpb.ReplicaDescriptor{{StoreID: stores[0].StoreID}},
@@ -1221,7 +1221,7 @@ func TestAllocatorTransferLeaseTarget(t *testing.T) {
 		t.Run("", func(t *testing.T) {
 			target := a.TransferLeaseTarget(
 				context.Background(),
-				config.EmptyCompleteZoneConfig(),
+				zonepb.EmptyCompleteZoneConfig(),
 				c.existing,
 				c.leaseholder,
 				0,
@@ -1297,7 +1297,7 @@ func TestAllocatorTransferLeaseTargetDraining(t *testing.T) {
 		t.Run("", func(t *testing.T) {
 			target := a.TransferLeaseTarget(
 				context.Background(),
-				config.EmptyCompleteZoneConfig(),
+				zonepb.EmptyCompleteZoneConfig(),
 				c.existing,
 				c.leaseholder,
 				0,
@@ -1432,7 +1432,7 @@ func TestAllocatorRebalanceDifferentLocalitySizes(t *testing.T) {
 		var rangeUsageInfo RangeUsageInfo
 		result, _, details, ok := a.RebalanceTarget(
 			ctx,
-			config.EmptyCompleteZoneConfig(),
+			zonepb.EmptyCompleteZoneConfig(),
 			nil, /* raftStatus */
 			firstRangeID,
 			tc.existing,
@@ -1503,7 +1503,7 @@ func TestAllocatorRebalanceDifferentLocalitySizes(t *testing.T) {
 		var rangeUsageInfo RangeUsageInfo
 		result, _, details, ok := a.RebalanceTarget(
 			ctx,
-			config.EmptyCompleteZoneConfig(),
+			zonepb.EmptyCompleteZoneConfig(),
 			nil, /* raftStatus */
 			firstRangeID,
 			tc.existing,
@@ -1569,7 +1569,7 @@ func TestAllocatorTransferLeaseTargetMultiStore(t *testing.T) {
 		t.Run("", func(t *testing.T) {
 			target := a.TransferLeaseTarget(
 				context.Background(),
-				config.EmptyCompleteZoneConfig(),
+				zonepb.EmptyCompleteZoneConfig(),
 				existing,
 				c.leaseholder,
 				0,
@@ -1626,7 +1626,7 @@ func TestAllocatorShouldTransferLease(t *testing.T) {
 		t.Run("", func(t *testing.T) {
 			result := a.ShouldTransferLease(
 				context.Background(),
-				config.EmptyCompleteZoneConfig(),
+				zonepb.EmptyCompleteZoneConfig(),
 				c.existing,
 				c.leaseholder,
 				0,
@@ -1688,7 +1688,7 @@ func TestAllocatorShouldTransferLeaseDraining(t *testing.T) {
 		t.Run("", func(t *testing.T) {
 			result := a.ShouldTransferLease(
 				context.Background(),
-				config.EmptyCompleteZoneConfig(),
+				zonepb.EmptyCompleteZoneConfig(),
 				c.existing,
 				c.leaseholder,
 				0,
@@ -1728,39 +1728,39 @@ func TestAllocatorLeasePreferences(t *testing.T) {
 	sg := gossiputil.NewStoreGossiper(g)
 	sg.GossipStores(stores, t)
 
-	preferDC1 := []config.LeasePreference{
-		{Constraints: []config.Constraint{{Key: "dc", Value: "1", Type: config.Constraint_REQUIRED}}},
+	preferDC1 := []zonepb.LeasePreference{
+		{Constraints: []zonepb.Constraint{{Key: "dc", Value: "1", Type: zonepb.Constraint_REQUIRED}}},
 	}
-	preferDC4Then3Then2 := []config.LeasePreference{
-		{Constraints: []config.Constraint{{Key: "dc", Value: "4", Type: config.Constraint_REQUIRED}}},
-		{Constraints: []config.Constraint{{Key: "dc", Value: "3", Type: config.Constraint_REQUIRED}}},
-		{Constraints: []config.Constraint{{Key: "dc", Value: "2", Type: config.Constraint_REQUIRED}}},
+	preferDC4Then3Then2 := []zonepb.LeasePreference{
+		{Constraints: []zonepb.Constraint{{Key: "dc", Value: "4", Type: zonepb.Constraint_REQUIRED}}},
+		{Constraints: []zonepb.Constraint{{Key: "dc", Value: "3", Type: zonepb.Constraint_REQUIRED}}},
+		{Constraints: []zonepb.Constraint{{Key: "dc", Value: "2", Type: zonepb.Constraint_REQUIRED}}},
 	}
-	preferN2ThenS3 := []config.LeasePreference{
-		{Constraints: []config.Constraint{{Value: "n2", Type: config.Constraint_REQUIRED}}},
-		{Constraints: []config.Constraint{{Value: "s3", Type: config.Constraint_REQUIRED}}},
+	preferN2ThenS3 := []zonepb.LeasePreference{
+		{Constraints: []zonepb.Constraint{{Value: "n2", Type: zonepb.Constraint_REQUIRED}}},
+		{Constraints: []zonepb.Constraint{{Value: "s3", Type: zonepb.Constraint_REQUIRED}}},
 	}
-	preferNotS1ThenNotN2 := []config.LeasePreference{
-		{Constraints: []config.Constraint{{Value: "s1", Type: config.Constraint_PROHIBITED}}},
-		{Constraints: []config.Constraint{{Value: "n2", Type: config.Constraint_PROHIBITED}}},
+	preferNotS1ThenNotN2 := []zonepb.LeasePreference{
+		{Constraints: []zonepb.Constraint{{Value: "s1", Type: zonepb.Constraint_PROHIBITED}}},
+		{Constraints: []zonepb.Constraint{{Value: "n2", Type: zonepb.Constraint_PROHIBITED}}},
 	}
-	preferNotS1AndNotN2 := []config.LeasePreference{
+	preferNotS1AndNotN2 := []zonepb.LeasePreference{
 		{
-			Constraints: []config.Constraint{
-				{Value: "s1", Type: config.Constraint_PROHIBITED},
-				{Value: "n2", Type: config.Constraint_PROHIBITED},
+			Constraints: []zonepb.Constraint{
+				{Value: "s1", Type: zonepb.Constraint_PROHIBITED},
+				{Value: "n2", Type: zonepb.Constraint_PROHIBITED},
 			},
 		},
 	}
-	preferMatchesNothing := []config.LeasePreference{
-		{Constraints: []config.Constraint{{Key: "dc", Value: "5", Type: config.Constraint_REQUIRED}}},
-		{Constraints: []config.Constraint{{Value: "n6", Type: config.Constraint_REQUIRED}}},
+	preferMatchesNothing := []zonepb.LeasePreference{
+		{Constraints: []zonepb.Constraint{{Key: "dc", Value: "5", Type: zonepb.Constraint_REQUIRED}}},
+		{Constraints: []zonepb.Constraint{{Value: "n6", Type: zonepb.Constraint_REQUIRED}}},
 	}
 
 	testCases := []struct {
 		leaseholder        roachpb.StoreID
 		existing           []roachpb.ReplicaDescriptor
-		preferences        []config.LeasePreference
+		preferences        []zonepb.LeasePreference
 		expectedCheckTrue  roachpb.StoreID /* checkTransferLeaseSource = true */
 		expectedCheckFalse roachpb.StoreID /* checkTransferLeaseSource = false */
 	}{
@@ -1815,7 +1815,7 @@ func TestAllocatorLeasePreferences(t *testing.T) {
 
 	for _, c := range testCases {
 		t.Run("", func(t *testing.T) {
-			zone := &config.ZoneConfig{NumReplicas: proto.Int32(0), LeasePreferences: c.preferences}
+			zone := &zonepb.ZoneConfig{NumReplicas: proto.Int32(0), LeasePreferences: c.preferences}
 			result := a.ShouldTransferLease(
 				context.Background(),
 				zone,
@@ -1896,17 +1896,17 @@ func TestAllocatorLeasePreferencesMultipleStoresPerLocality(t *testing.T) {
 	sg := gossiputil.NewStoreGossiper(g)
 	sg.GossipStores(stores, t)
 
-	preferEast := []config.LeasePreference{
-		{Constraints: []config.Constraint{{Key: "region", Value: "us-east1", Type: config.Constraint_REQUIRED}}},
+	preferEast := []zonepb.LeasePreference{
+		{Constraints: []zonepb.Constraint{{Key: "region", Value: "us-east1", Type: zonepb.Constraint_REQUIRED}}},
 	}
-	preferNotEast := []config.LeasePreference{
-		{Constraints: []config.Constraint{{Key: "region", Value: "us-east1", Type: config.Constraint_PROHIBITED}}},
+	preferNotEast := []zonepb.LeasePreference{
+		{Constraints: []zonepb.Constraint{{Key: "region", Value: "us-east1", Type: zonepb.Constraint_PROHIBITED}}},
 	}
 
 	testCases := []struct {
 		leaseholder        roachpb.StoreID
 		existing           []roachpb.ReplicaDescriptor
-		preferences        []config.LeasePreference
+		preferences        []zonepb.LeasePreference
 		expectedCheckTrue  roachpb.StoreID /* checkTransferLeaseSource = true */
 		expectedCheckFalse roachpb.StoreID /* checkTransferLeaseSource = false */
 	}{
@@ -1924,7 +1924,7 @@ func TestAllocatorLeasePreferencesMultipleStoresPerLocality(t *testing.T) {
 
 	for _, c := range testCases {
 		t.Run("", func(t *testing.T) {
-			zone := &config.ZoneConfig{NumReplicas: proto.Int32(0), LeasePreferences: c.preferences}
+			zone := &zonepb.ZoneConfig{NumReplicas: proto.Int32(0), LeasePreferences: c.preferences}
 			target := a.TransferLeaseTarget(
 				context.Background(),
 				zone,
@@ -2006,7 +2006,7 @@ func TestAllocatorRemoveTargetLocality(t *testing.T) {
 		}
 		targetRepl, details, err := a.RemoveTarget(
 			context.Background(),
-			config.EmptyCompleteZoneConfig(),
+			zonepb.EmptyCompleteZoneConfig(),
 			existingRepls,
 			existingRepls,
 		)
@@ -2089,7 +2089,7 @@ func TestAllocatorAllocateTargetLocality(t *testing.T) {
 		}
 		targetStore, details, err := a.AllocateTarget(
 			context.Background(),
-			config.EmptyCompleteZoneConfig(),
+			zonepb.EmptyCompleteZoneConfig(),
 			firstRangeID,
 			existingRepls,
 		)
@@ -2211,7 +2211,7 @@ func TestAllocatorRebalanceTargetLocality(t *testing.T) {
 		var rangeUsageInfo RangeUsageInfo
 		target, _, details, ok := a.RebalanceTarget(
 			context.Background(),
-			config.EmptyCompleteZoneConfig(),
+			zonepb.EmptyCompleteZoneConfig(),
 			nil,
 			firstRangeID,
 			existingRepls,
@@ -2236,114 +2236,114 @@ func TestAllocatorRebalanceTargetLocality(t *testing.T) {
 }
 
 var (
-	threeSpecificLocalities = []config.Constraints{
+	threeSpecificLocalities = []zonepb.Constraints{
 		{
-			Constraints: []config.Constraint{
-				{Key: "datacenter", Value: "a", Type: config.Constraint_REQUIRED},
+			Constraints: []zonepb.Constraint{
+				{Key: "datacenter", Value: "a", Type: zonepb.Constraint_REQUIRED},
 			},
 			NumReplicas: 1,
 		},
 		{
-			Constraints: []config.Constraint{
-				{Key: "datacenter", Value: "b", Type: config.Constraint_REQUIRED},
+			Constraints: []zonepb.Constraint{
+				{Key: "datacenter", Value: "b", Type: zonepb.Constraint_REQUIRED},
 			},
 			NumReplicas: 1,
 		},
 		{
-			Constraints: []config.Constraint{
-				{Key: "datacenter", Value: "c", Type: config.Constraint_REQUIRED},
+			Constraints: []zonepb.Constraint{
+				{Key: "datacenter", Value: "c", Type: zonepb.Constraint_REQUIRED},
 			},
 			NumReplicas: 1,
 		},
 	}
 
-	twoAndOneLocalities = []config.Constraints{
+	twoAndOneLocalities = []zonepb.Constraints{
 		{
-			Constraints: []config.Constraint{
-				{Key: "datacenter", Value: "a", Type: config.Constraint_REQUIRED},
+			Constraints: []zonepb.Constraint{
+				{Key: "datacenter", Value: "a", Type: zonepb.Constraint_REQUIRED},
 			},
 			NumReplicas: 2,
 		},
 		{
-			Constraints: []config.Constraint{
-				{Key: "datacenter", Value: "b", Type: config.Constraint_REQUIRED},
+			Constraints: []zonepb.Constraint{
+				{Key: "datacenter", Value: "b", Type: zonepb.Constraint_REQUIRED},
 			},
 			NumReplicas: 1,
 		},
 	}
 
-	threeInOneLocality = []config.Constraints{
+	threeInOneLocality = []zonepb.Constraints{
 		{
-			Constraints: []config.Constraint{
-				{Key: "datacenter", Value: "a", Type: config.Constraint_REQUIRED},
+			Constraints: []zonepb.Constraint{
+				{Key: "datacenter", Value: "a", Type: zonepb.Constraint_REQUIRED},
 			},
 			NumReplicas: 3,
 		},
 	}
 
-	twoAndOneNodeAttrs = []config.Constraints{
+	twoAndOneNodeAttrs = []zonepb.Constraints{
 		{
-			Constraints: []config.Constraint{
-				{Value: "ssd", Type: config.Constraint_REQUIRED},
+			Constraints: []zonepb.Constraint{
+				{Value: "ssd", Type: zonepb.Constraint_REQUIRED},
 			},
 			NumReplicas: 2,
 		},
 		{
-			Constraints: []config.Constraint{
-				{Value: "hdd", Type: config.Constraint_REQUIRED},
+			Constraints: []zonepb.Constraint{
+				{Value: "hdd", Type: zonepb.Constraint_REQUIRED},
 			},
 			NumReplicas: 1,
 		},
 	}
 
-	twoAndOneStoreAttrs = []config.Constraints{
+	twoAndOneStoreAttrs = []zonepb.Constraints{
 		{
-			Constraints: []config.Constraint{
-				{Value: "odd", Type: config.Constraint_REQUIRED},
+			Constraints: []zonepb.Constraint{
+				{Value: "odd", Type: zonepb.Constraint_REQUIRED},
 			},
 			NumReplicas: 2,
 		},
 		{
-			Constraints: []config.Constraint{
-				{Value: "even", Type: config.Constraint_REQUIRED},
+			Constraints: []zonepb.Constraint{
+				{Value: "even", Type: zonepb.Constraint_REQUIRED},
 			},
 			NumReplicas: 1,
 		},
 	}
 
-	mixLocalityAndAttrs = []config.Constraints{
+	mixLocalityAndAttrs = []zonepb.Constraints{
 		{
-			Constraints: []config.Constraint{
-				{Key: "datacenter", Value: "a", Type: config.Constraint_REQUIRED},
-				{Value: "ssd", Type: config.Constraint_REQUIRED},
+			Constraints: []zonepb.Constraint{
+				{Key: "datacenter", Value: "a", Type: zonepb.Constraint_REQUIRED},
+				{Value: "ssd", Type: zonepb.Constraint_REQUIRED},
 			},
 			NumReplicas: 1,
 		},
 		{
-			Constraints: []config.Constraint{
-				{Key: "datacenter", Value: "b", Type: config.Constraint_REQUIRED},
-				{Value: "odd", Type: config.Constraint_REQUIRED},
+			Constraints: []zonepb.Constraint{
+				{Key: "datacenter", Value: "b", Type: zonepb.Constraint_REQUIRED},
+				{Value: "odd", Type: zonepb.Constraint_REQUIRED},
 			},
 			NumReplicas: 1,
 		},
 		{
-			Constraints: []config.Constraint{
-				{Value: "even", Type: config.Constraint_REQUIRED},
+			Constraints: []zonepb.Constraint{
+				{Value: "even", Type: zonepb.Constraint_REQUIRED},
 			},
 			NumReplicas: 1,
 		},
 	}
 
-	twoSpecificLocalities = []config.Constraints{
+	twoSpecificLocalities = []zonepb.Constraints{
 		{
-			Constraints: []config.Constraint{
-				{Key: "datacenter", Value: "a", Type: config.Constraint_REQUIRED},
+			Constraints: []zonepb.Constraint{
+				{Key: "datacenter", Value: "a", Type: zonepb.Constraint_REQUIRED},
 			},
 			NumReplicas: 1,
 		},
 		{
-			Constraints: []config.Constraint{
-				{Key: "datacenter", Value: "b", Type: config.Constraint_REQUIRED},
+			Constraints: []zonepb.Constraint{
+				{Key: "datacenter", Value: "b", Type: zonepb.Constraint_REQUIRED},
 			},
 			NumReplicas: 1,
 		},
@@ -2363,7 +2363,7 @@ func TestAllocateCandidatesNumReplicasConstraints(t *testing.T) {
 	// stores from multiDiversityDCStores would be the best addition to the range
 	// purely on the basis of constraint satisfaction and locality diversity.
 	testCases := []struct {
-		constraints []config.Constraints
+		constraints []zonepb.Constraints
 		existing    []roachpb.StoreID
 		expected    []roachpb.StoreID
 	}{
@@ -2557,7 +2557,7 @@ func TestAllocateCandidatesNumReplicasConstraints(t *testing.T) {
 				StoreID: storeID,
 			}
 		}
-		zone := &config.ZoneConfig{NumReplicas: proto.Int32(0), Constraints: tc.constraints}
+		zone := &zonepb.ZoneConfig{NumReplicas: proto.Int32(0), Constraints: tc.constraints}
 		analyzed := constraint.AnalyzeConstraints(
 			context.Background(), a.storePool.getStoreDescriptor, existingRepls, zone)
 		candidates := allocateCandidates(
@@ -2601,7 +2601,7 @@ func TestRemoveCandidatesNumReplicasConstraints(t *testing.T) {
 	// stores would be best to remove if we had to remove one purely on the basis
 	// of constraint-matching and locality diversity.
 	testCases := []struct {
-		constraints []config.Constraints
+		constraints []zonepb.Constraints
 		existing    []roachpb.StoreID
 		expected    []roachpb.StoreID
 	}{
@@ -2780,7 +2780,7 @@ func TestRemoveCandidatesNumReplicasConstraints(t *testing.T) {
 				StoreID: storeID,
 			}
 		}
-		zone := &config.ZoneConfig{NumReplicas: proto.Int32(0), Constraints: tc.constraints}
+		zone := &zonepb.ZoneConfig{NumReplicas: proto.Int32(0), Constraints: tc.constraints}
 		analyzed := constraint.AnalyzeConstraints(
 			context.Background(), a.storePool.getStoreDescriptor, existingRepls, zone)
 		candidates := removeCandidates(
@@ -2828,7 +2828,7 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 		candidates []roachpb.StoreID
 	}
 	testCases := []struct {
-		constraints     []config.Constraints
+		constraints     []zonepb.Constraints
 		zoneNumReplicas int32
 		existing        []roachpb.StoreID
 		expected        []rebalanceStoreIDs
@@ -3571,7 +3571,7 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			}
 		}
 		var rangeUsageInfo RangeUsageInfo
-		zone := &config.ZoneConfig{
+		zone := &zonepb.ZoneConfig{
 			Constraints: tc.constraints,
 			NumReplicas: proto.Int32(tc.zoneNumReplicas),
 		}
@@ -3782,7 +3782,7 @@ func TestAllocatorTransferLeaseTargetLoadBased(t *testing.T) {
 			})
 			target := a.TransferLeaseTarget(
 				context.Background(),
-				config.EmptyCompleteZoneConfig(),
+				zonepb.EmptyCompleteZoneConfig(),
 				existing,
 				c.leaseholder,
 				0,
@@ -3980,7 +3980,7 @@ func TestAllocatorRemoveTarget(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		targetRepl, _, err := a.RemoveTarget(
 			ctx,
-			config.EmptyCompleteZoneConfig(),
+			zonepb.EmptyCompleteZoneConfig(),
 			replicas,
 			replicas,
 		)
@@ -4000,15 +4000,15 @@ func TestAllocatorComputeAction(t *testing.T) {
 	// Each test case should describe a repair situation which has a lower
 	// priority than the previous test case.
 	testCases := []struct {
-		zone           config.ZoneConfig
+		zone           zonepb.ZoneConfig
 		desc           roachpb.RangeDescriptor
 		expectedAction AllocatorAction
 	}{
 		// Need three replicas, have three, one is on a dead store.
 		{
-			zone: config.ZoneConfig{
+			zone: zonepb.ZoneConfig{
 				NumReplicas:   proto.Int32(3),
-				Constraints:   []config.Constraints{{Constraints: []config.Constraint{{Value: "us-east", Type: config.Constraint_DEPRECATED_POSITIVE}}}},
+				Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
 				RangeMinBytes: proto.Int64(0),
 				RangeMaxBytes: proto.Int64(64000),
 			},
@@ -4035,9 +4035,9 @@ func TestAllocatorComputeAction(t *testing.T) {
 		},
 		// Need five replicas, one is on a dead store.
 		{
-			zone: config.ZoneConfig{
+			zone: zonepb.ZoneConfig{
 				NumReplicas:   proto.Int32(5),
-				Constraints:   []config.Constraints{{Constraints: []config.Constraint{{Value: "us-east", Type: config.Constraint_DEPRECATED_POSITIVE}}}},
+				Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
 				RangeMinBytes: proto.Int64(0),
 				RangeMaxBytes: proto.Int64(64000),
 			},
@@ -4074,9 +4074,9 @@ func TestAllocatorComputeAction(t *testing.T) {
 		},
 		// Need three replicas, have two.
 		{
-			zone: config.ZoneConfig{
+			zone: zonepb.ZoneConfig{
 				NumReplicas:   proto.Int32(3),
-				Constraints:   []config.Constraints{{Constraints: []config.Constraint{{Value: "us-east", Type: config.Constraint_DEPRECATED_POSITIVE}}}},
+				Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
 				RangeMinBytes: proto.Int64(0),
 				RangeMaxBytes: proto.Int64(64000),
 			},
@@ -4098,9 +4098,9 @@ func TestAllocatorComputeAction(t *testing.T) {
 		},
 		// Need five replicas, have four, one is on a dead store.
 		{
-			zone: config.ZoneConfig{
+			zone: zonepb.ZoneConfig{
 				NumReplicas:   proto.Int32(5),
-				Constraints:   []config.Constraints{{Constraints: []config.Constraint{{Value: "us-east", Type: config.Constraint_DEPRECATED_POSITIVE}}}},
+				Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
 				RangeMinBytes: proto.Int64(0),
 				RangeMaxBytes: proto.Int64(64000),
 			},
@@ -4132,9 +4132,9 @@ func TestAllocatorComputeAction(t *testing.T) {
 		},
 		// Need five replicas, have four.
 		{
-			zone: config.ZoneConfig{
+			zone: zonepb.ZoneConfig{
 				NumReplicas:   proto.Int32(5),
-				Constraints:   []config.Constraints{{Constraints: []config.Constraint{{Value: "us-east", Type: config.Constraint_DEPRECATED_POSITIVE}}}},
+				Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
 				RangeMinBytes: proto.Int64(0),
 				RangeMaxBytes: proto.Int64(64000),
 			},
@@ -4166,9 +4166,9 @@ func TestAllocatorComputeAction(t *testing.T) {
 		},
 		// Need three replicas, have four, one is on a dead store.
 		{
-			zone: config.ZoneConfig{
+			zone: zonepb.ZoneConfig{
 				NumReplicas:   proto.Int32(3),
-				Constraints:   []config.Constraints{{Constraints: []config.Constraint{{Value: "us-east", Type: config.Constraint_DEPRECATED_POSITIVE}}}},
+				Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
 				RangeMinBytes: proto.Int64(0),
 				RangeMaxBytes: proto.Int64(64000),
 			},
@@ -4200,9 +4200,9 @@ func TestAllocatorComputeAction(t *testing.T) {
 		},
 		// Need five replicas, have six, one is on a dead store.
 		{
-			zone: config.ZoneConfig{
+			zone: zonepb.ZoneConfig{
 				NumReplicas:   proto.Int32(5),
-				Constraints:   []config.Constraints{{Constraints: []config.Constraint{{Value: "us-east", Type: config.Constraint_DEPRECATED_POSITIVE}}}},
+				Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
 				RangeMinBytes: proto.Int64(0),
 				RangeMaxBytes: proto.Int64(64000),
 			},
@@ -4244,9 +4244,9 @@ func TestAllocatorComputeAction(t *testing.T) {
 		},
 		// Need three replicas, have five, one is on a dead store.
 		{
-			zone: config.ZoneConfig{
+			zone: zonepb.ZoneConfig{
 				NumReplicas:   proto.Int32(3),
-				Constraints:   []config.Constraints{{Constraints: []config.Constraint{{Value: "us-east", Type: config.Constraint_DEPRECATED_POSITIVE}}}},
+				Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
 				RangeMinBytes: proto.Int64(0),
 				RangeMaxBytes: proto.Int64(64000),
 			},
@@ -4283,9 +4283,9 @@ func TestAllocatorComputeAction(t *testing.T) {
 		},
 		// Need three replicas, have four.
 		{
-			zone: config.ZoneConfig{
+			zone: zonepb.ZoneConfig{
 				NumReplicas:   proto.Int32(3),
-				Constraints:   []config.Constraints{{Constraints: []config.Constraint{{Value: "us-east", Type: config.Constraint_DEPRECATED_POSITIVE}}}},
+				Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
 				RangeMinBytes: proto.Int64(0),
 				RangeMaxBytes: proto.Int64(64000),
 			},
@@ -4317,9 +4317,9 @@ func TestAllocatorComputeAction(t *testing.T) {
 		},
 		// Need three replicas, have five.
 		{
-			zone: config.ZoneConfig{
+			zone: zonepb.ZoneConfig{
 				NumReplicas:   proto.Int32(3),
-				Constraints:   []config.Constraints{{Constraints: []config.Constraint{{Value: "us-east", Type: config.Constraint_DEPRECATED_POSITIVE}}}},
+				Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
 				RangeMinBytes: proto.Int64(0),
 				RangeMaxBytes: proto.Int64(64000),
 			},
@@ -4358,9 +4358,9 @@ func TestAllocatorComputeAction(t *testing.T) {
 		// be a noop because there aren't enough live replicas for
 		// a quorum.
 		{
-			zone: config.ZoneConfig{
+			zone: zonepb.ZoneConfig{
 				NumReplicas:   proto.Int32(3),
-				Constraints:   []config.Constraints{{Constraints: []config.Constraint{{Value: "us-east", Type: config.Constraint_DEPRECATED_POSITIVE}}}},
+				Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
 				RangeMinBytes: proto.Int64(0),
 				RangeMaxBytes: proto.Int64(64000),
 			},
@@ -4387,9 +4387,9 @@ func TestAllocatorComputeAction(t *testing.T) {
 		},
 		// Need three replicas, have three, none of the replicas in the store pool.
 		{
-			zone: config.ZoneConfig{
+			zone: zonepb.ZoneConfig{
 				NumReplicas:   proto.Int32(3),
-				Constraints:   []config.Constraints{{Constraints: []config.Constraint{{Value: "us-east", Type: config.Constraint_DEPRECATED_POSITIVE}}}},
+				Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
 				RangeMinBytes: proto.Int64(0),
 				RangeMaxBytes: proto.Int64(64000),
 			},
@@ -4416,9 +4416,9 @@ func TestAllocatorComputeAction(t *testing.T) {
 		},
 		// Need three replicas, have three.
 		{
-			zone: config.ZoneConfig{
+			zone: zonepb.ZoneConfig{
 				NumReplicas:   proto.Int32(3),
-				Constraints:   []config.Constraints{{Constraints: []config.Constraint{{Value: "us-east", Type: config.Constraint_DEPRECATED_POSITIVE}}}},
+				Constraints:   []zonepb.Constraints{{Constraints: []zonepb.Constraint{{Value: "us-east", Type: zonepb.Constraint_DEPRECATED_POSITIVE}}}},
 				RangeMinBytes: proto.Int64(0),
 				RangeMaxBytes: proto.Int64(64000),
 			},
@@ -4477,7 +4477,7 @@ func TestAllocatorComputeAction(t *testing.T) {
 func TestAllocatorComputeActionRemoveDead(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	zone := config.ZoneConfig{
+	zone := zonepb.ZoneConfig{
 		NumReplicas: proto.Int32(3),
 	}
 	threeReplDesc := roachpb.RangeDescriptor{
@@ -4570,7 +4570,7 @@ func TestAllocatorComputeActionDecommission(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	testCases := []struct {
-		zone            config.ZoneConfig
+		zone            zonepb.ZoneConfig
 		desc            roachpb.RangeDescriptor
 		expectedAction  AllocatorAction
 		live            []roachpb.StoreID
@@ -4582,7 +4582,7 @@ func TestAllocatorComputeActionDecommission(t *testing.T) {
 		// replace it (nor add a new replica) since there isn't a live target,
 		// but that's still the action being emitted.
 		{
-			zone: config.ZoneConfig{
+			zone: zonepb.ZoneConfig{
 				NumReplicas: proto.Int32(3),
 			},
 			desc: roachpb.RangeDescriptor{
@@ -4612,7 +4612,7 @@ func TestAllocatorComputeActionDecommission(t *testing.T) {
 		// Has three replicas, one is in decommissioning status, and one is on a
 		// dead node. Replacing the dead replica is more important.
 		{
-			zone: config.ZoneConfig{
+			zone: zonepb.ZoneConfig{
 				NumReplicas: proto.Int32(3),
 			},
 			desc: roachpb.RangeDescriptor{
@@ -4642,7 +4642,7 @@ func TestAllocatorComputeActionDecommission(t *testing.T) {
 		// Needs three replicas, has four, where one is decommissioning and one is
 		// dead.
 		{
-			zone: config.ZoneConfig{
+			zone: zonepb.ZoneConfig{
 				NumReplicas: proto.Int32(3),
 			},
 			desc: roachpb.RangeDescriptor{
@@ -4677,7 +4677,7 @@ func TestAllocatorComputeActionDecommission(t *testing.T) {
 		// Needs three replicas, has four, where one is decommissioning and one is
 		// decommissioned.
 		{
-			zone: config.ZoneConfig{
+			zone: zonepb.ZoneConfig{
 				NumReplicas: proto.Int32(3),
 			},
 			desc: roachpb.RangeDescriptor{
@@ -4712,7 +4712,7 @@ func TestAllocatorComputeActionDecommission(t *testing.T) {
 		},
 		// Needs three replicas, has three, all decommissioning
 		{
-			zone: config.ZoneConfig{
+			zone: zonepb.ZoneConfig{
 				NumReplicas: proto.Int32(3),
 			},
 			desc: roachpb.RangeDescriptor{
@@ -4741,7 +4741,7 @@ func TestAllocatorComputeActionDecommission(t *testing.T) {
 		},
 		// Needs 3. Has 1 live, 3 decommissioning.
 		{
-			zone: config.ZoneConfig{
+			zone: zonepb.ZoneConfig{
 				NumReplicas: proto.Int32(3),
 			},
 			desc: roachpb.RangeDescriptor{
@@ -4792,7 +4792,7 @@ func TestAllocatorComputeActionDecommission(t *testing.T) {
 func TestAllocatorRemoveLearner(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	zone := config.ZoneConfig{
+	zone := zonepb.ZoneConfig{
 		NumReplicas: proto.Int32(3),
 	}
 	learnerType := roachpb.LEARNER
@@ -5006,7 +5006,7 @@ func TestAllocatorComputeActionDynamicNumReplicas(t *testing.T) {
 
 	ctx := context.Background()
 	defer stopper.Stop(ctx)
-	zone := &config.ZoneConfig{
+	zone := &zonepb.ZoneConfig{
 		NumReplicas: proto.Int32(5),
 	}
 
@@ -5108,7 +5108,7 @@ func TestAllocatorComputeActionNoStorePool(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	a := MakeAllocator(nil /* storePool */, nil /* rpcContext */)
-	action, priority := a.ComputeAction(context.Background(), &config.ZoneConfig{NumReplicas: proto.Int32(0)}, nil)
+	action, priority := a.ComputeAction(context.Background(), &zonepb.ZoneConfig{NumReplicas: proto.Int32(0)}, nil)
 	if action != AllocatorNoop {
 		t.Errorf("expected AllocatorNoop, but got %v", action)
 	}
@@ -5122,14 +5122,14 @@ func TestAllocatorComputeActionNoStorePool(t *testing.T) {
 func TestAllocatorError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	constraint := []config.Constraints{
-		{Constraints: []config.Constraint{{Value: "one", Type: config.Constraint_REQUIRED}}},
+	constraint := []zonepb.Constraints{
+		{Constraints: []zonepb.Constraint{{Value: "one", Type: zonepb.Constraint_REQUIRED}}},
 	}
-	constraints := []config.Constraints{
+	constraints := []zonepb.Constraints{
 		{
-			Constraints: []config.Constraint{
-				{Value: "one", Type: config.Constraint_REQUIRED},
-				{Value: "two", Type: config.Constraint_REQUIRED},
+			Constraints: []zonepb.Constraint{
+				{Value: "one", Type: zonepb.Constraint_REQUIRED},
+				{Value: "two", Type: zonepb.Constraint_REQUIRED},
 			},
 		},
 	}
@@ -5223,6 +5223,7 @@ func TestAllocatorThrottled(t *testing.T) {
 
 func TestFilterBehindReplicas(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
 
 	testCases := []struct {
 		commit   uint64
@@ -5277,7 +5278,7 @@ func TestFilterBehindReplicas(t *testing.T) {
 					StoreID:   roachpb.StoreID(v),
 				})
 			}
-			candidates := filterBehindReplicas(status, replicas)
+			candidates := filterBehindReplicas(ctx, status, replicas)
 			var ids []uint64
 			for _, c := range candidates {
 				ids = append(ids, uint64(c.StoreID))
@@ -5291,6 +5292,7 @@ func TestFilterBehindReplicas(t *testing.T) {
 
 func TestFilterUnremovableReplicas(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
 
 	testCases := []struct {
 		commit            uint64
@@ -5348,7 +5350,7 @@ func TestFilterUnremovableReplicas(t *testing.T) {
 				})
 			}
 
-			candidates := filterUnremovableReplicas(status, replicas, c.brandNewReplicaID)
+			candidates := filterUnremovableReplicas(ctx, status, replicas, c.brandNewReplicaID)
 			var ids []uint64
 			for _, c := range candidates {
 				ids = append(ids, uint64(c.StoreID))
@@ -5362,6 +5364,7 @@ func TestFilterUnremovableReplicas(t *testing.T) {
 
 func TestSimulateFilterUnremovableReplicas(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
 
 	testCases := []struct {
 		commit            uint64
@@ -5403,7 +5406,7 @@ func TestSimulateFilterUnremovableReplicas(t *testing.T) {
 				})
 			}
 
-			candidates := simulateFilterUnremovableReplicas(status, replicas, c.brandNewReplicaID)
+			candidates := simulateFilterUnremovableReplicas(ctx, status, replicas, c.brandNewReplicaID)
 			var ids []uint64
 			for _, c := range candidates {
 				ids = append(ids, uint64(c.StoreID))
@@ -5472,43 +5475,43 @@ func TestAllocatorRebalanceAway(t *testing.T) {
 		{StoreID: stores[2].StoreID},
 	}
 	testCases := []struct {
-		constraint config.Constraint
+		constraint zonepb.Constraint
 		expected   *roachpb.StoreID
 	}{
 		{
-			constraint: config.Constraint{Key: "datacenter", Value: "us", Type: config.Constraint_REQUIRED},
+			constraint: zonepb.Constraint{Key: "datacenter", Value: "us", Type: zonepb.Constraint_REQUIRED},
 			expected:   &stores[3].StoreID,
 		},
 		{
-			constraint: config.Constraint{Key: "datacenter", Value: "eur", Type: config.Constraint_PROHIBITED},
+			constraint: zonepb.Constraint{Key: "datacenter", Value: "eur", Type: zonepb.Constraint_PROHIBITED},
 			expected:   &stores[3].StoreID,
 		},
 		{
-			constraint: config.Constraint{Key: "datacenter", Value: "eur", Type: config.Constraint_REQUIRED},
+			constraint: zonepb.Constraint{Key: "datacenter", Value: "eur", Type: zonepb.Constraint_REQUIRED},
 			expected:   &stores[4].StoreID,
 		},
 		{
-			constraint: config.Constraint{Key: "datacenter", Value: "us", Type: config.Constraint_PROHIBITED},
+			constraint: zonepb.Constraint{Key: "datacenter", Value: "us", Type: zonepb.Constraint_PROHIBITED},
 			expected:   &stores[4].StoreID,
 		},
 		{
-			constraint: config.Constraint{Key: "datacenter", Value: "other", Type: config.Constraint_REQUIRED},
+			constraint: zonepb.Constraint{Key: "datacenter", Value: "other", Type: zonepb.Constraint_REQUIRED},
 			expected:   nil,
 		},
 		{
-			constraint: config.Constraint{Key: "datacenter", Value: "other", Type: config.Constraint_PROHIBITED},
+			constraint: zonepb.Constraint{Key: "datacenter", Value: "other", Type: zonepb.Constraint_PROHIBITED},
 			expected:   nil,
 		},
 		{
-			constraint: config.Constraint{Key: "datacenter", Value: "other", Type: config.Constraint_DEPRECATED_POSITIVE},
+			constraint: zonepb.Constraint{Key: "datacenter", Value: "other", Type: zonepb.Constraint_DEPRECATED_POSITIVE},
 			expected:   nil,
 		},
 		{
-			constraint: config.Constraint{Key: "datacenter", Value: "us", Type: config.Constraint_DEPRECATED_POSITIVE},
+			constraint: zonepb.Constraint{Key: "datacenter", Value: "us", Type: zonepb.Constraint_DEPRECATED_POSITIVE},
 			expected:   nil,
 		},
 		{
-			constraint: config.Constraint{Key: "datacenter", Value: "eur", Type: config.Constraint_DEPRECATED_POSITIVE},
+			constraint: zonepb.Constraint{Key: "datacenter", Value: "eur", Type: zonepb.Constraint_DEPRECATED_POSITIVE},
 			expected:   nil,
 		},
 	}
@@ -5520,8 +5523,8 @@ func TestAllocatorRebalanceAway(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.constraint.String(), func(t *testing.T) {
-			constraints := config.Constraints{
-				Constraints: []config.Constraint{
+			constraints := zonepb.Constraints{
+				Constraints: []zonepb.Constraint{
 					tc.constraint,
 				},
 			}
@@ -5529,7 +5532,7 @@ func TestAllocatorRebalanceAway(t *testing.T) {
 			var rangeUsageInfo RangeUsageInfo
 			actual, _, _, ok := a.RebalanceTarget(
 				ctx,
-				&config.ZoneConfig{NumReplicas: proto.Int32(0), Constraints: []config.Constraints{constraints}},
+				&zonepb.ZoneConfig{NumReplicas: proto.Int32(0), Constraints: []zonepb.Constraints{constraints}},
 				nil,
 				firstRangeID,
 				existingReplicas,
@@ -5608,7 +5611,7 @@ func TestAllocatorFullDisks(t *testing.T) {
 		st,
 	)
 	server := rpc.NewServer(rpcContext) // never started
-	g := gossip.NewTest(1, rpcContext, server, stopper, metric.NewRegistry(), config.DefaultZoneConfigRef())
+	g := gossip.NewTest(1, rpcContext, server, stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 
 	TimeUntilStoreDead.Override(&st.SV, TestTimeUntilStoreDeadOff)
 
@@ -5695,7 +5698,7 @@ func TestAllocatorFullDisks(t *testing.T) {
 					var rangeUsageInfo RangeUsageInfo
 					target, _, details, ok := alloc.RebalanceTarget(
 						ctx,
-						config.EmptyCompleteZoneConfig(),
+						zonepb.EmptyCompleteZoneConfig(),
 						nil,
 						firstRangeID,
 						[]roachpb.ReplicaDescriptor{{NodeID: ts.Node.NodeID, StoreID: ts.StoreID}},
@@ -5751,7 +5754,7 @@ func Example_rebalancing() {
 		st,
 	)
 	server := rpc.NewServer(rpcContext) // never started
-	g := gossip.NewTest(1, rpcContext, server, stopper, metric.NewRegistry(), config.DefaultZoneConfigRef())
+	g := gossip.NewTest(1, rpcContext, server, stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 
 	TimeUntilStoreDead.Override(&st.SV, TestTimeUntilStoreDeadOff)
 
@@ -5824,7 +5827,7 @@ func Example_rebalancing() {
 			var rangeUsageInfo RangeUsageInfo
 			target, _, details, ok := alloc.RebalanceTarget(
 				context.Background(),
-				config.EmptyCompleteZoneConfig(),
+				zonepb.EmptyCompleteZoneConfig(),
 				nil,
 				firstRangeID,
 				[]roachpb.ReplicaDescriptor{{NodeID: ts.Node.NodeID, StoreID: ts.StoreID}},
@@ -5871,51 +5874,51 @@ func Example_rebalancing() {
 	// |   4 |   6 100% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |
 	// |   6 |   8 100% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |
 	// |   8 |  10 100% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |
-	// |  10 |  10  68% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   1  15% |   0   0% |   0   0% |   1  11% |   0   0% |   1   5% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |
-	// |  12 |  10  30% |   2   3% |   2   9% |   2   3% |   0   0% |   0   0% |   0   0% |   1   7% |   1   5% |   0   0% |   0   0% |   1   8% |   0   0% |   1  11% |   0   0% |   1   9% |   2   6% |   2   4% |   0   0% |   0   0% |
-	// |  14 |  10  15% |   2   0% |   2   6% |   3   2% |   2   2% |   4   8% |   2   3% |   4   7% |   2   4% |   2   0% |   2   5% |   3   7% |   3   4% |   2   7% |   2   4% |   2   6% |   2   0% |   2   1% |   2   2% |   2   7% |
-	// |  16 |  10   9% |   4   2% |   4   5% |   5   1% |   5   5% |   5   5% |   4   4% |   5   2% |   4   5% |   4   1% |   5   8% |   5   6% |   5   5% |   4   7% |   4   3% |   4   6% |   4   2% |   5   3% |   4   2% |   5   9% |
-	// |  18 |  10   5% |   6   3% |   6   4% |   7   3% |   7   5% |   7   5% |   6   3% |   7   2% |   7   7% |   7   3% |   7   6% |   7   6% |   7   6% |   6   6% |   6   3% |   6   5% |   6   3% |   7   3% |   6   3% |   7   8% |
-	// |  20 |  10   4% |   9   3% |   8   4% |   9   3% |   9   5% |   9   5% |   8   4% |   9   3% |   9   6% |   9   3% |   9   6% |   9   6% |   9   6% |   8   6% |   8   4% |   8   4% |   9   5% |   9   3% |   8   4% |   9   6% |
-	// |  22 |  12   5% |  11   3% |  10   4% |  11   3% |  11   5% |  11   6% |  10   4% |  11   3% |  11   6% |  11   3% |  11   6% |  11   6% |  11   5% |  10   5% |  10   4% |  10   4% |  11   5% |  11   2% |  10   4% |  11   6% |
-	// |  24 |  14   5% |  13   4% |  12   4% |  13   3% |  13   5% |  13   6% |  12   4% |  13   3% |  13   7% |  13   4% |  13   6% |  13   5% |  13   5% |  12   5% |  12   4% |  12   4% |  13   5% |  13   2% |  12   4% |  13   6% |
-	// |  26 |  16   5% |  15   4% |  14   3% |  15   3% |  15   5% |  15   5% |  14   4% |  15   3% |  15   7% |  15   4% |  15   6% |  15   5% |  15   5% |  14   5% |  14   4% |  14   4% |  15   4% |  15   3% |  14   4% |  15   6% |
-	// |  28 |  18   5% |  17   4% |  16   4% |  17   3% |  17   6% |  17   5% |  16   4% |  17   3% |  17   6% |  17   4% |  17   6% |  17   5% |  17   5% |  16   5% |  16   5% |  16   4% |  17   4% |  17   3% |  16   4% |  17   5% |
-	// |  30 |  20   5% |  19   4% |  18   4% |  19   3% |  19   6% |  19   5% |  18   4% |  19   4% |  19   6% |  19   4% |  19   6% |  19   4% |  19   5% |  18   5% |  18   5% |  18   4% |  19   4% |  19   3% |  18   4% |  19   5% |
-	// |  32 |  22   5% |  21   4% |  20   4% |  21   3% |  21   5% |  21   5% |  20   4% |  21   4% |  21   6% |  21   5% |  21   6% |  21   4% |  21   5% |  20   5% |  20   5% |  20   4% |  21   4% |  21   3% |  20   4% |  21   5% |
-	// |  34 |  24   5% |  23   4% |  22   3% |  23   3% |  23   5% |  23   5% |  22   4% |  23   4% |  23   6% |  23   5% |  23   6% |  23   5% |  23   5% |  22   5% |  22   5% |  22   4% |  23   4% |  23   3% |  22   4% |  23   5% |
-	// |  36 |  26   4% |  25   4% |  24   4% |  25   3% |  25   5% |  25   5% |  24   4% |  25   4% |  25   6% |  25   5% |  25   5% |  25   5% |  25   5% |  24   5% |  24   5% |  24   4% |  25   4% |  25   3% |  24   4% |  25   5% |
-	// |  38 |  28   4% |  27   4% |  26   4% |  27   3% |  27   5% |  27   5% |  26   4% |  27   4% |  27   5% |  27   5% |  27   5% |  27   5% |  27   5% |  26   5% |  26   4% |  26   4% |  27   5% |  27   3% |  26   4% |  27   5% |
-	// |  40 |  30   4% |  29   4% |  28   4% |  29   4% |  29   5% |  29   5% |  28   4% |  29   4% |  29   5% |  29   5% |  29   5% |  29   5% |  29   6% |  28   5% |  28   4% |  28   4% |  29   5% |  29   3% |  28   4% |  29   5% |
-	// |  42 |  32   4% |  31   4% |  30   4% |  31   3% |  31   5% |  31   5% |  30   4% |  31   4% |  31   5% |  31   5% |  31   5% |  31   5% |  31   6% |  30   5% |  30   4% |  30   4% |  31   5% |  31   3% |  30   4% |  31   5% |
-	// |  44 |  34   4% |  33   4% |  32   4% |  33   4% |  33   5% |  33   5% |  32   4% |  33   4% |  33   5% |  33   5% |  33   5% |  33   5% |  33   5% |  32   4% |  32   4% |  32   4% |  33   5% |  33   3% |  32   5% |  33   5% |
-	// |  46 |  36   4% |  35   4% |  34   4% |  35   4% |  35   5% |  35   5% |  34   4% |  35   4% |  35   5% |  35   5% |  35   5% |  35   5% |  35   5% |  34   4% |  34   4% |  34   4% |  35   5% |  35   3% |  34   4% |  35   5% |
-	// |  48 |  38   4% |  37   4% |  36   4% |  37   4% |  37   5% |  37   5% |  36   4% |  37   4% |  37   5% |  37   5% |  37   5% |  37   5% |  37   5% |  36   4% |  36   4% |  36   4% |  37   5% |  37   3% |  36   4% |  37   5% |
-	// |  50 |  40   4% |  39   4% |  38   4% |  39   4% |  39   5% |  39   5% |  38   4% |  39   4% |  39   5% |  39   5% |  39   5% |  39   4% |  39   5% |  38   4% |  38   4% |  38   4% |  39   5% |  39   3% |  38   4% |  39   5% |
-	// |  52 |  42   4% |  41   4% |  40   4% |  41   4% |  41   5% |  41   5% |  40   4% |  41   4% |  41   5% |  41   4% |  41   5% |  41   4% |  41   5% |  40   4% |  40   5% |  40   4% |  41   5% |  41   3% |  40   4% |  41   5% |
-	// |  54 |  44   4% |  43   4% |  42   4% |  43   4% |  43   5% |  43   5% |  42   4% |  43   4% |  43   5% |  43   4% |  43   5% |  43   4% |  43   5% |  42   4% |  42   5% |  42   4% |  43   5% |  43   3% |  42   4% |  43   5% |
-	// |  56 |  46   4% |  45   4% |  44   4% |  45   4% |  45   5% |  45   5% |  44   4% |  45   4% |  45   5% |  45   4% |  45   5% |  45   4% |  45   5% |  44   4% |  44   5% |  44   4% |  45   5% |  45   3% |  44   5% |  45   5% |
-	// |  58 |  48   4% |  47   4% |  46   4% |  47   4% |  47   5% |  47   5% |  46   4% |  47   4% |  47   5% |  47   4% |  47   5% |  47   4% |  47   5% |  46   4% |  46   5% |  46   4% |  47   5% |  47   3% |  46   5% |  47   5% |
-	// |  60 |  50   4% |  49   4% |  48   4% |  49   4% |  49   5% |  49   5% |  48   4% |  49   4% |  49   5% |  49   4% |  49   5% |  49   4% |  49   5% |  48   4% |  48   5% |  48   4% |  49   5% |  49   3% |  48   5% |  49   5% |
-	// |  62 |  52   4% |  51   4% |  50   4% |  51   4% |  51   5% |  51   5% |  50   4% |  51   4% |  51   5% |  51   4% |  51   5% |  51   4% |  51   5% |  50   4% |  50   5% |  50   4% |  51   5% |  51   3% |  50   5% |  51   5% |
-	// |  64 |  54   5% |  53   4% |  52   4% |  53   4% |  53   5% |  53   5% |  52   4% |  53   4% |  53   5% |  53   4% |  53   5% |  53   4% |  53   5% |  52   5% |  52   5% |  52   4% |  53   5% |  53   3% |  52   5% |  53   5% |
-	// |  66 |  56   5% |  55   4% |  54   4% |  55   4% |  55   5% |  55   5% |  54   4% |  55   4% |  55   5% |  55   4% |  55   5% |  55   4% |  55   5% |  54   5% |  54   5% |  54   4% |  55   4% |  55   3% |  54   5% |  55   5% |
-	// |  68 |  58   5% |  57   4% |  56   4% |  57   4% |  57   5% |  57   4% |  56   4% |  57   4% |  57   5% |  57   4% |  57   5% |  57   4% |  57   5% |  56   5% |  56   5% |  56   4% |  57   4% |  57   4% |  56   5% |  57   5% |
-	// |  70 |  60   5% |  59   4% |  58   4% |  59   4% |  59   5% |  59   5% |  58   4% |  59   4% |  59   5% |  59   5% |  59   5% |  59   4% |  59   5% |  58   5% |  58   5% |  58   4% |  59   4% |  59   4% |  58   5% |  59   5% |
-	// |  72 |  62   5% |  61   4% |  60   4% |  61   4% |  61   5% |  61   5% |  60   5% |  61   4% |  61   5% |  61   5% |  61   5% |  61   4% |  61   5% |  60   5% |  60   5% |  60   4% |  61   4% |  61   4% |  60   5% |  61   5% |
-	// |  74 |  64   5% |  63   4% |  62   4% |  63   4% |  63   5% |  63   4% |  62   5% |  63   4% |  63   5% |  63   4% |  63   5% |  63   5% |  63   5% |  62   5% |  62   5% |  62   4% |  63   4% |  63   4% |  62   5% |  63   5% |
-	// |  76 |  66   4% |  65   4% |  64   4% |  65   4% |  65   5% |  65   5% |  64   4% |  65   4% |  65   5% |  65   5% |  65   5% |  65   4% |  65   5% |  64   5% |  64   5% |  64   4% |  65   4% |  65   4% |  64   5% |  65   5% |
-	// |  78 |  68   4% |  67   4% |  66   4% |  67   4% |  67   5% |  67   5% |  66   4% |  67   4% |  67   5% |  67   5% |  67   5% |  67   5% |  67   5% |  66   5% |  66   5% |  66   4% |  67   4% |  67   4% |  66   5% |  67   5% |
-	// |  80 |  70   4% |  69   4% |  68   4% |  69   4% |  69   5% |  69   5% |  68   4% |  69   4% |  69   5% |  69   5% |  69   5% |  69   4% |  69   5% |  68   4% |  68   5% |  68   4% |  69   4% |  69   4% |  68   5% |  69   5% |
-	// |  82 |  72   4% |  71   4% |  70   4% |  71   4% |  71   5% |  71   4% |  70   4% |  71   4% |  71   5% |  71   5% |  71   5% |  71   4% |  71   5% |  70   4% |  70   5% |  70   4% |  71   4% |  71   4% |  70   5% |  71   5% |
-	// |  84 |  74   4% |  73   5% |  72   4% |  73   4% |  73   5% |  73   4% |  72   4% |  73   4% |  73   5% |  73   5% |  73   4% |  73   4% |  73   5% |  72   4% |  72   5% |  72   4% |  73   4% |  73   4% |  72   5% |  73   5% |
-	// |  86 |  76   4% |  75   5% |  74   4% |  75   4% |  75   5% |  75   5% |  74   4% |  75   4% |  75   5% |  75   5% |  75   4% |  75   4% |  75   5% |  74   4% |  74   5% |  74   4% |  75   4% |  75   4% |  74   5% |  75   5% |
-	// |  88 |  78   4% |  77   5% |  76   4% |  77   4% |  77   5% |  77   5% |  76   5% |  77   4% |  77   5% |  77   5% |  77   4% |  77   4% |  77   5% |  76   4% |  76   5% |  76   4% |  77   4% |  77   4% |  76   5% |  77   5% |
-	// |  90 |  80   4% |  79   5% |  78   5% |  79   4% |  79   5% |  79   5% |  78   5% |  79   4% |  79   5% |  79   4% |  79   5% |  79   4% |  79   5% |  78   4% |  78   5% |  78   4% |  79   4% |  79   4% |  78   5% |  79   5% |
-	// |  92 |  82   4% |  81   5% |  80   5% |  81   4% |  81   5% |  81   5% |  80   4% |  81   4% |  81   5% |  81   4% |  81   4% |  81   5% |  81   5% |  80   4% |  80   5% |  80   4% |  81   4% |  81   4% |  80   5% |  81   5% |
-	// |  94 |  84   4% |  83   5% |  82   4% |  83   4% |  83   5% |  83   5% |  82   5% |  83   4% |  83   5% |  83   4% |  83   5% |  83   5% |  83   5% |  82   4% |  82   5% |  82   4% |  83   4% |  83   4% |  82   5% |  83   5% |
-	// |  96 |  86   4% |  85   5% |  84   4% |  85   4% |  85   5% |  85   5% |  84   5% |  85   4% |  85   5% |  85   4% |  85   4% |  85   5% |  85   5% |  84   4% |  84   5% |  84   4% |  85   4% |  85   4% |  84   5% |  85   5% |
-	// |  98 |  88   4% |  87   5% |  86   4% |  87   4% |  87   5% |  87   5% |  86   5% |  87   4% |  87   5% |  87   4% |  87   4% |  87   5% |  87   5% |  86   4% |  86   5% |  86   4% |  87   4% |  87   4% |  86   5% |  87   5% |
+	// |  10 |  10  68% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   1  11% |   0   0% |   2  20% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |
+	// |  12 |  10  34% |   1   2% |   0   0% |   2  18% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   3  14% |   0   0% |   3  27% |   0   0% |   0   0% |   1   2% |   0   0% |   0   0% |   0   0% |
+	// |  14 |  10  22% |   3   7% |   0   0% |   4  18% |   0   0% |   0   0% |   0   0% |   0   0% |   0   0% |   1   3% |   0   0% |   4  11% |   2   1% |   4  22% |   0   0% |   0   0% |   3   8% |   1   0% |   1   4% |   0   0% |
+	// |  16 |  10  12% |   5  10% |   0   0% |   5  13% |   0   0% |   2   4% |   1   3% |   2   1% |   0   0% |   3   6% |   1   0% |   5   8% |   4   5% |   5  12% |   0   0% |   0   0% |   5   9% |   3   4% |   3   8% |   0   0% |
+	// |  18 |  10   5% |   6   7% |   3   1% |   6   9% |   3   4% |   4   6% |   3   5% |   4   2% |   2   1% |   4   5% |   3   2% |   6   7% |   5   3% |   6  10% |   3   2% |   4   3% |   6   6% |   4   5% |   4   6% |   2   1% |
+	// |  20 |  10   4% |   8   6% |   5   2% |   8   8% |   5   4% |   6   6% |   5   5% |   6   3% |   5   3% |   6   6% |   5   2% |   8   6% |   7   4% |   8   9% |   5   3% |   6   4% |   8   6% |   6   3% |   6   5% |   5   3% |
+	// |  22 |  11   4% |  10   6% |   7   2% |  10   7% |   7   4% |   8   6% |   7   5% |   8   4% |   7   3% |   8   5% |   8   2% |  10   6% |   9   4% |  10   8% |   7   3% |   8   3% |  10   6% |   8   3% |   8   5% |   7   4% |
+	// |  24 |  13   5% |  12   6% |   9   2% |  12   6% |   9   4% |  10   5% |   9   5% |  10   4% |   9   4% |  10   5% |  10   3% |  12   6% |  11   4% |  12   7% |   9   3% |  10   3% |  12   6% |  10   3% |  10   5% |   9   4% |
+	// |  26 |  15   5% |  14   6% |  11   3% |  14   6% |  11   4% |  12   5% |  11   4% |  12   4% |  11   4% |  12   5% |  12   3% |  14   6% |  13   4% |  14   6% |  11   4% |  12   3% |  14   6% |  12   3% |  12   5% |  11   4% |
+	// |  28 |  17   5% |  16   5% |  13   4% |  16   6% |  13   4% |  14   5% |  13   4% |  14   4% |  13   4% |  14   5% |  14   3% |  16   5% |  15   5% |  16   6% |  13   4% |  14   3% |  16   5% |  14   4% |  14   4% |  13   4% |
+	// |  30 |  19   5% |  18   6% |  15   3% |  18   6% |  15   4% |  16   5% |  15   4% |  16   4% |  15   4% |  16   5% |  16   3% |  18   5% |  17   5% |  18   5% |  15   4% |  16   3% |  18   6% |  16   4% |  16   5% |  15   4% |
+	// |  32 |  21   4% |  20   5% |  17   4% |  20   6% |  17   4% |  18   6% |  17   5% |  18   4% |  17   4% |  18   5% |  18   3% |  20   5% |  19   4% |  20   6% |  17   4% |  18   3% |  20   6% |  18   4% |  18   4% |  17   4% |
+	// |  34 |  23   4% |  22   6% |  19   4% |  22   6% |  19   4% |  20   5% |  19   5% |  20   4% |  19   4% |  20   4% |  20   4% |  22   5% |  21   4% |  22   5% |  19   4% |  20   3% |  22   6% |  20   3% |  20   4% |  19   5% |
+	// |  36 |  25   4% |  24   5% |  21   4% |  24   7% |  21   4% |  22   5% |  21   5% |  22   4% |  21   4% |  22   4% |  22   4% |  24   5% |  23   4% |  24   5% |  21   4% |  22   4% |  24   6% |  22   4% |  22   4% |  21   5% |
+	// |  38 |  27   4% |  26   5% |  23   4% |  26   6% |  23   4% |  24   5% |  23   5% |  24   4% |  23   4% |  24   4% |  24   4% |  26   5% |  25   5% |  26   5% |  23   4% |  24   4% |  26   6% |  24   4% |  24   5% |  23   5% |
+	// |  40 |  29   4% |  28   5% |  25   4% |  28   6% |  25   4% |  26   5% |  25   5% |  26   4% |  25   4% |  26   4% |  26   4% |  28   5% |  27   4% |  28   5% |  25   4% |  26   4% |  28   5% |  26   4% |  26   4% |  25   5% |
+	// |  42 |  31   4% |  30   5% |  27   4% |  30   6% |  27   4% |  28   5% |  27   5% |  28   4% |  27   4% |  28   4% |  28   4% |  30   5% |  29   4% |  30   5% |  27   4% |  28   4% |  30   5% |  28   4% |  28   4% |  27   5% |
+	// |  44 |  33   4% |  32   5% |  29   4% |  32   6% |  29   4% |  30   5% |  29   5% |  30   3% |  29   4% |  30   4% |  30   4% |  32   5% |  31   4% |  32   6% |  29   4% |  30   4% |  32   5% |  30   4% |  30   4% |  29   5% |
+	// |  46 |  35   4% |  34   5% |  31   4% |  34   6% |  31   4% |  32   5% |  31   5% |  32   3% |  31   4% |  32   5% |  32   4% |  34   5% |  33   4% |  34   6% |  31   4% |  32   4% |  34   5% |  32   4% |  32   4% |  31   5% |
+	// |  48 |  37   4% |  36   4% |  33   4% |  36   5% |  33   4% |  34   5% |  33   5% |  34   3% |  33   4% |  34   5% |  34   4% |  36   5% |  35   4% |  36   6% |  33   4% |  34   4% |  36   5% |  34   4% |  34   5% |  33   5% |
+	// |  50 |  39   4% |  38   4% |  35   4% |  38   5% |  35   4% |  36   5% |  35   5% |  36   3% |  35   4% |  36   5% |  36   4% |  38   5% |  37   4% |  38   5% |  35   4% |  36   4% |  38   5% |  36   4% |  36   5% |  35   5% |
+	// |  52 |  41   4% |  40   5% |  37   4% |  40   5% |  37   4% |  38   5% |  37   5% |  38   3% |  37   4% |  38   5% |  38   4% |  40   5% |  39   4% |  40   5% |  37   5% |  38   4% |  40   5% |  38   4% |  38   5% |  37   5% |
+	// |  54 |  43   4% |  42   5% |  39   4% |  42   5% |  39   4% |  40   5% |  39   5% |  40   3% |  39   4% |  40   5% |  40   4% |  42   5% |  41   4% |  42   5% |  39   5% |  40   4% |  42   5% |  40   4% |  40   5% |  39   5% |
+	// |  56 |  45   4% |  44   5% |  41   4% |  44   5% |  41   4% |  42   5% |  41   5% |  42   4% |  41   4% |  42   5% |  42   4% |  44   5% |  43   4% |  44   5% |  41   5% |  42   4% |  44   5% |  42   4% |  42   5% |  41   5% |
+	// |  58 |  47   4% |  46   5% |  43   4% |  46   5% |  43   4% |  44   5% |  43   5% |  44   4% |  43   4% |  44   5% |  44   4% |  46   5% |  45   5% |  46   5% |  43   5% |  44   4% |  46   5% |  44   4% |  44   5% |  43   5% |
+	// |  60 |  49   4% |  48   5% |  45   3% |  48   5% |  45   4% |  46   5% |  45   5% |  46   4% |  45   4% |  46   5% |  46   4% |  48   5% |  47   5% |  48   5% |  45   5% |  46   4% |  48   5% |  46   5% |  46   4% |  45   5% |
+	// |  62 |  51   4% |  50   5% |  47   4% |  50   5% |  47   4% |  48   5% |  47   5% |  48   4% |  47   4% |  48   5% |  48   5% |  50   5% |  49   5% |  50   5% |  47   5% |  48   4% |  50   5% |  48   5% |  48   4% |  47   5% |
+	// |  64 |  53   4% |  52   5% |  49   3% |  52   5% |  49   4% |  50   5% |  49   5% |  50   4% |  49   4% |  50   5% |  50   5% |  52   5% |  51   5% |  52   5% |  49   5% |  50   4% |  52   5% |  50   4% |  50   4% |  49   5% |
+	// |  66 |  55   4% |  54   5% |  51   4% |  54   5% |  51   4% |  52   5% |  51   5% |  52   4% |  51   4% |  52   5% |  52   5% |  54   5% |  53   5% |  54   5% |  51   5% |  52   5% |  54   5% |  52   4% |  52   4% |  51   5% |
+	// |  68 |  57   4% |  56   5% |  53   4% |  56   5% |  53   4% |  54   5% |  53   5% |  54   4% |  53   4% |  54   5% |  54   5% |  56   5% |  55   5% |  56   5% |  53   5% |  54   5% |  56   5% |  54   4% |  54   4% |  53   5% |
+	// |  70 |  59   4% |  58   5% |  55   4% |  58   5% |  55   4% |  56   5% |  55   5% |  56   4% |  55   4% |  56   5% |  56   4% |  58   5% |  57   5% |  58   5% |  55   5% |  56   5% |  58   5% |  56   4% |  56   4% |  55   5% |
+	// |  72 |  61   4% |  60   5% |  57   4% |  60   5% |  57   4% |  58   5% |  57   5% |  58   4% |  57   4% |  58   5% |  58   4% |  60   5% |  59   5% |  60   5% |  57   4% |  58   5% |  60   5% |  58   5% |  58   4% |  57   5% |
+	// |  74 |  63   4% |  62   5% |  59   4% |  62   5% |  59   4% |  60   5% |  59   5% |  60   4% |  59   4% |  60   5% |  60   4% |  62   5% |  61   5% |  62   5% |  59   4% |  60   5% |  62   5% |  60   5% |  60   4% |  59   5% |
+	// |  76 |  65   4% |  64   5% |  61   4% |  64   5% |  61   4% |  62   5% |  61   5% |  62   4% |  61   4% |  62   5% |  62   4% |  64   5% |  63   5% |  64   5% |  61   5% |  62   5% |  64   4% |  62   5% |  62   4% |  61   5% |
+	// |  78 |  67   4% |  66   5% |  63   4% |  66   5% |  63   4% |  64   5% |  63   5% |  64   4% |  63   4% |  64   5% |  64   4% |  66   5% |  65   5% |  66   5% |  63   4% |  64   5% |  66   5% |  64   5% |  64   4% |  63   5% |
+	// |  80 |  69   4% |  68   5% |  65   4% |  68   5% |  65   4% |  66   5% |  65   5% |  66   4% |  65   4% |  66   5% |  66   4% |  68   5% |  67   4% |  68   5% |  65   4% |  66   5% |  68   5% |  66   5% |  66   4% |  65   5% |
+	// |  82 |  71   4% |  70   5% |  67   4% |  70   5% |  67   4% |  68   5% |  67   5% |  68   4% |  67   4% |  68   5% |  68   4% |  70   5% |  69   5% |  70   5% |  67   4% |  68   4% |  70   5% |  68   4% |  68   4% |  67   5% |
+	// |  84 |  73   4% |  72   5% |  69   4% |  72   5% |  69   4% |  70   5% |  69   5% |  70   4% |  69   4% |  70   5% |  70   4% |  72   5% |  71   4% |  72   5% |  69   4% |  70   4% |  72   5% |  70   4% |  70   4% |  69   5% |
+	// |  86 |  75   4% |  74   5% |  71   4% |  74   5% |  71   4% |  72   5% |  71   5% |  72   4% |  71   4% |  72   5% |  72   4% |  74   5% |  73   4% |  74   5% |  71   4% |  72   4% |  74   5% |  72   4% |  72   4% |  71   5% |
+	// |  88 |  77   4% |  76   4% |  73   4% |  76   5% |  73   4% |  74   5% |  73   5% |  74   4% |  73   4% |  74   5% |  74   4% |  76   5% |  75   4% |  76   5% |  73   4% |  74   4% |  76   5% |  74   4% |  74   4% |  73   5% |
+	// |  90 |  79   4% |  78   4% |  75   4% |  78   5% |  75   4% |  76   5% |  75   5% |  76   4% |  75   4% |  76   5% |  76   4% |  78   5% |  77   5% |  78   5% |  75   5% |  76   4% |  78   5% |  76   4% |  76   4% |  75   5% |
+	// |  92 |  81   4% |  80   4% |  77   4% |  80   5% |  77   4% |  78   5% |  77   5% |  78   4% |  77   4% |  78   5% |  78   4% |  80   5% |  79   5% |  80   5% |  77   5% |  78   4% |  80   5% |  78   4% |  78   4% |  77   5% |
+	// |  94 |  83   4% |  82   4% |  79   4% |  82   5% |  79   4% |  80   5% |  79   5% |  80   4% |  79   4% |  80   5% |  80   4% |  82   5% |  81   5% |  82   5% |  79   4% |  80   4% |  82   5% |  80   4% |  80   4% |  79   5% |
+	// |  96 |  85   4% |  84   4% |  81   4% |  84   5% |  81   5% |  82   5% |  81   5% |  82   4% |  81   4% |  82   5% |  82   4% |  84   5% |  83   5% |  84   5% |  81   5% |  82   4% |  84   5% |  82   4% |  82   4% |  81   5% |
+	// |  98 |  87   4% |  86   4% |  83   4% |  86   5% |  83   5% |  84   5% |  83   5% |  84   4% |  83   4% |  84   5% |  84   4% |  86   5% |  85   5% |  86   5% |  83   5% |  84   4% |  86   5% |  84   4% |  84   4% |  83   5% |
 	// +-----+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+
-	// Total bytes=913070194, ranges=1755
+	// Total bytes=894061338, ranges=1708
 }

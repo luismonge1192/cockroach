@@ -36,20 +36,27 @@ import (
 	"github.com/cockroachdb/logtags"
 )
 
-// TxnAutoGC controls whether Transaction entries are automatically gc'ed
-// upon EndTransaction if they only have local intents (which can be
-// resolved synchronously with EndTransaction). Certain tests become
-// simpler with this being turned off.
-var TxnAutoGC = true
-
 func init() {
-	RegisterCommand(roachpb.EndTransaction, declareKeysEndTransaction, EndTransaction)
+	RegisterReadWriteCommand(roachpb.EndTxn, declareKeysEndTxn, EndTxn)
 }
 
-func declareKeysEndTransaction(
+// declareKeysWriteTransaction is the shared portion of
+// declareKeys{End,Heartbeat}Transaction.
+func declareKeysWriteTransaction(
+	_ *roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
+) {
+	if header.Txn != nil {
+		header.Txn.AssertInitialized(context.TODO())
+		spans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{
+			Key: keys.TransactionKey(req.Header().Key, header.Txn.ID),
+		})
+	}
+}
+
+func declareKeysEndTxn(
 	desc *roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
 ) {
-	et := req.(*roachpb.EndTransactionRequest)
+	et := req.(*roachpb.EndTxnRequest)
 	declareKeysWriteTransaction(desc, header, req, spans)
 	if header.Txn != nil {
 		header.Txn.AssertInitialized(context.TODO())
@@ -85,17 +92,22 @@ func declareKeysEndTransaction(
 			if st := et.InternalCommitTrigger.SplitTrigger; st != nil {
 				// Splits may read from the entire pre-split range (they read
 				// from the LHS in all cases, and the RHS only when the existing
-				// stats contain estimates), but they need to declare a write
-				// access to block all other concurrent writes. We block writes
-				// to the RHS because they will fail if applied after the split,
-				// and writes to the LHS because their stat deltas will
-				// interfere with the non-delta stats computed as a part of the
-				// split. (see
+				// stats contain estimates). Splits declare non-MVCC read access
+				// across the entire LHS to block all concurrent writes to the
+				// LHS because their stat deltas will interfere with the
+				// non-delta stats computed as a part of the split. Splits
+				// declare non-MVCC write access across the entire RHS to block
+				// all concurrent reads and writes to the RHS because they will
+				// fail if applied after the split. (see
 				// https://github.com/cockroachdb/cockroach/issues/14881)
-				spans.AddMVCC(spanset.SpanReadWrite, roachpb.Span{
+				spans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{
 					Key:    st.LeftDesc.StartKey.AsRawKey(),
+					EndKey: st.LeftDesc.EndKey.AsRawKey(),
+				})
+				spans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{
+					Key:    st.RightDesc.StartKey.AsRawKey(),
 					EndKey: st.RightDesc.EndKey.AsRawKey(),
-				}, header.Timestamp)
+				})
 				spans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{
 					Key:    keys.MakeRangeKeyPrefix(st.LeftDesc.StartKey),
 					EndKey: keys.MakeRangeKeyPrefix(st.RightDesc.EndKey).PrefixEnd(),
@@ -146,24 +158,30 @@ func declareKeysEndTransaction(
 	}
 }
 
-// EndTransaction either commits or aborts (rolls back) an extant
-// transaction according to the args.Commit parameter. Rolling back
-// an already rolled-back txn is ok.
-func EndTransaction(
-	ctx context.Context, batch engine.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
+// EndTxn either commits or aborts (rolls back) an extant transaction according
+// to the args.Commit parameter. Rolling back an already rolled-back txn is ok.
+// TODO(nvanbenschoten): rename this file to cmd_end_txn.go once some of andrei's
+// recent PRs have landed.
+func EndTxn(
+	ctx context.Context, readWriter engine.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
 ) (result.Result, error) {
-	args := cArgs.Args.(*roachpb.EndTransactionRequest)
+	args := cArgs.Args.(*roachpb.EndTxnRequest)
 	h := cArgs.Header
 	ms := cArgs.Stats
-	reply := resp.(*roachpb.EndTransactionResponse)
+	reply := resp.(*roachpb.EndTxnResponse)
 
 	if err := VerifyTransaction(h, args, roachpb.PENDING, roachpb.STAGING, roachpb.ABORTED); err != nil {
 		return result.Result{}, err
 	}
-
-	// If a 1PC txn was required and we're in EndTransaction, something went wrong.
 	if args.Require1PC {
+		// If a 1PC txn was required and we're in EndTxn, we've failed to evaluate
+		// the batch as a 1PC. We're returning early instead of preferring a
+		// possible retriable error because we might want to leave intents behind in
+		// case of retriable errors - which Require1PC does not want.
 		return result.Result{}, roachpb.NewTransactionStatusError("could not commit in one phase as requested")
+	}
+	if args.Commit && args.Poison {
+		return result.Result{}, errors.Errorf("cannot poison during a committing EndTxn request")
 	}
 
 	key := keys.TransactionKey(h.Txn.Key, h.Txn.ID)
@@ -171,7 +189,7 @@ func EndTransaction(
 	// Fetch existing transaction.
 	var existingTxn roachpb.Transaction
 	if ok, err := engine.MVCCGetProto(
-		ctx, batch, key, hlc.Timestamp{}, &existingTxn, engine.MVCCGetOptions{},
+		ctx, readWriter, key, hlc.Timestamp{}, &existingTxn, engine.MVCCGetOptions{},
 	); err != nil {
 		return result.Result{}, err
 	} else if !ok {
@@ -208,12 +226,12 @@ func EndTransaction(
 				// Do not return TransactionAbortedError since the client anyway
 				// wanted to abort the transaction.
 				desc := cArgs.EvalCtx.Desc()
-				externalIntents, err := resolveLocalIntents(ctx, desc, batch, ms, args, reply.Txn, cArgs.EvalCtx)
+				externalIntents, err := resolveLocalIntents(ctx, desc, readWriter, ms, args, reply.Txn, cArgs.EvalCtx)
 				if err != nil {
 					return result.Result{}, err
 				}
 				if err := updateFinalizedTxn(
-					ctx, batch, ms, key, args, reply.Txn, externalIntents,
+					ctx, readWriter, ms, key, args, reply.Txn, externalIntents,
 				); err != nil {
 					return result.Result{}, err
 				}
@@ -251,9 +269,14 @@ func EndTransaction(
 
 	// Attempt to commit or abort the transaction per the args.Commit parameter.
 	if args.Commit {
-		if retry, reason, extraMsg := IsEndTransactionTriggeringRetryError(reply.Txn, args); retry {
+		if retry, reason, extraMsg := IsEndTxnTriggeringRetryError(reply.Txn, args); retry {
 			return result.Result{}, roachpb.NewTransactionRetryError(reason, extraMsg)
 		}
+		// Update the read timestamp in case we've essentially refreshed. This
+		// update is important because reply.Txn.ReadTimestamp will make its way
+		// into BatchResponse.Timestamp, which is used to update the timestamp
+		// cache.
+		reply.Txn.ReadTimestamp = reply.Txn.WriteTimestamp
 
 		// If the transaction needs to be staged as part of an implicit commit
 		// before being explicitly committed, write the staged transaction
@@ -270,7 +293,7 @@ func EndTransaction(
 
 			reply.Txn.Status = roachpb.STAGING
 			reply.StagingTimestamp = reply.Txn.WriteTimestamp
-			if err := updateStagingTxn(ctx, batch, ms, key, args, reply.Txn); err != nil {
+			if err := updateStagingTxn(ctx, readWriter, ms, key, args, reply.Txn); err != nil {
 				return result.Result{}, err
 			}
 			return result.Result{}, nil
@@ -290,7 +313,7 @@ func EndTransaction(
 		// during startup, to infer that any lingering intents belong to in-progress
 		// transactions and thus the pre-intent value can safely be used.
 		if mt := args.InternalCommitTrigger.GetMergeTrigger(); mt != nil {
-			mergeResult, err := mergeTrigger(ctx, cArgs.EvalCtx, batch.(engine.Batch),
+			mergeResult, err := mergeTrigger(ctx, cArgs.EvalCtx, readWriter.(engine.Batch),
 				ms, mt, reply.Txn.WriteTimestamp)
 			if err != nil {
 				return result.Result{}, err
@@ -309,17 +332,17 @@ func EndTransaction(
 	// This avoids the need for the intentResolver to have to return to this range
 	// to resolve intents for this transaction in the future.
 	desc := cArgs.EvalCtx.Desc()
-	externalIntents, err := resolveLocalIntents(ctx, desc, batch, ms, args, reply.Txn, cArgs.EvalCtx)
+	externalIntents, err := resolveLocalIntents(ctx, desc, readWriter, ms, args, reply.Txn, cArgs.EvalCtx)
 	if err != nil {
 		return result.Result{}, err
 	}
-	if err := updateFinalizedTxn(ctx, batch, ms, key, args, reply.Txn, externalIntents); err != nil {
+	if err := updateFinalizedTxn(ctx, readWriter, ms, key, args, reply.Txn, externalIntents); err != nil {
 		return result.Result{}, err
 	}
 
 	// Run the rest of the commit triggers if successfully committed.
 	if reply.Txn.Status == roachpb.COMMITTED {
-		triggerResult, err := RunCommitTrigger(ctx, cArgs.EvalCtx, batch.(engine.Batch),
+		triggerResult, err := RunCommitTrigger(ctx, cArgs.EvalCtx, readWriter.(engine.Batch),
 			ms, args, reply.Txn)
 		if err != nil {
 			return result.Result{}, roachpb.NewReplicaCorruptionError(err)
@@ -334,43 +357,42 @@ func EndTransaction(
 	// could have been written (the txn would already have been in
 	// state=ABORTED).
 	//
-	// Summary of transaction replay protection after EndTransaction: When a
+	// Summary of transaction replay protection after EndTxn: When a
 	// transactional write gets replayed over its own resolved intents, the
 	// write will succeed but only as an intent with a newer timestamp (with a
 	// WriteTooOldError). However, the replayed intent cannot be resolved by a
-	// subsequent replay of this EndTransaction call because the txn timestamp
-	// will be too old. Replays of requests which attempt to create a new txn
-	// record (BeginTransaction, HeartbeatTxn, or EndTransaction) never succeed
-	// because EndTransaction inserts in the write timestamp cache in Replica's
-	// updateTimestampCache method, forcing the call to CanCreateTxnRecord to
-	// return false, resulting in a transaction retry error. If the replay
-	// didn't attempt to create a txn record, any push will immediately succeed
-	// as a missing txn record on push where CanCreateTxnRecord returns false
-	// succeeds. In both cases, the txn will be GC'd on the slow path.
+	// subsequent replay of this EndTxn call because the txn timestamp will be
+	// too old. Replays of requests which attempt to create a new txn record
+	// (HeartbeatTxn or EndTxn) never succeed because EndTxn inserts in the
+	// timestamp cache in Replica's updateTimestampCache method, forcing
+	// the call to CanCreateTxnRecord to return false, resulting in a
+	// transaction retry error. If the replay didn't attempt to create a txn
+	// record, any push will immediately succeed as a missing txn record on push
+	// where CanCreateTxnRecord returns false succeeds. In both cases, the txn
+	// will be GC'd on the slow path.
 	//
 	// We specify alwaysReturn==false because if the commit fails below Raft, we
 	// don't want the intents to be up for resolution. That should happen only
 	// if the commit actually happens; otherwise, we risk losing writes.
 	intentsResult := result.FromEndTxn(reply.Txn, false /* alwaysReturn */, args.Poison)
-	intentsResult.Local.UpdatedTxns = &[]*roachpb.Transaction{reply.Txn}
+	intentsResult.Local.UpdatedTxns = []*roachpb.Transaction{reply.Txn}
 	if err := pd.MergeAndDestroy(intentsResult); err != nil {
 		return result.Result{}, err
 	}
 	return pd, nil
 }
 
-// IsEndTransactionExceedingDeadline returns true if the transaction
-// exceeded its deadline.
-func IsEndTransactionExceedingDeadline(t hlc.Timestamp, args *roachpb.EndTransactionRequest) bool {
-	return args.Deadline != nil && !t.Less(*args.Deadline)
+// IsEndTxnExceedingDeadline returns true if the transaction exceeded its
+// deadline.
+func IsEndTxnExceedingDeadline(t hlc.Timestamp, args *roachpb.EndTxnRequest) bool {
+	return args.Deadline != nil && args.Deadline.LessEq(t)
 }
 
-// IsEndTransactionTriggeringRetryError returns true if the
-// EndTransactionRequest cannot be committed and needs to return a
-// TransactionRetryError. It also returns the reason and possibly an extra
-// message to be used for the error.
-func IsEndTransactionTriggeringRetryError(
-	txn *roachpb.Transaction, args *roachpb.EndTransactionRequest,
+// IsEndTxnTriggeringRetryError returns true if the EndTxnRequest cannot be
+// committed and needs to return a TransactionRetryError. It also returns the
+// reason and possibly an extra message to be used for the error.
+func IsEndTxnTriggeringRetryError(
+	txn *roachpb.Transaction, args *roachpb.EndTxnRequest,
 ) (retry bool, reason roachpb.TransactionRetryReason, extraMsg string) {
 	// If we saw any WriteTooOldErrors, we must restart to avoid lost
 	// update anomalies.
@@ -378,9 +400,6 @@ func IsEndTransactionTriggeringRetryError(
 		retry, reason = true, roachpb.RETRY_WRITE_TOO_OLD
 	} else {
 		readTimestamp := txn.ReadTimestamp
-		// For compatibility with 19.2 nodes which might not have set
-		// ReadTimestamp, fallback to DeprecatedOrigTimestamp.
-		readTimestamp.Forward(txn.DeprecatedOrigTimestamp)
 		isTxnPushed := txn.WriteTimestamp != readTimestamp
 
 		// Return a transaction retry error if the commit timestamp isn't equal to
@@ -390,13 +409,8 @@ func IsEndTransactionTriggeringRetryError(
 		}
 	}
 
-	// A transaction can still avoid a retry under certain conditions.
-	if retry && CanForwardCommitTimestampWithoutRefresh(txn, args) {
-		retry, reason = false, 0
-	}
-
-	// However, a transaction must obey its deadline, if set.
-	if !retry && IsEndTransactionExceedingDeadline(txn.WriteTimestamp, args) {
+	// A transaction must obey its deadline, if set.
+	if !retry && IsEndTxnExceedingDeadline(txn.WriteTimestamp, args) {
 		exceededBy := txn.WriteTimestamp.GoTime().Sub(args.Deadline.GoTime())
 		extraMsg = fmt.Sprintf(
 			"txn timestamp pushed too much; deadline exceeded by %s (%s > %s)",
@@ -413,10 +427,13 @@ func IsEndTransactionTriggeringRetryError(
 // has encountered no spans which require refreshing at the forwarded
 // timestamp. If either of those conditions are true, a client-side
 // retry is required.
+//
+// Note that when deciding whether a transaction can be bumped to a particular
+// timestamp, the transaction's deadling must also be taken into account.
 func CanForwardCommitTimestampWithoutRefresh(
-	txn *roachpb.Transaction, args *roachpb.EndTransactionRequest,
+	txn *roachpb.Transaction, args *roachpb.EndTxnRequest,
 ) bool {
-	return !txn.CommitTimestampFixed && args.NoRefreshSpans
+	return !txn.CommitTimestampFixed && args.CanCommitAtHigherTimestamp
 }
 
 const intentResolutionBatchSize = 500
@@ -432,9 +449,9 @@ const intentResolutionBatchSize = 500
 func resolveLocalIntents(
 	ctx context.Context,
 	desc *roachpb.RangeDescriptor,
-	batch engine.ReadWriter,
+	readWriter engine.ReadWriter,
 	ms *enginepb.MVCCStats,
-	args *roachpb.EndTransactionRequest,
+	args *roachpb.EndTxnRequest,
 	txn *roachpb.Transaction,
 	evalCtx EvalContext,
 ) ([]roachpb.Span, error) {
@@ -445,7 +462,7 @@ func resolveLocalIntents(
 		desc = &mergeTrigger.LeftDesc
 	}
 
-	iter := batch.NewIterator(engine.IterOptions{
+	iter := readWriter.NewIterator(engine.IterOptions{
 		UpperBound: desc.EndKey.AsRawKey(),
 	})
 	iterAndBuf := engine.GetBufUsingIter(iter)
@@ -464,26 +481,29 @@ func resolveLocalIntents(
 				externalIntents = append(externalIntents, span)
 				return nil
 			}
-			intent := roachpb.Intent{Span: span, Txn: txn.TxnMeta, Status: txn.Status}
+			intent := roachpb.MakeIntent(txn, span)
 			if len(span.EndKey) == 0 {
 				// For single-key intents, do a KeyAddress-aware check of
 				// whether it's contained in our Range.
-				if !storagebase.ContainsKey(*desc, span.Key) {
+				if !storagebase.ContainsKey(desc, span.Key) {
 					externalIntents = append(externalIntents, span)
 					return nil
 				}
 				resolveMS := ms
-				resolveAllowance--
-				return engine.MVCCResolveWriteIntentUsingIter(ctx, batch, iterAndBuf, resolveMS, intent)
+				ok, err := engine.MVCCResolveWriteIntentUsingIter(ctx, readWriter, iterAndBuf, resolveMS, intent)
+				if ok {
+					resolveAllowance--
+				}
+				return err
 			}
 			// For intent ranges, cut into parts inside and outside our key
 			// range. Resolve locally inside, delegate the rest. In particular,
 			// an intent range for range-local data is correctly considered local.
-			inSpan, outSpans := storagebase.IntersectSpan(span, *desc)
+			inSpan, outSpans := storagebase.IntersectSpan(span, desc)
 			externalIntents = append(externalIntents, outSpans...)
 			if inSpan != nil {
 				intent.Span = *inSpan
-				num, resumeSpan, err := engine.MVCCResolveWriteIntentRangeUsingIter(ctx, batch, iterAndBuf, ms, intent, resolveAllowance)
+				num, resumeSpan, err := engine.MVCCResolveWriteIntentRangeUsingIter(ctx, readWriter, iterAndBuf, ms, intent, resolveAllowance)
 				if err != nil {
 					return err
 				}
@@ -504,32 +524,32 @@ func resolveLocalIntents(
 			return nil, errors.Wrapf(err, "resolving intent at %s on end transaction [%s]", span, txn.Status)
 		}
 	}
-	// If the poison arg is set, make sure to set the abort span entry.
-	if args.Poison && txn.Status == roachpb.ABORTED {
-		if err := SetAbortSpan(ctx, evalCtx, batch, ms, txn.TxnMeta, true /* poison */); err != nil {
+
+	removedAny := resolveAllowance != intentResolutionBatchSize
+	if WriteAbortSpanOnResolve(txn.Status, args.Poison, removedAny) {
+		if err := UpdateAbortSpan(ctx, evalCtx, readWriter, ms, txn.TxnMeta, args.Poison); err != nil {
 			return nil, err
 		}
 	}
-
 	return externalIntents, nil
 }
 
 // updateStagingTxn persists the STAGING transaction record with updated status
-// (and possibly timestamp). It persists the record with the EndTransaction
-// request's declared in-flight writes along with all of the transaction's
-// (local and remote) intents.
+// (and possibly timestamp). It persists the record with the EndTxn request's
+// declared in-flight writes along with all of the transaction's (local and
+// remote) intents.
 func updateStagingTxn(
 	ctx context.Context,
-	batch engine.ReadWriter,
+	readWriter engine.ReadWriter,
 	ms *enginepb.MVCCStats,
 	key []byte,
-	args *roachpb.EndTransactionRequest,
+	args *roachpb.EndTxnRequest,
 	txn *roachpb.Transaction,
 ) error {
 	txn.IntentSpans = args.IntentSpans
 	txn.InFlightWrites = args.InFlightWrites
 	txnRecord := txn.AsRecord()
-	return engine.MVCCPutProto(ctx, batch, ms, key, hlc.Timestamp{}, nil /* txn */, &txnRecord)
+	return engine.MVCCPutProto(ctx, readWriter, ms, key, hlc.Timestamp{}, nil /* txn */, &txnRecord)
 }
 
 // updateFinalizedTxn persists the COMMITTED or ABORTED transaction record with
@@ -538,23 +558,23 @@ func updateStagingTxn(
 // it around.
 func updateFinalizedTxn(
 	ctx context.Context,
-	batch engine.ReadWriter,
+	readWriter engine.ReadWriter,
 	ms *enginepb.MVCCStats,
 	key []byte,
-	args *roachpb.EndTransactionRequest,
+	args *roachpb.EndTxnRequest,
 	txn *roachpb.Transaction,
 	externalIntents []roachpb.Span,
 ) error {
-	if TxnAutoGC && len(externalIntents) == 0 {
+	if txnAutoGC && len(externalIntents) == 0 {
 		if log.V(2) {
 			log.Infof(ctx, "auto-gc'ed %s (%d intents)", txn.Short(), len(args.IntentSpans))
 		}
-		return engine.MVCCDelete(ctx, batch, ms, key, hlc.Timestamp{}, nil /* txn */)
+		return engine.MVCCDelete(ctx, readWriter, ms, key, hlc.Timestamp{}, nil /* txn */)
 	}
 	txn.IntentSpans = externalIntents
 	txn.InFlightWrites = nil
 	txnRecord := txn.AsRecord()
-	return engine.MVCCPutProto(ctx, batch, ms, key, hlc.Timestamp{}, nil /* txn */, &txnRecord)
+	return engine.MVCCPutProto(ctx, readWriter, ms, key, hlc.Timestamp{}, nil /* txn */, &txnRecord)
 }
 
 // RunCommitTrigger runs the commit trigger from an end transaction request.
@@ -563,7 +583,7 @@ func RunCommitTrigger(
 	rec EvalContext,
 	batch engine.Batch,
 	ms *enginepb.MVCCStats,
-	args *roachpb.EndTransactionRequest,
+	args *roachpb.EndTxnRequest,
 	txn *roachpb.Transaction,
 ) (result.Result, error) {
 	ct := args.InternalCommitTrigger
@@ -681,8 +701,8 @@ func RunCommitTrigger(
 // and the meta range addressing information. (If we're splitting a meta2 range
 // we'll be updating the meta1 addressing, otherwise we'll be updating the
 // meta2 addressing). That transaction includes a special SplitTrigger flag on
-// the EndTransaction request. Like all transactions, the requests within the
-// transaction are replicated via Raft, including the EndTransaction request.
+// the EndTxn request. Like all transactions, the requests within the
+// transaction are replicated via Raft, including the EndTxn request.
 //
 // The second phase of split processing occurs when each replica for the range
 // encounters the SplitTrigger. Processing of the SplitTrigger happens below,
@@ -995,10 +1015,9 @@ func splitTriggerHelper(
 		// writeInitialReplicaState which essentially writes a ReplicaState
 		// only.
 
-		v := cluster.Version.ActiveVersion(ctx, rec.ClusterSettings()).Version
 		*h.AbsPostSplitRight(), err = stateloader.WriteInitialReplicaState(
 			ctx, batch, *h.AbsPostSplitRight(), split.RightDesc, rightLease,
-			*gcThreshold, v, truncStateType,
+			*gcThreshold, truncStateType,
 		)
 		if err != nil {
 			return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to write initial Replica state")
@@ -1006,8 +1025,6 @@ func splitTriggerHelper(
 	}
 
 	var pd result.Result
-	// This makes sure that no reads are happening in parallel; see #3148.
-	pd.Replicated.BlockReads = true
 	pd.Replicated.Split = &storagepb.Split{
 		SplitTrigger: *split,
 		// NB: the RHSDelta is identical to the stats for the newly created right
@@ -1066,7 +1083,6 @@ func mergeTrigger(
 	}
 
 	var pd result.Result
-	pd.Replicated.BlockReads = true
 	pd.Replicated.Merge = &storagepb.Merge{
 		MergeTrigger: *merge,
 	}
@@ -1074,7 +1090,7 @@ func mergeTrigger(
 }
 
 func changeReplicasTrigger(
-	ctx context.Context, rec EvalContext, batch engine.Batch, change *roachpb.ChangeReplicasTrigger,
+	_ context.Context, rec EvalContext, _ engine.Batch, change *roachpb.ChangeReplicasTrigger,
 ) result.Result {
 	var pd result.Result
 	// After a successful replica addition or removal check to see if the
@@ -1113,4 +1129,17 @@ func changeReplicasTrigger(
 	}
 
 	return pd
+}
+
+// txnAutoGC controls whether Transaction entries are automatically gc'ed upon
+// EndTxn if they only have local intents (which can be resolved synchronously
+// with EndTxn). Certain tests become simpler with this being turned off.
+var txnAutoGC = true
+
+// TestingSetTxnAutoGC is used in tests to temporarily enable/disable
+// txnAutoGC.
+func TestingSetTxnAutoGC(to bool) func() {
+	prev := txnAutoGC
+	txnAutoGC = to
+	return func() { txnAutoGC = prev }
 }

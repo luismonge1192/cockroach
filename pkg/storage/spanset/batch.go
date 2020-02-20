@@ -81,13 +81,13 @@ func (i *Iterator) SeekGE(key engine.MVCCKey) {
 
 // SeekLT is part of the engine.Iterator interface.
 func (i *Iterator) SeekLT(key engine.MVCCKey) {
-	// NB: this isn't exactly right because the key provided to SeekLT is
-	// exclusive so requesting the first key in an allowed span should not
-	// be permitted, but it's close enough.
+	// CheckAllowed{At} supports the span representation of [,key), which
+	// corresponds to the span [key.Prev(),).
+	revSpan := roachpb.Span{EndKey: key.Key}
 	if i.spansOnly {
-		i.err = i.spans.CheckAllowed(SpanReadOnly, roachpb.Span{Key: key.Key})
+		i.err = i.spans.CheckAllowed(SpanReadOnly, revSpan)
 	} else {
-		i.err = i.spans.CheckAllowedAt(SpanReadOnly, roachpb.Span{Key: key.Key}, i.ts)
+		i.err = i.spans.CheckAllowedAt(SpanReadOnly, revSpan, i.ts)
 	}
 	if i.err == nil {
 		i.invalid = false
@@ -250,14 +250,14 @@ func (i *Iterator) MVCCGet(
 // MVCCScan is part of the engine.MVCCIterator interface.
 func (i *Iterator) MVCCScan(
 	start, end roachpb.Key, max int64, timestamp hlc.Timestamp, opts engine.MVCCScanOptions,
-) (kvData [][]byte, numKVs int64, resumeSpan *roachpb.Span, intents []roachpb.Intent, err error) {
+) (engine.MVCCScanResult, error) {
 	if i.spansOnly {
 		if err := i.spans.CheckAllowed(SpanReadOnly, roachpb.Span{Key: start, EndKey: end}); err != nil {
-			return nil, 0, nil, nil, err
+			return engine.MVCCScanResult{}, err
 		}
 	} else {
 		if err := i.spans.CheckAllowedAt(SpanReadOnly, roachpb.Span{Key: start, EndKey: end}, timestamp); err != nil {
-			return nil, 0, nil, nil, err
+			return engine.MVCCScanResult{}, err
 		}
 	}
 	return i.i.(engine.MVCCIterator).MVCCScan(start, end, max, timestamp, opts)
@@ -286,9 +286,10 @@ func (s spanSetReader) ExportToSst(
 	startKey, endKey roachpb.Key,
 	startTS, endTS hlc.Timestamp,
 	exportAllRevisions bool,
+	targetSize, maxSize uint64,
 	io engine.IterOptions,
-) ([]byte, roachpb.BulkOpSummary, error) {
-	return s.r.ExportToSst(startKey, endKey, startTS, endTS, exportAllRevisions, io)
+) ([]byte, roachpb.BulkOpSummary, roachpb.Key, error) {
+	return s.r.ExportToSst(startKey, endKey, startTS, endTS, exportAllRevisions, targetSize, maxSize, io)
 }
 
 func (s spanSetReader) Get(key engine.MVCCKey) ([]byte, error) {
@@ -344,14 +345,14 @@ func (s spanSetReader) NewIterator(opts engine.IterOptions) engine.Iterator {
 }
 
 // GetDBEngine recursively searches for the underlying rocksDB engine.
-func GetDBEngine(e engine.Reader, span roachpb.Span) engine.Reader {
-	switch v := e.(type) {
+func GetDBEngine(reader engine.Reader, span roachpb.Span) engine.Reader {
+	switch v := reader.(type) {
 	case ReadWriter:
 		return GetDBEngine(getSpanReader(v, span), span)
 	case *spanSetBatch:
 		return GetDBEngine(getSpanReader(v.ReadWriter, span), span)
 	default:
-		return e
+		return reader
 	}
 }
 

@@ -29,7 +29,7 @@ message NotLeaseHolderError {
   option (gogoproto.equal) = true;
 
   // The replica the error originated from. Used in the error's string
-  // representation.
+  // representation, if known.
   optional ReplicaDescriptor replica = 1 [(gogoproto.nullable) = false];
   // The lease holder, if known.
   optional ReplicaDescriptor lease_holder = 2;
@@ -118,12 +118,12 @@ enum TransactionAbortedReason {
   // For backwards compatibility.
   ABORT_REASON_UNKNOWN = 0;
 
-  // A BeginTransaction, HeartbeatTxn, or EndTransaction(commit=true) request
-  // found an aborted transaction record. Another txn must have written this
-  // record - that other txn probably ran into one of our intents and pushed our
-  // transaction record successfully. Either a high-priority transaction simply
-  // pushed us or we failed to heartbeat for a while and another txn (of any
-  // priority) considered us abandoned and pushed us.
+  // A HeartbeatTxn or EndTxn(commit=true) request found an aborted transaction
+  // record. Another txn must have written this record - that other txn probably
+  // ran into one of our intents and pushed our transaction record successfully.
+  // Either a high-priority transaction simply pushed us or we failed to
+  // heartbeat for a while and another txn (of any priority) considered us
+  // abandoned and pushed us.
   ABORT_REASON_ABORTED_RECORD_FOUND = 1;
 
   // The client is trying to use a transaction that's already been aborted. The
@@ -150,11 +150,28 @@ enum TransactionAbortedReason {
   // it must be the latter case, and the transaction can be retried.
   ABORT_REASON_ALREADY_COMMITTED_OR_ROLLED_BACK_POSSIBLE_REPLAY = 6;
 
-  // Like the above, except the timestamp cache doesn't have a txn id in it.
-  // This means that it no longer has good accuracy; likely as a result of a
-  // lease transfer. As above, if the error has not been converted by the time
-  // it reaches a client, then it's not a replay.
-  ABORT_REASON_TIMESTAMP_CACHE_REJECTED_POSSIBLE_REPLAY= 7;
+  // A request attempting to create a transaction record is not allowed to
+  // proceed by the timestamp cache because it cannot be verified that the
+  // respective transaction record did not previously exist. As opposed to the
+  // case above, the timestamp cache does not have a txn id in it, but the lease
+  // under which the request is evaluated is newer than the transaction's
+  // minimum timestamp (see CanCreateTxnRecord()). A new lease wipes the
+  // timestamp cache, so transaction record creation is bound to fail for
+  // transactions that spanned a lease acquisition.
+  // As above, if the error has not been converted by the time it reaches a
+  // client, then it's not a replay.
+  ABORT_REASON_NEW_LEASE_PREVENTS_TXN = 8;
+
+  // Like the above, the timestamp cache rejects the creation of a transaction
+  // record. But there's no txn id in the ts cache, and also the lease is not
+  // new. The timestamp cache has lost accuracy because of a range merge or
+  // because of its memory limit.
+  // As above, if the error has not been converted by the time it reaches a
+  // client, then it's not a replay.
+  //
+  // TODO(andrei): We should be able to identify the range merge case by saving
+  // a bit more info in the timestamp cache.
+  ABORT_REASON_TIMESTAMP_CACHE_REJECTED = 7;
   
   reserved 2;
 }
@@ -192,13 +209,8 @@ enum TransactionRetryReason {
   RETRY_REASON_UNKNOWN = 0;
   // A concurrent writer finished first, causing restart.
   RETRY_WRITE_TOO_OLD = 1;
-  reserved 2;
   // A SERIALIZABLE transaction had its timestamp moved forward.
   RETRY_SERIALIZABLE = 3;
-  // A possible replay caused by duplicate begin txn or out-of-order
-  // txn sequence number.
-  // TODO(nvanbenschoten): This is no longer in use. Remove in 2.4.
-  RETRY_POSSIBLE_REPLAY = 4;
   // An asynchronous write was observed to have failed.
   RETRY_ASYNC_WRITE_FAILURE = 5;
   // The transaction exceeded its deadline.

@@ -29,8 +29,10 @@ import (
 //
 // See Builder.buildStmt for a description of the remaining input and
 // return values.
-func (b *Builder) buildJoin(join *tree.JoinTableExpr, inScope *scope) (outScope *scope) {
-	leftScope := b.buildDataSource(join.Left, nil /* indexFlags */, inScope)
+func (b *Builder) buildJoin(
+	join *tree.JoinTableExpr, locking lockingSpec, inScope *scope,
+) (outScope *scope) {
+	leftScope := b.buildDataSource(join.Left, nil /* indexFlags */, locking, inScope)
 
 	isLateral := false
 	inScopeRight := inScope
@@ -43,7 +45,7 @@ func (b *Builder) buildJoin(join *tree.JoinTableExpr, inScope *scope) (outScope 
 		inScopeRight = leftScope
 	}
 
-	rightScope := b.buildDataSource(join.Right, nil /* indexFlags */, inScopeRight)
+	rightScope := b.buildDataSource(join.Right, nil /* indexFlags */, locking, inScopeRight)
 
 	// Check that the same table name is not used on both sides.
 	b.validateJoinTableNames(leftScope, rightScope)
@@ -54,13 +56,11 @@ func (b *Builder) buildJoin(join *tree.JoinTableExpr, inScope *scope) (outScope 
 	case "":
 	case tree.AstHash:
 		telemetry.Inc(sqltelemetry.HashJoinHintUseCounter)
-		flags.DisallowMergeJoin = true
-		flags.DisallowLookupJoin = true
+		flags = memo.AllowHashJoinStoreRight
 
 	case tree.AstLookup:
 		telemetry.Inc(sqltelemetry.LookupJoinHintUseCounter)
-		flags.DisallowHashJoin = true
-		flags.DisallowMergeJoin = true
+		flags = memo.AllowLookupJoinIntoRight
 		if joinType != sqlbase.InnerJoin && joinType != sqlbase.LeftOuterJoin {
 			panic(pgerror.Newf(pgcode.Syntax,
 				"%s can only be used with INNER or LEFT joins", tree.AstLookup,
@@ -69,8 +69,7 @@ func (b *Builder) buildJoin(join *tree.JoinTableExpr, inScope *scope) (outScope 
 
 	case tree.AstMerge:
 		telemetry.Inc(sqltelemetry.MergeJoinHintUseCounter)
-		flags.DisallowLookupJoin = true
-		flags.DisallowHashJoin = true
+		flags = memo.AllowMergeJoin
 
 	default:
 		panic(pgerror.Newf(
@@ -107,7 +106,7 @@ func (b *Builder) buildJoin(join *tree.JoinTableExpr, inScope *scope) (outScope 
 			filter := b.buildScalar(
 				outScope.resolveAndRequireType(on.Expr, types.Bool), outScope, nil, nil, nil,
 			)
-			filters = memo.FiltersExpr{{Condition: filter}}
+			filters = memo.FiltersExpr{b.factory.ConstructFiltersItem(filter)}
 		} else {
 			filters = memo.TrueFilter
 		}
@@ -454,7 +453,7 @@ func (jb *usingJoinBuilder) addEqualityCondition(leftCol, rightCol *scopeColumn)
 	leftVar := jb.b.factory.ConstructVariable(leftCol.id)
 	rightVar := jb.b.factory.ConstructVariable(rightCol.id)
 	eq := jb.b.factory.ConstructEq(leftVar, rightVar)
-	jb.filters = append(jb.filters, memo.FiltersItem{Condition: eq})
+	jb.filters = append(jb.filters, jb.b.factory.ConstructFiltersItem(eq))
 
 	// Add the merged column to the scope, constructing a new column if needed.
 	if jb.joinType == sqlbase.InnerJoin || jb.joinType == sqlbase.LeftOuterJoin {

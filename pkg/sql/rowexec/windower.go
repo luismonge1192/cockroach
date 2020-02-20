@@ -149,6 +149,7 @@ type windower struct {
 
 var _ execinfra.Processor = &windower{}
 var _ execinfra.RowSource = &windower{}
+var _ execinfra.OpNode = &windower{}
 
 const windowerProcName = "windower"
 
@@ -213,7 +214,7 @@ func newWindower(
 				memRequiredByWindower, limit)
 		}
 	} else {
-		if limit < memRequiredByWindower {
+		if flowCtx.Cfg.TestingKnobs.ForceDiskSpill || limit < memRequiredByWindower {
 			// The limit is set very low by the tests, but the windower requires
 			// some amount of RAM, so we override the limit.
 			limit = memRequiredByWindower
@@ -261,7 +262,7 @@ func newWindower(
 	w.acc = w.MemMonitor.MakeBoundAccount()
 
 	if sp := opentracing.SpanFromContext(ctx); sp != nil && tracing.IsRecording(sp) {
-		w.input = execinfra.NewInputStatCollector(w.input)
+		w.input = newInputStatCollector(w.input)
 		w.FinishTrace = w.outputStatsToTrace
 	}
 
@@ -483,7 +484,11 @@ func (w *windower) processPartition(
 	partition *rowcontainer.DiskBackedIndexedRowContainer,
 	partitionIdx int,
 ) error {
-	var peerGrouper tree.PeerGroupChecker
+	peerGrouper := &partitionPeerGrouper{
+		ctx:     ctx,
+		evalCtx: evalCtx,
+		rowCopy: make(sqlbase.EncDatumRow, len(w.inputTypes)),
+	}
 	usage := sizeOfSliceOfRows + rowSliceOverhead + sizeOfRow*int64(len(w.windowFns))
 	if err := w.growMemAccount(&w.acc, usage); err != nil {
 		return err
@@ -600,17 +605,9 @@ func (w *windower) processPartition(
 				}
 				partition.Sort(ctx)
 			}
-			peerGrouper = &partitionPeerGrouper{
-				ctx:       ctx,
-				evalCtx:   evalCtx,
-				partition: partition,
-				ordering:  windowFn.ordering,
-				rowCopy:   make(sqlbase.EncDatumRow, len(w.inputTypes)),
-			}
-		} else {
-			// If ORDER BY clause is not provided, all rows are peers.
-			peerGrouper = allPeers{}
 		}
+		peerGrouper.ordering = windowFn.ordering
+		peerGrouper.partition = partition
 
 		frameRun.Rows = partition
 		frameRun.RowIdx = 0
@@ -830,6 +827,10 @@ type partitionPeerGrouper struct {
 }
 
 func (n *partitionPeerGrouper) InSameGroup(i, j int) (bool, error) {
+	if len(n.ordering.Columns) == 0 {
+		// ORDER BY clause is omitted, so all rows are peers.
+		return true, nil
+	}
 	if n.err != nil {
 		return false, n.err
 	}
@@ -864,11 +865,6 @@ func (n *partitionPeerGrouper) InSameGroup(i, j int) (bool, error) {
 	return true, nil
 }
 
-type allPeers struct{}
-
-// allPeers implements the PeerGroupChecker interface.
-func (allPeers) InSameGroup(i, j int) (bool, error) { return true, nil }
-
 const sizeOfInt = int64(unsafe.Sizeof(int(0)))
 const sliceOfIntsOverhead = int64(unsafe.Sizeof([]int{}))
 const sizeOfSliceOfRows = int64(unsafe.Sizeof([][]tree.Datum{}))
@@ -899,8 +895,8 @@ const windowerTagPrefix = "windower."
 // Stats implements the SpanStats interface.
 func (ws *WindowerStats) Stats() map[string]string {
 	inputStatsMap := ws.InputStats.Stats(windowerTagPrefix)
-	inputStatsMap[windowerTagPrefix+execinfra.MaxMemoryTagSuffix] = humanizeutil.IBytes(ws.MaxAllocatedMem)
-	inputStatsMap[windowerTagPrefix+execinfra.MaxDiskTagSuffix] = humanizeutil.IBytes(ws.MaxAllocatedDisk)
+	inputStatsMap[windowerTagPrefix+MaxMemoryTagSuffix] = humanizeutil.IBytes(ws.MaxAllocatedMem)
+	inputStatsMap[windowerTagPrefix+MaxDiskTagSuffix] = humanizeutil.IBytes(ws.MaxAllocatedDisk)
 	return inputStatsMap
 }
 
@@ -908,12 +904,12 @@ func (ws *WindowerStats) Stats() map[string]string {
 func (ws *WindowerStats) StatsForQueryPlan() []string {
 	return append(
 		ws.InputStats.StatsForQueryPlan("" /* prefix */),
-		fmt.Sprintf("%s: %s", execinfra.MaxMemoryQueryPlanSuffix, humanizeutil.IBytes(ws.MaxAllocatedMem)),
-		fmt.Sprintf("%s: %s", execinfra.MaxDiskQueryPlanSuffix, humanizeutil.IBytes(ws.MaxAllocatedDisk)),
+		fmt.Sprintf("%s: %s", MaxMemoryQueryPlanSuffix, humanizeutil.IBytes(ws.MaxAllocatedMem)),
+		fmt.Sprintf("%s: %s", MaxDiskQueryPlanSuffix, humanizeutil.IBytes(ws.MaxAllocatedDisk)),
 	)
 }
 func (w *windower) outputStatsToTrace() {
-	is, ok := execinfra.GetInputStats(w.FlowCtx, w.input)
+	is, ok := getInputStats(w.FlowCtx, w.input)
 	if !ok {
 		return
 	}
@@ -927,4 +923,20 @@ func (w *windower) outputStatsToTrace() {
 			},
 		)
 	}
+}
+
+// ChildCount is part of the execinfra.OpNode interface.
+func (w *windower) ChildCount(verbose bool) int {
+	return 1
+}
+
+// Child is part of the execinfra.OpNode interface.
+func (w *windower) Child(nth int, verbose bool) execinfra.OpNode {
+	if nth == 0 {
+		if n, ok := w.input.(execinfra.OpNode); ok {
+			return n
+		}
+		panic("input to windower is not an execinfra.OpNode")
+	}
+	panic(fmt.Sprintf("invalid index %d", nth))
 }

@@ -34,9 +34,15 @@ func (r *RowCounter) Count(key roachpb.Key) error {
 	// We reuse it here to count "rows" by counting when it changes.
 	// Non-SQL keys are returned unchanged or may error -- we ignore them, since
 	// non-SQL keys are obviously thus not SQL rows.
+	//
+	// TODO(ajwerner): provide a separate mechanism to determine whether the key
+	// is a valid SQL key which explicitly indicates whether the key is valid as
+	// a split key independent of an error. See #43423.
 	row, err := keys.EnsureSafeSplitKey(key)
 	if err != nil || len(key) == len(row) {
-		return nil
+		// TODO(ajwerner): Determine which errors should be ignored and only
+		// ignore those.
+		return nil //nolint:returnerrcheck
 	}
 
 	// no change key prefix => no new row.
@@ -46,21 +52,17 @@ func (r *RowCounter) Count(key roachpb.Key) error {
 
 	r.prev = append(r.prev[:0], row...)
 
-	rest, tbl, err := keys.DecodeTablePrefix(row)
+	rest, _, err := keys.DecodeTablePrefix(row)
 	if err != nil {
 		return err
 	}
 
-	if tbl < keys.MaxReservedDescID {
-		r.SystemRecords++
+	if _, indexID, err := encoding.DecodeUvarintAscending(rest); err != nil {
+		return err
+	} else if indexID == 1 {
+		r.Rows++
 	} else {
-		if _, indexID, err := encoding.DecodeUvarintAscending(rest); err != nil {
-			return err
-		} else if indexID == 1 {
-			r.Rows++
-		} else {
-			r.IndexEntries++
-		}
+		r.IndexEntries++
 	}
 
 	return nil

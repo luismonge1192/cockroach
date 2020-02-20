@@ -22,8 +22,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -453,11 +454,19 @@ CREATE TABLE crdb_internal.jobs (
 	coordinator_id     		INT
 )`,
 	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		currentUser := p.SessionData().User
+		isAdmin, err := p.HasAdminRole(ctx)
+		if err != nil {
+			return err
+		}
+
+		// Beware: we're querying system.jobs as root; we need to be careful to filter
+		// out results that the current user is not able to see.
 		query := `SELECT id, status, created, payload, progress FROM system.jobs`
-		rows, _ /* cols */, err :=
-			p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryWithUser(
-				ctx, "crdb-internal-jobs-table", p.txn,
-				p.SessionData().User, query)
+		rows, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryEx(
+			ctx, "crdb-internal-jobs-table", p.txn,
+			sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+			query)
 		if err != nil {
 			return err
 		}
@@ -472,6 +481,16 @@ CREATE TABLE crdb_internal.jobs (
 
 			// Extract data from the payload.
 			payload, err := jobs.UnmarshalPayload(payloadBytes)
+
+			// We filter out masked rows before we allocate all the
+			// datums. Needless allocate when not necessary.
+			sameUser := payload != nil && payload.Username == currentUser
+			if canAccess := isAdmin || sameUser; !canAccess {
+				// This user is neither an admin nor the user who created the
+				// job. They cannot see this row.
+				continue
+			}
+
 			if err != nil {
 				errorStr = tree.NewDString(fmt.Sprintf("error decoding payload: %v", err))
 			} else {
@@ -928,6 +947,11 @@ func populateQueriesTable(
 					isDistributedDatum = tree.DBoolTrue
 				}
 			}
+
+			if query.Progress > 0 {
+				phase = fmt.Sprintf("%s (%.2f%%)", phase, query.Progress*100)
+			}
+
 			if err := addRow(
 				tree.NewDString(query.ID),
 				tree.NewDInt(tree.DInt(session.NodeID)),
@@ -1224,14 +1248,14 @@ CREATE TABLE crdb_internal.create_statements (
 		} else {
 			for _, row := range zoneConstraintRows {
 				tableName := string(tree.MustBeDString(row[0]))
-				var zoneConfig config.ZoneConfig
+				var zoneConfig zonepb.ZoneConfig
 				yamlString := string(tree.MustBeDString(row[1]))
 				err := yaml.UnmarshalStrict([]byte(yamlString), &zoneConfig)
 				if err != nil {
 					return err
 				}
 				// If all constraints are default, then don't show anything.
-				if !zoneConfig.Equal(config.ZoneConfig{}) {
+				if !zoneConfig.Equal(zonepb.ZoneConfig{}) {
 					sqlString := string(tree.MustBeDString(row[2]))
 					zoneConfigStmts[tableName] = append(zoneConfigStmts[tableName], sqlString)
 				}
@@ -1260,7 +1284,7 @@ CREATE TABLE crdb_internal.create_statements (
 				} else {
 					descType = typeTable
 					tn := (*tree.Name)(&table.Name)
-					createNofk, err = ShowCreateTable(ctx, tn, contextName, table, lCtx, OmitFKClausesFromCreate)
+					createNofk, err = ShowCreateTable(ctx, p, tn, contextName, table, lCtx, OmitFKClausesFromCreate)
 					if err != nil {
 						return err
 					}
@@ -1268,7 +1292,7 @@ CREATE TABLE crdb_internal.create_statements (
 					if err := showAlterStatementWithInterleave(ctx, tn, contextName, lCtx, allIdx, table, alterStmts, validateStmts); err != nil {
 						return err
 					}
-					stmt, err = ShowCreateTable(ctx, tn, contextName, table, lCtx, IncludeFkClausesInCreate)
+					stmt, err = ShowCreateTable(ctx, p, tn, contextName, table, lCtx, IncludeFkClausesInCreate)
 				}
 				if err != nil {
 					return err
@@ -1481,7 +1505,8 @@ CREATE TABLE crdb_internal.table_indexes (
   index_id         INT NOT NULL,
   index_name       STRING NOT NULL,
   index_type       STRING NOT NULL,
-  is_unique        BOOL NOT NULL
+  is_unique        BOOL NOT NULL,
+  is_inverted      BOOL NOT NULL
 )
 `,
 	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
@@ -1498,6 +1523,7 @@ CREATE TABLE crdb_internal.table_indexes (
 					tree.NewDString(table.PrimaryIndex.Name),
 					primary,
 					tree.MakeDBool(tree.DBool(table.PrimaryIndex.Unique)),
+					tree.MakeDBool(table.PrimaryIndex.Type == sqlbase.IndexDescriptor_INVERTED),
 				); err != nil {
 					return err
 				}
@@ -1509,6 +1535,7 @@ CREATE TABLE crdb_internal.table_indexes (
 						tree.NewDString(idx.Name),
 						secondary,
 						tree.MakeDBool(tree.DBool(idx.Unique)),
+						tree.MakeDBool(idx.Type == sqlbase.IndexDescriptor_INVERTED),
 					); err != nil {
 						return err
 					}
@@ -1683,13 +1710,21 @@ CREATE TABLE crdb_internal.backward_dependencies (
 
 				for i := range table.OutboundFKs {
 					fk := &table.OutboundFKs[i]
+					refTbl, err := tableLookup.getTableByID(fk.ReferencedTableID)
+					if err != nil {
+						return err
+					}
+					refIdx, err := sqlbase.FindFKReferencedIndex(refTbl, fk.ReferencedColumnIDs)
+					if err != nil {
+						return err
+					}
 					if err := addRow(
 						tableID, tableName,
 						tree.DNull,
 						tree.DNull,
 						tree.NewDInt(tree.DInt(fk.ReferencedTableID)),
 						fkDep,
-						tree.NewDInt(tree.DInt(fk.LegacyReferencedIndex)),
+						tree.NewDInt(tree.DInt(refIdx.ID)),
 						tree.NewDString(fk.Name),
 						tree.DNull,
 					); err != nil {
@@ -2005,31 +2040,31 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 				return nil, err
 			}
 
-			var voterReplicas, learnerReplicas []int
-			for _, rd := range desc.Replicas().Voters() {
-				voterReplicas = append(voterReplicas, int(rd.StoreID))
-			}
+			voterReplicas := append([]roachpb.ReplicaDescriptor(nil), desc.Replicas().Voters()...)
+			var learnerReplicaStoreIDs []int
 			for _, rd := range desc.Replicas().Learners() {
-				learnerReplicas = append(learnerReplicas, int(rd.StoreID))
+				learnerReplicaStoreIDs = append(learnerReplicaStoreIDs, int(rd.StoreID))
 			}
-			sort.Ints(voterReplicas)
-			sort.Ints(learnerReplicas)
+			sort.Slice(voterReplicas, func(i, j int) bool {
+				return voterReplicas[i].StoreID < voterReplicas[j].StoreID
+			})
+			sort.Ints(learnerReplicaStoreIDs)
 			votersArr := tree.NewDArray(types.Int)
 			for _, replica := range voterReplicas {
-				if err := votersArr.Append(tree.NewDInt(tree.DInt(replica))); err != nil {
+				if err := votersArr.Append(tree.NewDInt(tree.DInt(replica.StoreID))); err != nil {
 					return nil, err
 				}
 			}
 			learnersArr := tree.NewDArray(types.Int)
-			for _, replica := range learnerReplicas {
+			for _, replica := range learnerReplicaStoreIDs {
 				if err := learnersArr.Append(tree.NewDInt(tree.DInt(replica))); err != nil {
 					return nil, err
 				}
 			}
 
 			replicaLocalityArr := tree.NewDArray(types.String)
-			for _, id := range voterReplicas {
-				replicaLocality := nodeIDToLocality[roachpb.NodeID(id)].String()
+			for _, replica := range voterReplicas {
+				replicaLocality := nodeIDToLocality[replica.NodeID].String()
 				if err := replicaLocalityArr.Append(tree.NewDString(replicaLocality)); err != nil {
 					return nil, err
 				}
@@ -2072,29 +2107,71 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 	},
 }
 
-type namespaceKey struct {
-	parentID sqlbase.ID
-	name     string
+// NamespaceKey represents a key from the namespace table.
+type NamespaceKey struct {
+	ParentID sqlbase.ID
+	// ParentSchemaID is not populated for rows under system.deprecated_namespace.
+	// This table will no longer exist on 20.2 or later.
+	ParentSchemaID sqlbase.ID
+	Name           string
 }
 
 // getAllNames returns a map from ID to namespaceKey for every entry in
 // system.namespace.
-func (p *planner) getAllNames(ctx context.Context) (map[sqlbase.ID]namespaceKey, error) {
-	namespace := map[sqlbase.ID]namespaceKey{}
-	rows, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.Query(
-		ctx, "get-all-names", p.txn,
-		`SELECT id, "parentID", name FROM system.namespace`,
+func (p *planner) getAllNames(ctx context.Context) (map[sqlbase.ID]NamespaceKey, error) {
+	return getAllNames(ctx, p.txn, p.ExtendedEvalContext().ExecCfg.InternalExecutor)
+}
+
+// TestingGetAllNames is a wrapper for getAllNames.
+func TestingGetAllNames(
+	ctx context.Context, txn *client.Txn, executor *InternalExecutor,
+) (map[sqlbase.ID]NamespaceKey, error) {
+	return getAllNames(ctx, txn, executor)
+}
+
+// getAllNames is the testable implementation of getAllNames.
+// It is public so that it can be tested outside the sql package.
+func getAllNames(
+	ctx context.Context, txn *client.Txn, executor *InternalExecutor,
+) (map[sqlbase.ID]NamespaceKey, error) {
+	namespace := map[sqlbase.ID]NamespaceKey{}
+	rows, err := executor.Query(
+		ctx, "get-all-names", txn,
+		`SELECT id, "parentID", "parentSchemaID", name FROM system.namespace`,
 	)
 	if err != nil {
 		return nil, err
 	}
 	for _, r := range rows {
-		id, parentID, name := tree.MustBeDInt(r[0]), tree.MustBeDInt(r[1]), tree.MustBeDString(r[2])
-		namespace[sqlbase.ID(id)] = namespaceKey{
-			parentID: sqlbase.ID(parentID),
-			name:     string(name),
+		id, parentID, parentSchemaID, name := tree.MustBeDInt(r[0]), tree.MustBeDInt(r[1]), tree.MustBeDInt(r[2]), tree.MustBeDString(r[3])
+		namespace[sqlbase.ID(id)] = NamespaceKey{
+			ParentID:       sqlbase.ID(parentID),
+			ParentSchemaID: sqlbase.ID(parentSchemaID),
+			Name:           string(name),
 		}
 	}
+
+	// Also get all rows from namespace_deprecated, and add to the namespace map
+	// if it is not already there yet.
+	// If a row exists in both here and namespace, only use the one from namespace.
+	// TODO(sqlexec): In 20.2, this can be removed.
+	deprecatedRows, err := executor.Query(
+		ctx, "get-all-names-deprecated-namespace", txn,
+		`SELECT id, "parentID", name FROM system.namespace_deprecated`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range deprecatedRows {
+		id, parentID, name := tree.MustBeDInt(r[0]), tree.MustBeDInt(r[1]), tree.MustBeDString(r[2])
+		if _, ok := namespace[sqlbase.ID(id)]; !ok {
+			namespace[sqlbase.ID(id)] = NamespaceKey{
+				ParentID: sqlbase.ID(parentID),
+				Name:     string(name),
+			}
+		}
+	}
+
 	return namespace, nil
 }
 
@@ -2129,7 +2206,7 @@ CREATE TABLE crdb_internal.zones (
 		}
 		resolveID := func(id uint32) (parentID uint32, name string, err error) {
 			if entry, ok := namespace[sqlbase.ID(id)]; ok {
-				return uint32(entry.parentID), entry.name, nil
+				return uint32(entry.ParentID), entry.Name, nil
 			}
 			return 0, "", errors.AssertionFailedf(
 				"object with ID %d does not exist", errors.Safe(id))
@@ -2153,7 +2230,7 @@ CREATE TABLE crdb_internal.zones (
 			id := uint32(tree.MustBeDInt(r[0]))
 
 			var zoneSpecifier *tree.ZoneSpecifier
-			zs, err := config.ZoneSpecifierFromID(id, resolveID)
+			zs, err := zonepb.ZoneSpecifierFromID(id, resolveID)
 			if err != nil {
 				// We can have valid zoneSpecifiers whose table/database has been
 				// deleted because zoneSpecifiers are collected asynchronously.
@@ -2165,7 +2242,7 @@ CREATE TABLE crdb_internal.zones (
 			}
 
 			configBytes := []byte(*r[1].(*tree.DBytes))
-			var configProto config.ZoneConfig
+			var configProto zonepb.ZoneConfig
 			if err := protoutil.Unmarshal(configBytes, &configProto); err != nil {
 				return err
 			}
@@ -2343,7 +2420,7 @@ CREATE TABLE crdb_internal.gossip_nodes (
 		g := p.ExecCfg().Gossip
 		descriptors, err := getAllNodeDescriptors(p)
 		if err != nil {
-			return nil
+			return err
 		}
 
 		alive := make(map[roachpb.NodeID]tree.DBool)

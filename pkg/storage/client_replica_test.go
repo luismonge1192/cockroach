@@ -23,7 +23,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -190,7 +190,7 @@ func TestRejectFutureCommand(t *testing.T) {
 //    Writer txn. The Writer will not actually restart until it tries to commit
 //    the current epoch of the transaction. The Reader updates the timestamp of
 //    the write intent to T+200. The test deliberately fails the Reader get
-//    operation, and cockroach doesn't update its read timestamp cache.
+//    operation, and cockroach doesn't update its timestamp cache.
 // 4) The Writer executes the put operation again. This put operation comes
 //    out-of-order since its timestamp is T+100, while the intent timestamp
 //    updated at Step 3 is T+200.
@@ -507,7 +507,8 @@ func TestRangeLookupUseReverse(t *testing.T) {
 }
 
 type leaseTransferTest struct {
-	mtc                        *multiTestContext
+	mtc *multiTestContext
+	// replicas of range covering key "a" on the first and the second stores.
 	replica0, replica1         *storage.Replica
 	replica0Desc, replica1Desc roachpb.ReplicaDescriptor
 	leftKey                    roachpb.Key
@@ -643,15 +644,20 @@ func (l *leaseTransferTest) setFilter(setTo bool, extensionSem chan struct{}) {
 			l.filter = nil
 			l.filterMu.Unlock()
 			extensionSem <- struct{}{}
+			log.Infof(filterArgs.Ctx, "filter blocking request: %s", llReq)
 			<-extensionSem
+			log.Infof(filterArgs.Ctx, "filter unblocking lease request")
 		}
 		return nil
 	}
 }
 
+// forceLeaseExtension moves the clock forward close to the lease's expiration,
+// and then performs a read on the range, which will force the lease to be
+// renewed. This assumes the lease is not epoch-based.
 func (l *leaseTransferTest) forceLeaseExtension(storeIdx int, lease roachpb.Lease) error {
-	shouldRenewTS := lease.Expiration.Add(-1, 0)
-	l.mtc.manualClock.Set(shouldRenewTS.WallTime + 1)
+	// Set the clock close to the lease's expiration.
+	l.mtc.manualClock.Set(lease.Expiration.WallTime - 10)
 	err := l.sendRead(storeIdx).GoError()
 	// We can sometimes receive an error from our renewal attempt because the
 	// lease transfer ends up causing the renewal to re-propose and second
@@ -1152,13 +1158,9 @@ func TestLeaseNotUsedAfterRestart(t *testing.T) {
 }
 
 // Test that a lease extension (a RequestLeaseRequest that doesn't change the
-// lease holder) is not blocked by ongoing reads.
-// The test relies on two things:
-// 1) Lease extensions, unlike lease transfers, are not blocked by reads through
-//    their ReplicatedEvalResult.BlockReads.
-// 2) Requests such as RequestLeaseRequest don't declare to touch the whole key
-//    span of the range, and thus don't acquire latches that conflict with other
-//    reads.
+// lease holder) is not blocked by ongoing reads. The test relies on the fact
+// that RequestLeaseRequest does not declare to touch the whole key span of the
+// range, and thus don't conflict through the command queue with other reads.
 func TestLeaseExtensionNotBlockedByRead(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	readBlocked := make(chan struct{})
@@ -1716,8 +1718,8 @@ func TestSystemZoneConfigs(t *testing.T) {
 	}
 	expectedUserRanges := 1
 	expectedSystemRanges -= expectedUserRanges
-	systemNumReplicas := int(*config.DefaultSystemZoneConfig().NumReplicas)
-	userNumReplicas := int(*config.DefaultZoneConfig().NumReplicas)
+	systemNumReplicas := int(*zonepb.DefaultSystemZoneConfig().NumReplicas)
+	userNumReplicas := int(*zonepb.DefaultZoneConfig().NumReplicas)
 	expectedReplicas := expectedSystemRanges*systemNumReplicas + expectedUserRanges*userNumReplicas
 	log.Infof(ctx, "TestSystemZoneConfig: expecting %d system ranges and %d user ranges",
 		expectedSystemRanges, expectedUserRanges)
@@ -1917,7 +1919,7 @@ func TestLeaseTransferInSnapshotUpdatesTimestampCache(t *testing.T) {
 	// and the write will be attempted on the new leaseholder (node 2).
 	// It should not succeed because it should run into the timestamp cache.
 	db := mtc.dbs[0]
-	txnOld := client.NewTxn(ctx, db, 0 /* gatewayNodeID */, client.RootTxn)
+	txnOld := client.NewTxn(ctx, db, 0 /* gatewayNodeID */)
 
 	// Perform a write with txnOld so that its timestamp gets set.
 	if _, err := txnOld.Inc(ctx, keyB, 3); err != nil {
@@ -1935,7 +1937,7 @@ func TestLeaseTransferInSnapshotUpdatesTimestampCache(t *testing.T) {
 	// mark of the new leaseholder's timestamp cache. Amusingly, if the bug
 	// we're regression testing against here still existed, we would not have
 	// to do this.
-	hb, hbH := heartbeatArgs(txnOld.Serialize(), mtc.clock.Now())
+	hb, hbH := heartbeatArgs(txnOld.TestingCloneTxn(), mtc.clock.Now())
 	if _, pErr := client.SendWrappedWith(ctx, mtc.stores[0].TestSender(), hbH, hb); pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -2522,7 +2524,7 @@ func TestReplicaTombstone(t *testing.T) {
 			return nil
 		})
 		require.NoError(t, tc.Server(0).DB().AdminMerge(ctx, key))
-		var tombstone roachpb.RaftTombstone
+		var tombstone roachpb.RangeTombstone
 		testutils.SucceedsSoon(t, func() (err error) {
 			// One of the two other stores better be the raft leader eventually.
 			// We keep trying to send snapshots until one takes.
@@ -2536,7 +2538,7 @@ func TestReplicaTombstone(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			tombstoneKey := keys.RaftTombstoneKey(rhsDesc.RangeID)
+			tombstoneKey := keys.RangeTombstoneKey(rhsDesc.RangeID)
 			ok, err := engine.MVCCGetProto(
 				context.TODO(), store.Engine(), tombstoneKey, hlc.Timestamp{}, &tombstone, engine.MVCCGetOptions{},
 			)
@@ -2684,7 +2686,7 @@ func TestChangeReplicasLeaveAtomicRacesWithMerge(t *testing.T) {
 		var rangeToBlockRangeDescriptorRead atomic.Value
 		rangeToBlockRangeDescriptorRead.Store(roachpb.RangeID(0))
 		blockRangeDescriptorReadChan := make(chan struct{}, 1)
-		blockOnChangeReplicasRead := storagebase.ReplicaRequestFilter(func(ba roachpb.BatchRequest) *roachpb.Error {
+		blockOnChangeReplicasRead := storagebase.ReplicaRequestFilter(func(ctx context.Context, ba roachpb.BatchRequest) *roachpb.Error {
 			if req, isGet := ba.GetArg(roachpb.Get); !isGet ||
 				ba.RangeID != rangeToBlockRangeDescriptorRead.Load().(roachpb.RangeID) ||
 				!ba.IsSingleRequest() ||
@@ -2695,6 +2697,7 @@ func TestChangeReplicasLeaveAtomicRacesWithMerge(t *testing.T) {
 			select {
 			case <-blockRangeDescriptorReadChan:
 				<-blockRangeDescriptorReadChan
+			case <-ctx.Done():
 			default:
 			}
 			return nil

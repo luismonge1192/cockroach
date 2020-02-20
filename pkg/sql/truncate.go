@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -211,7 +212,9 @@ func (p *planner) truncateTable(
 	//
 	// TODO(vivek): Fix properly along with #12123.
 	zoneKey := config.MakeZoneKey(uint32(tableDesc.ID))
-	nameKey := sqlbase.NewTableKey(tableDesc.ParentID, tableDesc.GetName()).Key()
+	nameKey := sqlbase.MakePublicTableNameKey(ctx, p.ExecCfg().Settings, tableDesc.ParentID, tableDesc.GetName()).Key()
+	key := sqlbase.MakePublicTableNameKey(ctx, p.ExecCfg().Settings, newTableDesc.ParentID, newTableDesc.Name).Key()
+
 	b := &client.Batch{}
 	// Use CPut because we want to remove a specific name -> id map.
 	if traceKV {
@@ -270,7 +273,6 @@ func (p *planner) truncateTable(
 	newTableDesc.Mutations = nil
 	newTableDesc.GCMutations = nil
 	newTableDesc.ModificationTime = p.txn.CommitTimestamp()
-	key := sqlbase.NewTableKey(newTableDesc.ParentID, newTableDesc.Name).Key()
 	if err := p.createDescriptorWithID(
 		ctx, key, newID, newTableDesc, p.ExtendedEvalContext().Settings); err != nil {
 		return err
@@ -351,7 +353,6 @@ func reassignReferencedTables(
 			fk := &table.OutboundFKs[i]
 			if fk.ReferencedTableID == oldID {
 				fk.ReferencedTableID = newID
-				fk.LegacyUpgradedFromOriginReference.Table = newID
 				changed = true
 			}
 		}
@@ -359,7 +360,6 @@ func reassignReferencedTables(
 			fk := &table.InboundFKs[i]
 			if fk.OriginTableID == oldID {
 				fk.OriginTableID = newID
-				fk.LegacyUpgradedFromReferencedReference.Table = newID
 				changed = true
 			}
 		}
@@ -387,10 +387,11 @@ func reassignReferencedTables(
 func reassignComment(
 	ctx context.Context, p *planner, oldTableDesc, newTableDesc *sqlbase.MutableTableDescriptor,
 ) error {
-	comment, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRow(
+	comment, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRowEx(
 		ctx,
 		"select-table-comment",
 		p.txn,
+		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 		`SELECT comment FROM system.comments WHERE type=$1 AND object_id=$2`,
 		keys.TableCommentType,
 		oldTableDesc.ID)
@@ -399,10 +400,11 @@ func reassignComment(
 	}
 
 	if comment != nil {
-		_, err = p.ExtendedEvalContext().ExecCfg.InternalExecutor.Exec(
+		_, err = p.ExtendedEvalContext().ExecCfg.InternalExecutor.ExecEx(
 			ctx,
 			"set-table-comment",
 			p.txn,
+			sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 			"UPSERT INTO system.comments VALUES ($1, $2, 0, $3)",
 			keys.TableCommentType,
 			newTableDesc.ID,
@@ -411,10 +413,11 @@ func reassignComment(
 			return err
 		}
 
-		_, err = p.ExtendedEvalContext().ExecCfg.InternalExecutor.Exec(
+		_, err = p.ExtendedEvalContext().ExecCfg.InternalExecutor.ExecEx(
 			ctx,
 			"delete-comment",
 			p.txn,
+			sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 			"DELETE FROM system.comments WHERE type=$1 AND object_id=$2 AND sub_id=0",
 			keys.TableCommentType,
 			oldTableDesc.ID)
@@ -445,10 +448,11 @@ func reassignComment(
 func reassignColumnComment(
 	ctx context.Context, p *planner, oldID sqlbase.ID, newID sqlbase.ID, columnID sqlbase.ColumnID,
 ) error {
-	comment, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRow(
+	comment, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRowEx(
 		ctx,
 		"select-column-comment",
 		p.txn,
+		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 		`SELECT comment FROM system.comments WHERE type=$1 AND object_id=$2 AND sub_id=$3`,
 		keys.ColumnCommentType,
 		oldID,
@@ -491,10 +495,11 @@ func reassignColumnComment(
 func reassignIndexComment(
 	ctx context.Context, p *planner, oldTableID, newTableID sqlbase.ID, indexID sqlbase.IndexID,
 ) error {
-	comment, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRow(
+	comment, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRowEx(
 		ctx,
 		"select-index-comment",
 		p.txn,
+		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 		`SELECT comment FROM system.comments WHERE type=$1 AND object_id=$2 AND sub_id=$3`,
 		keys.IndexCommentType,
 		oldTableID,
@@ -544,6 +549,7 @@ func truncateTableInChunks(
 		}
 		if err := db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
 			rd, err := row.MakeDeleter(
+				ctx,
 				txn,
 				sqlbase.NewImmutableTableDescriptor(*tableDesc),
 				nil,
@@ -556,7 +562,7 @@ func truncateTableInChunks(
 				return err
 			}
 			td := tableDeleter{rd: rd, alloc: alloc}
-			if err := td.init(txn, nil /* *tree.EvalContext */); err != nil {
+			if err := td.init(ctx, txn, nil /* *tree.EvalContext */); err != nil {
 				return err
 			}
 			resume, err = td.deleteAllRows(ctx, resumeAt, chunkSize, traceKV)

@@ -91,35 +91,24 @@ func TestDockerCLI(t *testing.T) {
 	}
 }
 
-func TestDockerStartFlags(t *testing.T) {
+// TestDockerUnixSocket verifies that CockroachDB initializes a unix
+// socket useable by 'psql', even when the server runs insecurely.
+func TestDockerUnixSocket(t *testing.T) {
 	s := log.Scope(t)
 	defer s.Close(t)
 
 	containerConfig := defaultContainerConfig()
 	containerConfig.Cmd = []string{"stat", cluster.CockroachBinaryInContainer}
 	ctx := context.Background()
-	if err := testDockerOneShot(ctx, t, "start_flags_test", containerConfig); err != nil {
+
+	if err := testDockerOneShot(ctx, t, "cli_test", containerConfig); err != nil {
 		t.Skipf(`TODO(dt): No binary in one-shot container, see #6086: %s`, err)
 	}
 
-	script := `
-set -eux
-bin=/cockroach/cockroach
-
-touch out
-function finish() {
-	cat out
-}
-trap finish EXIT
-
-HOST=$(hostname -f)
-$bin start --logtostderr=INFO --background --insecure --listen-addr="${HOST}":12345 &> out
-$bin sql --insecure --host="${HOST}":12345 -e "show databases"
-$bin quit --insecure --host="${HOST}":12345
-`
-	containerConfig.Cmd = []string{"/bin/bash", "-c", script}
-	if err := testDockerOneShot(ctx, t, "start_flags_test", containerConfig); err != nil {
+	containerConfig.Env = []string{fmt.Sprintf("PGUSER=%s", security.RootUser)}
+	containerConfig.Cmd = append(cmdBase,
+		"/mnt/data/psql/test-psql-unix.sh "+cluster.CockroachBinaryInContainer)
+	if err := testDockerOneShot(ctx, t, "unix_socket_test", containerConfig); err != nil {
 		t.Error(err)
 	}
-
 }

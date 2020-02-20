@@ -13,9 +13,11 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
 )
@@ -44,6 +46,11 @@ func (p *planner) AlterIndex(ctx context.Context, n *tree.AlterIndex) (planNode,
 	return &alterIndexNode{n: n, tableDesc: tableDesc, indexDesc: indexDesc}, nil
 }
 
+// ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
+// This is because ALTER INDEX performs multiple KV operations on descriptors
+// and expects to see its own writes.
+func (n *alterIndexNode) ReadingOwnWrites() {}
+
 func (n *alterIndexNode) startExec(params runParams) error {
 	// Commands can either change the descriptor directly (for
 	// alterations that don't require a backfill) or add a mutation to
@@ -54,6 +61,7 @@ func (n *alterIndexNode) startExec(params runParams) error {
 	for _, cmd := range n.n.Cmds {
 		switch t := cmd.(type) {
 		case *tree.AlterIndexPartitionBy:
+			telemetry.Inc(sqltelemetry.SchemaChangeAlterWithExtra("index", "partition_by"))
 			partitioning, err := CreatePartitioning(
 				params.ctx, params.extendedEvalCtx.Settings,
 				params.EvalContext(),

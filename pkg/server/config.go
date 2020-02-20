@@ -21,7 +21,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip/resolver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
@@ -35,7 +35,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/pebble"
 	"github.com/elastic/gosigar"
 	"github.com/pkg/errors"
@@ -93,10 +92,6 @@ func (mo *MaxOffsetType) Type() string {
 
 // Set implements the pflag.Value interface.
 func (mo *MaxOffsetType) Set(v string) error {
-	if v == "experimental-clockless" {
-		*mo = MaxOffsetType(timeutil.ClocklessMaxOffset)
-		return nil
-	}
 	nanos, err := time.ParseDuration(v)
 	if err != nil {
 		return err
@@ -110,9 +105,6 @@ func (mo *MaxOffsetType) Set(v string) error {
 
 // String implements the pflag.Value interface.
 func (mo *MaxOffsetType) String() string {
-	if *mo == timeutil.ClocklessMaxOffset {
-		return "experimental-clockless"
-	}
 	return time.Duration(*mo).String()
 }
 
@@ -240,11 +232,11 @@ type Config struct {
 	// DefaultZoneConfig is used to set the default zone config inside the server.
 	// It can be overridden during tests by setting the DefaultZoneConfigOverride
 	// server testing knob.
-	DefaultZoneConfig config.ZoneConfig
+	DefaultZoneConfig zonepb.ZoneConfig
 	// DefaultSystemZoneConfig is used to set the default system zone config
 	// inside the server. It can be overridden during tests by setting the
 	// DefaultSystemZoneConfigOverride server testing knob.
-	DefaultSystemZoneConfig config.ZoneConfig
+	DefaultSystemZoneConfig zonepb.ZoneConfig
 
 	// Locality is a description of the topography of the server.
 	Locality roachpb.Locality
@@ -344,8 +336,8 @@ func MakeConfig(ctx context.Context, st *cluster.Settings) Config {
 
 	cfg := Config{
 		Config:                         new(base.Config),
-		DefaultZoneConfig:              config.DefaultZoneConfig(),
-		DefaultSystemZoneConfig:        config.DefaultSystemZoneConfig(),
+		DefaultZoneConfig:              zonepb.DefaultZoneConfig(),
+		DefaultSystemZoneConfig:        zonepb.DefaultSystemZoneConfig(),
 		MaxOffset:                      MaxOffsetType(base.DefaultMaxClockOffset),
 		Settings:                       st,
 		CacheSize:                      DefaultCacheSize,
@@ -440,6 +432,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 	if cfg.StorageEngine == enginepb.EngineTypePebble || cfg.StorageEngine == enginepb.EngineTypeTeePebbleRocksDB {
 		details = append(details, fmt.Sprintf("Pebble cache size: %s", humanizeutil.IBytes(cfg.CacheSize)))
 		pebbleCache = pebble.NewCache(cfg.CacheSize)
+		defer pebbleCache.Unref()
 	} else if cfg.StorageEngine == enginepb.EngineTypeRocksDB || cfg.StorageEngine == enginepb.EngineTypeTeePebbleRocksDB {
 		details = append(details, fmt.Sprintf("RocksDB cache size: %s", humanizeutil.IBytes(cfg.CacheSize)))
 		cache = engine.NewRocksDBCache(cfg.CacheSize)

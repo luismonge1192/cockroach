@@ -12,7 +12,8 @@ import _ from "lodash";
 import React from "react";
 import { Helmet } from "react-helmet";
 import { connect } from "react-redux";
-import { bindActionCreators, Dispatch } from "redux";
+import { withRouter } from "react-router-dom";
+
 import * as protos from "src/js/protos";
 import { refreshSettings } from "src/redux/apiReducers";
 import { AdminUIState } from "src/redux/state";
@@ -30,7 +31,7 @@ type SettingsProps = SettingsOwnProps;
 /**
  * Renders the Cluster Settings Report page.
  */
-class Settings extends React.Component<SettingsProps, {}> {
+export class Settings extends React.Component<SettingsProps, {}> {
   refresh(props = this.props) {
     props.refreshSettings(new protos.cockroach.server.serverpb.SettingsRequest());
   }
@@ -79,10 +80,8 @@ class Settings extends React.Component<SettingsProps, {}> {
   render() {
     return (
       <div className="section">
-        <Helmet>
-          <title>Cluster Settings | Debug</title>
-        </Helmet>
-        <h1>Cluster Settings</h1>
+        <Helmet title="Cluster Settings | Debug" />
+        <h1 className="base-heading page-title">Cluster Settings</h1>
         <Loading
           loading={!this.props.settings.data}
           error={this.props.settings.lastError}
@@ -105,13 +104,9 @@ const mapStateToProps = (state: AdminUIState) => ({ // RootState contains declar
   settings: state.cachedData.settings,
 });
 
-const mapDispatchToProps = (dispatch: Dispatch<AdminUIState>) =>
-  bindActionCreators(
-    {
-      // actionCreators returns objects with type and payload
-      refreshSettings,
-    },
-    dispatch,
-  );
+const mapDispatchToProps = {
+  // actionCreators returns objects with type and payload
+  refreshSettings,
+};
 
-export default connect(mapStateToProps, mapDispatchToProps)(Settings);
+export default withRouter(connect(mapStateToProps, mapDispatchToProps)(Settings));

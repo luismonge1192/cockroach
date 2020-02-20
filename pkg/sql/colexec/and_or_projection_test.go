@@ -207,10 +207,13 @@ func TestAndOrOps(t *testing.T) {
 								RenderExprs: []execinfrapb.Expression{{Expr: fmt.Sprintf("@1 %s @2", test.operation)}},
 							},
 						}
-						result, err := NewColOperator(
-							ctx, flowCtx, spec, input, testMemAcc,
-							true, /* useStreamingMemAccountForBuffering */
-						)
+						args := NewColOperatorArgs{
+							Spec:                spec,
+							Inputs:              input,
+							StreamingMemAccount: testMemAcc,
+						}
+						args.TestingKnobs.UseStreamingMemAccountForBuffering = true
+						result, err := NewColOperator(ctx, flowCtx, args)
 						if err != nil {
 							return nil, err
 						}
@@ -263,7 +266,7 @@ func benchmarkLogicalProjOp(
 			sel[i] = uint16(i)
 		}
 	}
-	input := NewRepeatableBatchSource(batch)
+	input := NewRepeatableBatchSource(testAllocator, batch)
 
 	spec := &execinfrapb.ProcessorSpec{
 		Input: []execinfrapb.InputSyncSpec{{ColumnTypes: []types.T{*types.Bool, *types.Bool}}},
@@ -275,10 +278,13 @@ func benchmarkLogicalProjOp(
 		},
 	}
 
-	result, err := NewColOperator(
-		ctx, flowCtx, spec, []Operator{input}, testMemAcc,
-		true, /* useStreamingMemAccountForBuffering */
-	)
+	args := NewColOperatorArgs{
+		Spec:                spec,
+		Inputs:              []Operator{input},
+		StreamingMemAccount: testMemAcc,
+	}
+	args.TestingKnobs.UseStreamingMemAccountForBuffering = true
+	result, err := NewColOperator(ctx, flowCtx, args)
 	if err != nil {
 		b.Fatal(err)
 	}

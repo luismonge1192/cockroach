@@ -17,6 +17,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -24,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachange"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
@@ -90,7 +92,14 @@ func (p *planner) AlterTable(ctx context.Context, n *tree.AlterTable) (planNode,
 	}, nil
 }
 
+// ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
+// This is because ALTER TABLE performs multiple KV operations on descriptors
+// and expects to see its own writes.
+func (n *alterTableNode) ReadingOwnWrites() {}
+
 func (n *alterTableNode) startExec(params runParams) error {
+	telemetry.Inc(sqltelemetry.SchemaChangeAlter("table"))
+
 	// Commands can either change the descriptor directly (for
 	// alterations that don't require a backfill) or add a mutation to
 	// the list.
@@ -100,6 +109,8 @@ func (n *alterTableNode) startExec(params runParams) error {
 	tn := params.p.ResolvedName(n.n.Table)
 
 	for i, cmd := range n.n.Cmds {
+		telemetry.Inc(cmd.TelemetryCounter())
+
 		switch t := cmd.(type) {
 		case *tree.AlterTableAddColumn:
 			d := t.ColumnDef
@@ -113,12 +124,21 @@ func (n *alterTableNode) startExec(params runParams) error {
 				return err
 			}
 			if seqName != nil {
-				if err := doCreateSequence(params, n.n.String(), seqDbDesc, seqName, seqOpts); err != nil {
+				if err := doCreateSequence(
+					params,
+					n.n.String(),
+					seqDbDesc,
+					n.tableDesc.GetParentSchemaID(),
+					seqName,
+					n.tableDesc.Temporary,
+					seqOpts,
+				); err != nil {
 					return err
 				}
 			}
 			d = newDef
 
+			telemetry.Inc(sqltelemetry.SchemaNewTypeCounter(d.Type.TelemetryName()))
 			col, idx, expr, err := sqlbase.MakeColumnDefDescs(d, &params.p.semaCtx)
 			if err != nil {
 				return err
@@ -304,7 +324,226 @@ func (n *alterTableNode) startExec(params runParams) error {
 			}
 
 		case *tree.AlterTableAlterPrimaryKey:
-			return unimplemented.NewWithIssue(19141, "primary key changes are unsupported")
+			// Make sure that all nodes in the cluster are able to perform primary key changes before proceeding.
+			version := cluster.Version.ActiveVersionOrEmpty(params.ctx, params.p.ExecCfg().Settings)
+			if !version.IsActive(cluster.VersionPrimaryKeyChanges) {
+				return pgerror.Newf(pgcode.FeatureNotSupported,
+					"all nodes are not the correct version for primary key changes")
+			}
+
+			if !params.p.EvalContext().SessionData.PrimaryKeyChangesEnabled {
+				return pgerror.Newf(pgcode.FeatureNotSupported,
+					"session variable experimental_enable_primary_key_changes is set to false, cannot perform primary key change")
+			}
+
+			if t.Sharded != nil {
+				if !version.IsActive(cluster.VersionHashShardedIndexes) {
+					return invalidClusterForShardedIndexError
+				}
+				if !params.p.EvalContext().SessionData.HashShardedIndexesEnabled {
+					return hashShardedIndexesDisabledError
+				}
+				if t.Interleave != nil {
+					return pgerror.Newf(pgcode.FeatureNotSupported, "interleaved indexes cannot also be hash sharded")
+				}
+			}
+
+			if n.tableDesc.IsNewTable() {
+				return pgerror.Newf(pgcode.FeatureNotSupported,
+					"cannot create table and change it's primary key in the same transaction")
+			}
+
+			// Ensure that there is not another primary key change attempted within this transaction.
+			currentMutationID := n.tableDesc.ClusterVersion.NextMutationID
+			for i := range n.tableDesc.Mutations {
+				if desc := n.tableDesc.Mutations[i].GetPrimaryKeySwap(); desc != nil &&
+					n.tableDesc.Mutations[i].MutationID == currentMutationID {
+					return unimplemented.NewWithIssue(
+						43376, "multiple primary key changes in the same transaction are unsupported")
+				}
+			}
+
+			for _, elem := range t.Columns {
+				col, dropped, err := n.tableDesc.FindColumnByName(elem.Column)
+				if err != nil {
+					return err
+				}
+				if dropped {
+					return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
+						"column %q is being dropped", col.Name)
+				}
+				if col.Nullable {
+					return pgerror.Newf(pgcode.InvalidSchemaDefinition, "cannot use nullable column %q in primary key", col.Name)
+				}
+			}
+
+			// Disable primary key changes on tables that are interleaved parents.
+			if len(n.tableDesc.PrimaryIndex.InterleavedBy) != 0 {
+				return errors.New("cannot change the primary key of an interleaved parent")
+			}
+
+			nameExists := func(name string) bool {
+				_, _, err := n.tableDesc.FindIndexByName(name)
+				return err == nil
+			}
+
+			// Make a new index that is suitable to be a primary index.
+			name := generateUniqueConstraintName(
+				"new_primary_key",
+				nameExists,
+			)
+			newPrimaryIndexDesc := &sqlbase.IndexDescriptor{
+				Name:              name,
+				Unique:            true,
+				CreatedExplicitly: true,
+				EncodingType:      sqlbase.PrimaryIndexEncoding,
+				Type:              sqlbase.IndexDescriptor_FORWARD,
+			}
+
+			// If the new index is requested to be sharded, set up the index descriptor
+			// to be sharded, and add the new shard column if it is missing.
+			if t.Sharded != nil {
+				shardCol, newColumn, err := setupShardedIndex(
+					params.ctx,
+					params.EvalContext().Settings,
+					params.SessionData().HashShardedIndexesEnabled,
+					&t.Columns,
+					t.Sharded.ShardBuckets,
+					n.tableDesc,
+					newPrimaryIndexDesc,
+					false, /* isNewTable */
+				)
+				if err != nil {
+					return err
+				}
+				if newColumn {
+					if err := setupFamilyAndConstraintForShard(
+						params,
+						n.tableDesc,
+						shardCol,
+						newPrimaryIndexDesc.Sharded.ColumnNames,
+						newPrimaryIndexDesc.Sharded.ShardBuckets,
+					); err != nil {
+						return err
+					}
+				}
+			}
+
+			if err := newPrimaryIndexDesc.FillColumns(t.Columns); err != nil {
+				return err
+			}
+			if err := n.tableDesc.AddIndexMutation(newPrimaryIndexDesc, sqlbase.DescriptorMutation_ADD); err != nil {
+				return err
+			}
+			if err := n.tableDesc.AllocateIDs(); err != nil {
+				return err
+			}
+
+			if t.Interleave != nil {
+				if err := params.p.addInterleave(params.ctx, n.tableDesc, newPrimaryIndexDesc, t.Interleave); err != nil {
+					return err
+				}
+				if err := params.p.finalizeInterleave(params.ctx, n.tableDesc, newPrimaryIndexDesc); err != nil {
+					return err
+				}
+			}
+
+			// Since we are potentially dropping indexes here, make sure to upgrade any potentially out of
+			// date foreign key representations on old tables.
+			if err := params.p.MaybeUpgradeDependentOldForeignKeyVersionTables(params.ctx, n.tableDesc); err != nil {
+				return err
+			}
+
+			// TODO (rohany): gate this behind a flag so it doesn't happen all the time.
+			// Create a new index that indexes everything the old primary index does, but doesn't store anything.
+			if !n.tableDesc.IsPrimaryIndexDefaultRowID() {
+				oldPrimaryIndexCopy := protoutil.Clone(&n.tableDesc.PrimaryIndex).(*sqlbase.IndexDescriptor)
+				// Clear the name of the index so that it gets generated by AllocateIDs.
+				oldPrimaryIndexCopy.Name = ""
+				oldPrimaryIndexCopy.StoreColumnIDs = nil
+				oldPrimaryIndexCopy.StoreColumnNames = nil
+				// Make the copy of the old primary index not-interleaved. This decision
+				// can be revisited based on user experience.
+				oldPrimaryIndexCopy.Interleave = sqlbase.InterleaveDescriptor{}
+				if err := addIndexMutationWithSpecificPrimaryKey(n.tableDesc, oldPrimaryIndexCopy, newPrimaryIndexDesc); err != nil {
+					return err
+				}
+			}
+
+			// We have to rewrite all indexes that either:
+			// * depend on uniqueness from the old primary key (inverted, non-unique, or unique with nulls).
+			// * don't store or index all columns in the new primary key.
+			shouldRewriteIndex := func(idx *sqlbase.IndexDescriptor) bool {
+				shouldRewrite := false
+				for _, colID := range newPrimaryIndexDesc.ColumnIDs {
+					if !idx.ContainsColumnID(colID) {
+						shouldRewrite = true
+						break
+					}
+				}
+				if idx.Unique {
+					for _, colID := range idx.ColumnIDs {
+						col, err := n.tableDesc.FindColumnByID(colID)
+						if err != nil {
+							panic(err)
+						}
+						if col.Nullable {
+							shouldRewrite = true
+							break
+						}
+					}
+				}
+				return shouldRewrite || !idx.Unique || idx.Type == sqlbase.IndexDescriptor_INVERTED
+			}
+			var indexesToRewrite []*sqlbase.IndexDescriptor
+			for i := range n.tableDesc.Indexes {
+				idx := &n.tableDesc.Indexes[i]
+				if idx.ID != newPrimaryIndexDesc.ID && shouldRewriteIndex(idx) {
+					indexesToRewrite = append(indexesToRewrite, idx)
+				}
+			}
+
+			// Queue up a mutation for each index that needs to be rewritten.
+			// This new index will have an altered ExtraColumnIDs to allow it to be rewritten
+			// using the unique-ifying columns from the new table.
+			var oldIndexIDs, newIndexIDs []sqlbase.IndexID
+			for _, idx := range indexesToRewrite {
+				// Clone the index that we want to rewrite.
+				newIndex := protoutil.Clone(idx).(*sqlbase.IndexDescriptor)
+				name := newIndex.Name + "_rewrite_for_primary_key_change"
+				for try := 1; nameExists(name); try++ {
+					name = fmt.Sprintf("%s#%d", name, try)
+				}
+				newIndex.Name = name
+				if err := addIndexMutationWithSpecificPrimaryKey(n.tableDesc, newIndex, newPrimaryIndexDesc); err != nil {
+					return err
+				}
+				// If the index that we are rewriting is interleaved, we need to setup the rewritten
+				// index to be interleaved as well. Since we cloned the index, the interleave descriptor
+				// on the new index is already set up. So, we just need to add the backreference from the
+				// parent to this new index.
+				if len(newIndex.Interleave.Ancestors) != 0 {
+					if err := params.p.finalizeInterleave(params.ctx, n.tableDesc, newIndex); err != nil {
+						return err
+					}
+				}
+				oldIndexIDs = append(oldIndexIDs, idx.ID)
+				newIndexIDs = append(newIndexIDs, newIndex.ID)
+			}
+
+			swapArgs := &sqlbase.PrimaryKeySwap{
+				OldPrimaryIndexId: n.tableDesc.PrimaryIndex.ID,
+				NewPrimaryIndexId: newPrimaryIndexDesc.ID,
+				NewIndexes:        newIndexIDs,
+				OldIndexes:        oldIndexIDs,
+			}
+			n.tableDesc.AddPrimaryKeySwapMutation(swapArgs)
+
+			// N.B. We don't schedule index deletions here because the existing indexes need to be visible to the user
+			// until the primary key swap actually occurs. Deletions will get enqueued in the phase when the swap happens.
+
+			// Mark descriptorChanged so that a mutation job is scheduled at the end of startExec.
+			descriptorChanged = true
 
 		case *tree.AlterTableDropColumn:
 			if params.SessionData().SafeUpdates {
@@ -325,7 +564,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 
 			// If the dropped column uses a sequence, remove references to it from that sequence.
 			if len(col.UsesSequenceIds) > 0 {
-				if err := removeSequenceDependencies(n.tableDesc, col, params); err != nil {
+				if err := params.p.removeSequenceDependencies(params.ctx, n.tableDesc, col); err != nil {
 					return err
 				}
 			}
@@ -335,11 +574,9 @@ func (n *alterTableNode) startExec(params runParams) error {
 			if err := params.p.canRemoveAllColumnOwnedSequences(params.ctx, n.tableDesc, col, t.DropBehavior); err != nil {
 				return err
 			}
-			// If the dropped column owns a sequence, drop the sequence as well.
-			if len(col.OwnsSequenceIds) > 0 {
-				if err := dropSequencesOwnedByCol(col, params); err != nil {
-					return err
-				}
+
+			if err := params.p.dropSequencesOwnedByCol(params.ctx, col); err != nil {
+				return err
 			}
 
 			// You can't drop a column depended on by a view unless CASCADE was
@@ -763,6 +1000,31 @@ func (n *alterTableNode) Next(runParams) (bool, error) { return false, nil }
 func (n *alterTableNode) Values() tree.Datums          { return tree.Datums{} }
 func (n *alterTableNode) Close(context.Context)        {}
 
+// addIndexMutationWithSpecificPrimaryKey adds an index mutation into the given table descriptor, but sets up
+// the index with ExtraColumnIDs from the given index, rather than the table's primary key.
+func addIndexMutationWithSpecificPrimaryKey(
+	table *sqlbase.MutableTableDescriptor,
+	toAdd *sqlbase.IndexDescriptor,
+	primary *sqlbase.IndexDescriptor,
+) error {
+	// Reset the ID so that a call to AllocateIDs will set up the index.
+	toAdd.ID = 0
+	if err := table.AddIndexMutation(toAdd, sqlbase.DescriptorMutation_ADD); err != nil {
+		return err
+	}
+	if err := table.AllocateIDs(); err != nil {
+		return err
+	}
+	// Use the columns in the given primary index to construct this indexes ExtraColumnIDs list.
+	toAdd.ExtraColumnIDs = nil
+	for _, colID := range primary.ColumnIDs {
+		if !toAdd.ContainsColumnID(colID) {
+			toAdd.ExtraColumnIDs = append(toAdd.ExtraColumnIDs, colID)
+		}
+	}
+	return nil
+}
+
 // applyColumnMutation applies the mutation specified in `mut` to the given
 // columnDescriptor, and saves the containing table descriptor. If the column's
 // dependencies on sequences change, it updates them as well.
@@ -820,7 +1082,7 @@ func applyColumnMutation(
 
 	case *tree.AlterTableSetDefault:
 		if len(col.UsesSequenceIds) > 0 {
-			if err := removeSequenceDependencies(tableDesc, col, params); err != nil {
+			if err := params.p.removeSequenceDependencies(params.ctx, tableDesc, col); err != nil {
 				return err
 			}
 		}
@@ -858,7 +1120,8 @@ func applyColumnMutation(
 		// See if there's already a mutation to add a not null constraint
 		for i := range tableDesc.Mutations {
 			if constraint := tableDesc.Mutations[i].GetConstraint(); constraint != nil &&
-				constraint.ConstraintType == sqlbase.ConstraintToUpdate_NOT_NULL {
+				constraint.ConstraintType == sqlbase.ConstraintToUpdate_NOT_NULL &&
+				constraint.NotNullColumn == col.ID {
 				if tableDesc.Mutations[i].Direction == sqlbase.DescriptorMutation_ADD {
 					return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 						"constraint in the middle of being added")
@@ -883,10 +1146,18 @@ func applyColumnMutation(
 		if col.Nullable {
 			return nil
 		}
+
+		// Prevent a column in a primary key from becoming non-null.
+		if tableDesc.PrimaryIndex.ContainsColumnID(col.ID) {
+			return pgerror.Newf(pgcode.InvalidTableDefinition,
+				`column "%s" is in a primary index`, col.Name)
+		}
+
 		// See if there's already a mutation to add/drop a not null constraint.
 		for i := range tableDesc.Mutations {
 			if constraint := tableDesc.Mutations[i].GetConstraint(); constraint != nil &&
-				constraint.ConstraintType == sqlbase.ConstraintToUpdate_NOT_NULL {
+				constraint.ConstraintType == sqlbase.ConstraintToUpdate_NOT_NULL &&
+				constraint.NotNullColumn == col.ID {
 				if tableDesc.Mutations[i].Direction == sqlbase.DescriptorMutation_ADD {
 					return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 						"constraint in the middle of being added, try again later")
@@ -904,15 +1175,12 @@ func applyColumnMutation(
 			inuseNames[k] = struct{}{}
 		}
 		col.Nullable = true
-		// In 19.2 and above, add a check constraint equivalent to the non-null
-		// constraint and drop it in the schema changer.
-		if cluster.Version.IsActive(
-			params.ctx, params.ExecCfg().Settings, cluster.VersionTopLevelForeignKeys,
-		) {
-			check := sqlbase.MakeNotNullCheckConstraint(col.Name, col.ID, inuseNames, sqlbase.ConstraintValidity_Dropping)
-			tableDesc.Checks = append(tableDesc.Checks, check)
-			tableDesc.AddNotNullMutation(check, sqlbase.DescriptorMutation_DROP)
-		}
+
+		// Add a check constraint equivalent to the non-null constraint and drop
+		// it in the schema changer.
+		check := sqlbase.MakeNotNullCheckConstraint(col.Name, col.ID, inuseNames, sqlbase.ConstraintValidity_Dropping)
+		tableDesc.Checks = append(tableDesc.Checks, check)
+		tableDesc.AddNotNullMutation(check, sqlbase.DescriptorMutation_DROP)
 
 	case *tree.AlterTableDropStored:
 		if !col.IsComputed() {

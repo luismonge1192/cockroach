@@ -15,12 +15,8 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/pem"
 	"fmt"
-	"io"
 	"io/ioutil"
-	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -28,10 +24,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/cockroachdb/cockroach/pkg/blobs"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/bank"
@@ -238,73 +232,142 @@ func testListFiles(t *testing.T, storeURI string) {
 	}
 
 	uri, _ := url.Parse(storeURI)
-	expectedBaseURI := fmt.Sprintf("%s://%s%s", uri.Scheme, uri.Host, uri.Path)
 
-	for _, tc := range []struct {
-		name       string
-		URI        string
-		resultList []string
-	}{
-		{
-			"list-all-csv",
-			appendPath(t, storeURI, "file/*/*.csv"),
-			fileNames,
-		},
-		{
-			"list-letter-csv",
-			appendPath(t, storeURI, "file/abc/?.csv"),
-			letterFiles,
-		},
-		{
-			"list-data-num-csv",
-			appendPath(t, storeURI, "file/numbers/data[0-9].csv"),
-			dataNumberFiles,
-		},
-		{
-			"wildcard-bucket-and-filename",
-			appendPath(t, storeURI, "*/numbers/*.csv"),
-			dataNumberFiles,
-		},
-		{
-			"list-all-csv-skip-dir",
-			// filepath.Glob() assumes that / is the separator, and enforces that it's there.
-			// So this pattern would not actually match anything.
-			appendPath(t, storeURI, "file/*.csv"),
-			[]string{},
-		},
-		{
-			"list-no-matches",
-			appendPath(t, storeURI, "file/letters/dataD.csv"),
-			[]string{},
-		},
-		{
-			"list-escaped-star",
-			appendPath(t, storeURI, "file/*/\\*.csv"),
-			[]string{},
-		},
-		{
-			"list-escaped-range",
-			appendPath(t, storeURI, "file/*/data\\[0-9\\].csv"),
-			[]string{},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			s := storeFromURI(ctx, t, tc.URI, clientFactory)
-			filesList, err := s.ListFiles(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			if len(filesList) != len(tc.resultList) {
-				t.Fatal(`listed incorrect number of files`, filesList)
-			}
-			for i, result := range filesList {
-				if result != fmt.Sprintf("%s/%s", expectedBaseURI, tc.resultList[i]) {
-					t.Fatal(`resulting list is incorrect`, expectedBaseURI, filesList)
-				}
-			}
-		})
+	abs := func(in []string) []string {
+		out := make([]string, len(in))
+		for i := range in {
+			u := *uri
+			u.Path = u.Path + "/" + in[i]
+			out[i] = u.String()
+		}
+		return out
 	}
+
+	t.Run("ListFiles", func(t *testing.T) {
+
+		for _, tc := range []struct {
+			name       string
+			URI        string
+			suffix     string
+			resultList []string
+		}{
+			{
+				"list-all-csv",
+				appendPath(t, storeURI, "file/*/*.csv"),
+				"",
+				abs(fileNames),
+			},
+			{
+				"list-letter-csv",
+				appendPath(t, storeURI, "file/abc/?.csv"),
+				"",
+				abs(letterFiles),
+			},
+			{
+				"list-letter-csv-rel-file-suffix",
+				appendPath(t, storeURI, "file"),
+				"abc/?.csv",
+				[]string{"abc/A.csv", "abc/B.csv", "abc/C.csv"},
+			},
+			{
+				"list-letter-csv-rel-abc-suffix",
+				appendPath(t, storeURI, "file/abc"),
+				"?.csv",
+				[]string{"A.csv", "B.csv", "C.csv"},
+			},
+			{
+				"list-letter-csv-dotdot",
+				appendPath(t, storeURI, "file/abc/xzy/../?.csv"),
+				"",
+				abs(letterFiles),
+			},
+			{
+				"list-abc-csv-suffix",
+				appendPath(t, storeURI, "file"),
+				"abc/?.csv",
+				[]string{"abc/A.csv", "abc/B.csv", "abc/C.csv"},
+			},
+			{
+				"list-letter-csv-dotdot-suffix",
+				appendPath(t, storeURI, "file/abc/xzy"),
+				"../../?.csv",
+				nil,
+			},
+			{
+				"list-data-num-csv",
+				appendPath(t, storeURI, "file/numbers/data[0-9].csv"),
+				"",
+				abs(dataNumberFiles),
+			},
+			{
+				"wildcard-bucket-and-filename",
+				appendPath(t, storeURI, "*/numbers/*.csv"),
+				"",
+				abs(dataNumberFiles),
+			},
+			{
+				"wildcard-bucket-and-filename-suffix",
+				appendPath(t, storeURI, ""),
+				"*/numbers/*.csv",
+				[]string{"file/numbers/data1.csv", "file/numbers/data2.csv", "file/numbers/data3.csv"},
+			},
+			{
+				"list-all-csv-skip-dir",
+				// filepath.Glob() assumes that / is the separator, and enforces that it's there.
+				// So this pattern would not actually match anything.
+				appendPath(t, storeURI, "file/*.csv"),
+				"",
+				[]string{},
+			},
+			{
+				"list-no-matches",
+				appendPath(t, storeURI, "file/letters/dataD.csv"),
+				"",
+				[]string{},
+			},
+			{
+				"list-escaped-star",
+				appendPath(t, storeURI, "file/*/\\*.csv"),
+				"",
+				[]string{},
+			},
+			{
+				"list-escaped-star-suffix",
+				appendPath(t, storeURI, "file"),
+				"*/\\*.csv",
+				[]string{},
+			},
+			{
+				"list-escaped-range",
+				appendPath(t, storeURI, "file/*/data\\[0-9\\].csv"),
+				"",
+				[]string{},
+			},
+			{
+				"list-escaped-range-suffix",
+				appendPath(t, storeURI, "file"),
+				"*/data\\[0-9\\].csv",
+				[]string{},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				s := storeFromURI(ctx, t, tc.URI, clientFactory)
+				filesList, err := s.ListFiles(ctx, tc.suffix)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				if len(filesList) != len(tc.resultList) {
+					t.Fatal(`listed incorrect number of files`, filesList)
+				}
+				for i, got := range filesList {
+					if expected := tc.resultList[i]; got != expected {
+						t.Fatal(`resulting list is incorrect. got: `, got, `expected: `, expected, "\n", filesList)
+					}
+				}
+			})
+		}
+	})
 
 	for _, fileName := range fileNames {
 		file := storeFromURI(ctx, t, storeURI, clientFactory)
@@ -313,295 +376,6 @@ func testListFiles(t *testing.T, storeURI string) {
 		}
 		_ = file.Close()
 	}
-}
-
-func TestPutLocal(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	p, cleanupFn := testutils.TempDir(t)
-	defer cleanupFn()
-
-	testSettings.ExternalIODir = p
-	dest := MakeLocalStorageURI(p)
-
-	testExportStore(t, dest, false)
-	testListFiles(t, fmt.Sprintf("nodelocal:///%s", "listing-test"))
-}
-
-func TestLocalIOLimits(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	ctx := context.TODO()
-	const allowed = "/allowed"
-	testSettings.ExternalIODir = allowed
-
-	clientFactory := blobs.TestBlobServiceClient(testSettings.ExternalIODir)
-	for dest, expected := range map[string]string{allowed: "", "/../../blah": "not allowed"} {
-		u := fmt.Sprintf("nodelocal://%s", dest)
-		e, err := ExternalStorageFromURI(ctx, u, testSettings, clientFactory)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, err = e.ListFiles(ctx)
-		if !testutils.IsError(err, expected) {
-			t.Fatal(err)
-		}
-	}
-
-	for host, expectErr := range map[string]bool{"": false, "1": false, "0": false, "blah": true} {
-		u := fmt.Sprintf("nodelocal://%s/path/to/file", host)
-
-		var expected string
-		if expectErr {
-			expected = "host component of nodelocal URI must be a node ID"
-		}
-		if _, err := ExternalStorageConfFromURI(u); !testutils.IsError(err, expected) {
-			t.Fatalf("%q: expected error %q, got %v", u, expected, err)
-		}
-	}
-}
-
-func TestPutHttp(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	tmp, dirCleanup := testutils.TempDir(t)
-	defer dirCleanup()
-
-	const badHeadResponse = "bad-head-response"
-
-	makeServer := func() (*url.URL, func() int, func()) {
-		var files int
-		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			localfile := filepath.Join(tmp, filepath.Base(r.URL.Path))
-			switch r.Method {
-			case "PUT":
-				f, err := os.Create(localfile)
-				if err != nil {
-					http.Error(w, err.Error(), 500)
-					return
-				}
-				defer f.Close()
-				if _, err := io.Copy(f, r.Body); err != nil {
-					http.Error(w, err.Error(), 500)
-					return
-				}
-				files++
-				w.WriteHeader(201)
-			case "GET", "HEAD":
-				if filepath.Base(localfile) == badHeadResponse {
-					http.Error(w, "HEAD not implemented", 500)
-					return
-				}
-				http.ServeFile(w, r, localfile)
-			case "DELETE":
-				if err := os.Remove(localfile); err != nil {
-					http.Error(w, err.Error(), 500)
-					return
-				}
-				w.WriteHeader(204)
-			default:
-				http.Error(w, "unsupported method "+r.Method, 400)
-			}
-		}))
-
-		u := testSettings.MakeUpdater()
-		if err := u.Set(
-			cloudstorageHTTPCASetting,
-			string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})),
-			"s",
-		); err != nil {
-			t.Fatal(err)
-		}
-
-		cleanup := func() {
-			srv.Close()
-			if err := u.Set(cloudstorageHTTPCASetting, "", "s"); err != nil {
-				t.Fatal(err)
-			}
-		}
-
-		t.Logf("Mock HTTP Storage %q", srv.URL)
-		uri, err := url.Parse(srv.URL)
-		if err != nil {
-			srv.Close()
-			t.Fatal(err)
-		}
-		uri.Path = filepath.Join(uri.Path, "testing")
-		return uri, func() int { return files }, cleanup
-	}
-
-	t.Run("singleHost", func(t *testing.T) {
-		srv, files, cleanup := makeServer()
-		defer cleanup()
-		testExportStore(t, srv.String(), false)
-		if expected, actual := 13, files(); expected != actual {
-			t.Fatalf("expected %d files to be written to single http store, got %d", expected, actual)
-		}
-	})
-
-	t.Run("multiHost", func(t *testing.T) {
-		srv1, files1, cleanup1 := makeServer()
-		defer cleanup1()
-		srv2, files2, cleanup2 := makeServer()
-		defer cleanup2()
-		srv3, files3, cleanup3 := makeServer()
-		defer cleanup3()
-
-		combined := *srv1
-		combined.Host = strings.Join([]string{srv1.Host, srv2.Host, srv3.Host}, ",")
-
-		testExportStore(t, combined.String(), true)
-		if expected, actual := 3, files1(); expected != actual {
-			t.Fatalf("expected %d files written to http host 1, got %d", expected, actual)
-		}
-		if expected, actual := 4, files2(); expected != actual {
-			t.Fatalf("expected %d files written to http host 2, got %d", expected, actual)
-		}
-		if expected, actual := 4, files3(); expected != actual {
-			t.Fatalf("expected %d files written to http host 3, got %d", expected, actual)
-		}
-	})
-
-	// Ensure that servers that error on HEAD are handled gracefully.
-	t.Run("bad-head-response", func(t *testing.T) {
-		ctx := context.TODO()
-
-		srv, _, cleanup := makeServer()
-		defer cleanup()
-
-		conf, err := ExternalStorageConfFromURI(srv.String())
-		if err != nil {
-			t.Fatal(err)
-		}
-		s, err := MakeExternalStorage(ctx, conf, testSettings, blobs.TestEmptyBlobClientFactory)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer s.Close()
-
-		const file = "file"
-		var content = []byte("contents")
-		if err := s.WriteFile(ctx, file, bytes.NewReader(content)); err != nil {
-			t.Fatal(err)
-		}
-		if err := s.WriteFile(ctx, badHeadResponse, bytes.NewReader(content)); err != nil {
-			t.Fatal(err)
-		}
-		if sz, err := s.Size(ctx, file); err != nil {
-			t.Fatal(err)
-		} else if sz != int64(len(content)) {
-			t.Fatalf("expected %d, got %d", len(content), sz)
-		}
-		if sz, err := s.Size(ctx, badHeadResponse); !testutils.IsError(err, "500 Internal Server Error") {
-			t.Fatalf("unexpected error: %v", err)
-		} else if sz != 0 {
-			t.Fatalf("expected 0 size, got %d", sz)
-		}
-	})
-}
-
-func TestPutS3(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	// If environment credentials are not present, we want to
-	// skip all S3 tests, including auth-implicit, even though
-	// it is not used in auth-implicit.
-	creds, err := credentials.NewEnvCredentials().Get()
-	if err != nil {
-		t.Skip("No AWS credentials")
-	}
-	bucket := os.Getenv("AWS_S3_BUCKET")
-	if bucket == "" {
-		t.Skip("AWS_S3_BUCKET env var must be set")
-	}
-
-	ctx := context.TODO()
-	t.Run("auth-empty-no-cred", func(t *testing.T) {
-		_, err := ExternalStorageFromURI(
-			ctx, fmt.Sprintf("s3://%s/%s", bucket, "backup-test-default"),
-			testSettings, blobs.TestEmptyBlobClientFactory,
-		)
-		require.EqualError(t, err, fmt.Sprintf(
-			`%s is set to '%s', but %s is not set`,
-			AuthParam,
-			authParamSpecified,
-			S3AccessKeyParam,
-		))
-	})
-	t.Run("auth-implicit", func(t *testing.T) {
-		// You can create an IAM that can access S3
-		// in the AWS console, then set it up locally.
-		// https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-role.html
-		// We only run this test if default role exists.
-		credentialsProvider := credentials.SharedCredentialsProvider{}
-		_, err := credentialsProvider.Retrieve()
-		if err != nil {
-			t.Skip(err)
-		}
-
-		testExportStore(
-			t,
-			fmt.Sprintf(
-				"s3://%s/%s?%s=%s",
-				bucket, "backup-test-default",
-				AuthParam, authParamImplicit,
-			),
-			false,
-		)
-	})
-
-	t.Run("auth-specified", func(t *testing.T) {
-		testExportStore(t,
-			fmt.Sprintf(
-				"s3://%s/%s?%s=%s&%s=%s",
-				bucket, "backup-test",
-				S3AccessKeyParam, url.QueryEscape(creds.AccessKeyID),
-				S3SecretParam, url.QueryEscape(creds.SecretAccessKey),
-			),
-			false,
-		)
-		testListFiles(t,
-			fmt.Sprintf(
-				"s3://%s/%s?%s=%s&%s=%s",
-				bucket, "listing-test",
-				S3AccessKeyParam, url.QueryEscape(creds.AccessKeyID),
-				S3SecretParam, url.QueryEscape(creds.SecretAccessKey),
-			),
-		)
-	})
-}
-
-func TestPutS3Endpoint(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	q := make(url.Values)
-	expect := map[string]string{
-		"AWS_S3_ENDPOINT":        S3EndpointParam,
-		"AWS_S3_ENDPOINT_KEY":    S3AccessKeyParam,
-		"AWS_S3_ENDPOINT_REGION": S3RegionParam,
-		"AWS_S3_ENDPOINT_SECRET": S3SecretParam,
-	}
-	for env, param := range expect {
-		v := os.Getenv(env)
-		if v == "" {
-			t.Skipf("%s env var must be set", env)
-		}
-		q.Add(param, v)
-	}
-
-	bucket := os.Getenv("AWS_S3_ENDPOINT_BUCKET")
-	if bucket == "" {
-		t.Skip("AWS_S3_ENDPOINT_BUCKET env var must be set")
-	}
-
-	u := url.URL{
-		Scheme:   "s3",
-		Host:     bucket,
-		Path:     "backup-test",
-		RawQuery: q.Encode(),
-	}
-
-	testExportStore(t, u.String(), false)
 }
 
 func TestPutGoogleCloud(t *testing.T) {
@@ -660,37 +434,6 @@ func TestPutGoogleCloud(t *testing.T) {
 			false,
 		)
 	})
-}
-
-func TestPutAzure(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	accountName := os.Getenv("AZURE_ACCOUNT_NAME")
-	accountKey := os.Getenv("AZURE_ACCOUNT_KEY")
-	if accountName == "" || accountKey == "" {
-		t.Skip("AZURE_ACCOUNT_NAME and AZURE_ACCOUNT_KEY env vars must be set")
-	}
-	bucket := os.Getenv("AZURE_CONTAINER")
-	if bucket == "" {
-		t.Skip("AZURE_CONTAINER env var must be set")
-	}
-
-	testExportStore(t,
-		fmt.Sprintf("azure://%s/%s?%s=%s&%s=%s",
-			bucket, "backup-test",
-			AzureAccountNameParam, url.QueryEscape(accountName),
-			AzureAccountKeyParam, url.QueryEscape(accountKey),
-		),
-		false,
-	)
-	testListFiles(
-		t,
-		fmt.Sprintf("azure://%s/%s?%s=%s&%s=%s",
-			bucket, "listing-test",
-			AzureAccountNameParam, url.QueryEscape(accountName),
-			AzureAccountKeyParam, url.QueryEscape(accountKey),
-		),
-	)
 }
 
 func TestWorkloadStorage(t *testing.T) {

@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
 )
 
@@ -41,7 +42,7 @@ const (
 // See Builder.buildStmt for a description of the remaining input and
 // return values.
 func (b *Builder) buildDataSource(
-	texpr tree.TableExpr, indexFlags *tree.IndexFlags, inScope *scope,
+	texpr tree.TableExpr, indexFlags *tree.IndexFlags, locking lockingSpec, inScope *scope,
 ) (outScope *scope) {
 	defer func(prevAtRoot bool) {
 		inScope.atRoot = prevAtRoot
@@ -54,8 +55,11 @@ func (b *Builder) buildDataSource(
 			telemetry.Inc(sqltelemetry.IndexHintUseCounter)
 			indexFlags = source.IndexFlags
 		}
+		if source.As.Alias != "" {
+			locking = locking.filter(source.As.Alias)
+		}
 
-		outScope = b.buildDataSource(source.Expr, indexFlags, inScope)
+		outScope = b.buildDataSource(source.Expr, indexFlags, locking, inScope)
 
 		if source.Ordinality {
 			outScope = b.buildWithOrdinality("ordinality", outScope)
@@ -67,13 +71,14 @@ func (b *Builder) buildDataSource(
 		return outScope
 
 	case *tree.JoinTableExpr:
-		return b.buildJoin(source, inScope)
+		return b.buildJoin(source, locking, inScope)
 
 	case *tree.TableName:
 		tn := source
 
 		// CTEs take precedence over other data sources.
 		if cte := inScope.resolveCTE(tn); cte != nil {
+			locking.ignoreLockingForCTE()
 			outScope = inScope.push()
 			inCols := make(opt.ColList, len(cte.cols))
 			outCols := make(opt.ColList, len(cte.cols))
@@ -88,39 +93,54 @@ func (b *Builder) buildDataSource(
 			}
 
 			outScope.expr = b.factory.ConstructWithScan(&memo.WithScanPrivate{
-				ID:           cte.id,
+				With:         cte.id,
 				Name:         string(cte.name.Alias),
 				InCols:       inCols,
 				OutCols:      outCols,
 				BindingProps: cte.bindingProps,
+				ID:           b.factory.Metadata().NextUniqueID(),
 			})
 
 			return outScope
 		}
 
-		ds, resName := b.resolveDataSource(tn, privilege.SELECT)
+		priv := privilege.SELECT
+		locking = locking.filter(tn.TableName)
+		if locking.isSet() {
+			// SELECT ... FOR [KEY] UPDATE/SHARE requires UPDATE privileges.
+			priv = privilege.UPDATE
+		}
+
+		ds, resName := b.resolveDataSource(tn, priv)
 		switch t := ds.(type) {
 		case cat.Table:
 			tabMeta := b.addTable(t, &resName)
-			return b.buildScan(tabMeta, nil /* ordinals */, indexFlags, excludeMutations, inScope)
+			return b.buildScan(tabMeta, nil /* ordinals */, indexFlags, locking, excludeMutations, inScope)
 
 		case cat.Sequence:
 			return b.buildSequenceSelect(t, &resName, inScope)
 
 		case cat.View:
-			return b.buildView(t, &resName, inScope)
+			return b.buildView(t, &resName, locking, inScope)
+
 		default:
 			panic(errors.AssertionFailedf("unknown DataSource type %T", ds))
 		}
 
 	case *tree.ParenTableExpr:
-		return b.buildDataSource(source.Expr, indexFlags, inScope)
+		return b.buildDataSource(source.Expr, indexFlags, locking, inScope)
 
 	case *tree.RowsFromExpr:
 		return b.buildZip(source.Items, inScope)
 
 	case *tree.Subquery:
-		outScope = b.buildStmt(source.Select, nil /* desiredTypes */, inScope)
+		// Remove any target relations from the current scope's locking spec, as
+		// those only apply to relations in this statement. Interestingly, this
+		// would not be necessary if we required all subqueries to have aliases
+		// like Postgres does.
+		locking = locking.withoutTargets()
+
+		outScope = b.buildSelectStmt(source.Select, locking, nil /* desiredTypes */, inScope)
 
 		// Treat the subquery result as an anonymous data source (i.e. column names
 		// are not qualified). Remove hidden columns, as they are not accessible
@@ -161,6 +181,7 @@ func (b *Builder) buildDataSource(
 			outCols[i] = b.factory.Metadata().AddColumn(col.Alias, c.Type)
 		}
 
+		locking.ignoreLockingForCTE()
 		outScope = inScope.push()
 		// Similar to appendColumnsFromScope, but with re-numbering the column IDs.
 		for i, col := range innerScope.cols {
@@ -170,20 +191,28 @@ func (b *Builder) buildDataSource(
 		}
 
 		outScope.expr = b.factory.ConstructWithScan(&memo.WithScanPrivate{
-			ID:           cte.id,
+			With:         cte.id,
 			Name:         string(cte.name.Alias),
 			InCols:       inCols,
 			OutCols:      outCols,
 			BindingProps: cte.bindingProps,
+			ID:           b.factory.Metadata().NextUniqueID(),
 		})
 
 		return outScope
 
 	case *tree.TableRef:
-		ds := b.resolveDataSourceRef(source, privilege.SELECT)
+		priv := privilege.SELECT
+		locking = locking.filter(source.As.Alias)
+		if locking.isSet() {
+			// SELECT ... FOR [KEY] UPDATE/SHARE requires UPDATE privileges.
+			priv = privilege.UPDATE
+		}
+
+		ds := b.resolveDataSourceRef(source, priv)
 		switch t := ds.(type) {
 		case cat.Table:
-			outScope = b.buildScanFromTableRef(t, source, indexFlags, inScope)
+			outScope = b.buildScanFromTableRef(t, source, indexFlags, locking, inScope)
 		case cat.View:
 			if source.Columns != nil {
 				panic(pgerror.Newf(pgcode.FeatureNotSupported,
@@ -191,7 +220,7 @@ func (b *Builder) buildDataSource(
 			}
 			tn := tree.MakeUnqualifiedTableName(t.Name())
 
-			outScope = b.buildView(t, &tn, inScope)
+			outScope = b.buildView(t, &tn, locking, inScope)
 		case cat.Sequence:
 			tn := tree.MakeUnqualifiedTableName(t.Name())
 			// Any explicitly listed columns are ignored.
@@ -209,7 +238,7 @@ func (b *Builder) buildDataSource(
 
 // buildView parses the view query text and builds it as a Select expression.
 func (b *Builder) buildView(
-	view cat.View, viewName *tree.TableName, inScope *scope,
+	view cat.View, viewName *tree.TableName, locking lockingSpec, inScope *scope,
 ) (outScope *scope) {
 	// Cache the AST so that multiple references won't need to reparse.
 	if b.views == nil {
@@ -254,7 +283,7 @@ func (b *Builder) buildView(
 		defer func() { b.trackViewDeps = true }()
 	}
 
-	outScope = b.buildStmt(sel, nil /* desiredTypes */, &scope{builder: b})
+	outScope = b.buildSelect(sel, locking, nil /* desiredTypes */, &scope{builder: b})
 
 	// Update data source name to be the name of the view. And if view columns
 	// are specified, then update names of output columns.
@@ -339,7 +368,11 @@ func (b *Builder) renameSource(as tree.AliasClause, scope *scope) {
 // Note, the query SELECT * FROM [53() as t] is unsupported. Column lists must
 // be non-empty
 func (b *Builder) buildScanFromTableRef(
-	tab cat.Table, ref *tree.TableRef, indexFlags *tree.IndexFlags, inScope *scope,
+	tab cat.Table,
+	ref *tree.TableRef,
+	indexFlags *tree.IndexFlags,
+	locking lockingSpec,
+	inScope *scope,
 ) (outScope *scope) {
 	var ordinals []int
 	if ref.Columns != nil {
@@ -355,7 +388,7 @@ func (b *Builder) buildScanFromTableRef(
 
 	tn := tree.MakeUnqualifiedTableName(tab.Name())
 	tabMeta := b.addTable(tab, &tn)
-	return b.buildScan(tabMeta, ordinals, indexFlags, excludeMutations, inScope)
+	return b.buildScan(tabMeta, ordinals, indexFlags, locking, excludeMutations, inScope)
 }
 
 // addTable adds a table to the metadata and returns the TableMeta. The table
@@ -380,6 +413,7 @@ func (b *Builder) buildScan(
 	tabMeta *opt.TableMeta,
 	ordinals []int,
 	indexFlags *tree.IndexFlags,
+	locking lockingSpec,
 	scanMutationCols bool,
 	inScope *scope,
 ) (outScope *scope) {
@@ -433,13 +467,16 @@ func (b *Builder) buildScan(
 			panic(pgerror.Newf(pgcode.Syntax,
 				"index flags not allowed with virtual tables"))
 		}
+		if locking.isSet() {
+			panic(pgerror.Newf(pgcode.Syntax,
+				"%s not allowed with virtual tables", locking.get().Strength))
+		}
 		private := memo.VirtualScanPrivate{Table: tabID, Cols: tabColIDs}
 		outScope.expr = b.factory.ConstructVirtualScan(&private)
 
 		// Virtual tables should not be collected as view dependencies.
 	} else {
 		private := memo.ScanPrivate{Table: tabID, Cols: tabColIDs}
-
 		if indexFlags != nil {
 			private.Flags.NoIndexJoin = indexFlags.NoIndexJoin
 			if indexFlags.Index != "" || indexFlags.IndexID != 0 {
@@ -465,9 +502,13 @@ func (b *Builder) buildScan(
 				private.Flags.Direction = indexFlags.Direction
 			}
 		}
+		if locking.isSet() {
+			private.Locking = locking.get()
+		}
 		outScope.expr = b.factory.ConstructScan(&private)
 
-		b.addCheckConstraintsForTable(outScope, tabMeta, ordinals != nil /* allowMissingColumns */)
+		b.addCheckConstraintsForTable(tabMeta)
+		b.addComputedColsForTable(tabMeta)
 
 		if b.trackViewDeps {
 			dep := opt.ViewDep{DataSource: tab}
@@ -487,17 +528,12 @@ func (b *Builder) buildScan(
 // addCheckConstraintsForTable finds all the check constraints that apply to the
 // table and adds them to the table metadata. To do this, the scalar expression
 // of the check constraints are built here.
-//
-// If allowMissingColumns is true, we ignore check constraints that involve
-// columns not in the current scope (useful when we build a scan that doesn't
-// contain all table columns).
-func (b *Builder) addCheckConstraintsForTable(
-	scope *scope, tabMeta *opt.TableMeta, allowMissingColumns bool,
-) {
-	tab := tabMeta.Table
+func (b *Builder) addCheckConstraintsForTable(tabMeta *opt.TableMeta) {
 	// Find all the check constraints that apply to the table and add them
 	// to the table meta data. To do this, we must build them into scalar
 	// expressions.
+	tableScope := scope{builder: b}
+	tab := tabMeta.Table
 	for i, n := 0, tab.CheckCount(); i < n; i++ {
 		checkConstraint := tab.Check(i)
 
@@ -510,25 +546,40 @@ func (b *Builder) addCheckConstraintsForTable(
 			panic(err)
 		}
 
-		var texpr tree.TypedExpr
-		func() {
-			if allowMissingColumns {
-				// Swallow any undefined column errors.
-				defer func() {
-					if r := recover(); r != nil {
-						if err, ok := r.(error); ok {
-							if code := pgerror.GetPGCode(err); code == pgcode.UndefinedColumn {
-								return
-							}
-						}
-						panic(r)
-					}
-				}()
-			}
-			texpr = scope.resolveAndRequireType(expr, types.Bool)
-		}()
-		if texpr != nil {
-			tabMeta.AddConstraint(b.buildScalar(texpr, scope, nil, nil, nil))
+		if len(tableScope.cols) == 0 {
+			tableScope.appendColumnsFromTable(tabMeta, &tabMeta.Alias)
+		}
+
+		if texpr := tableScope.resolveAndRequireType(expr, types.Bool); texpr != nil {
+			scalar := b.buildScalar(texpr, &tableScope, nil, nil, nil)
+			tabMeta.AddConstraint(scalar)
+		}
+	}
+}
+
+// addComputedColsForTable finds all computed columns in the given table and
+// caches them in the table metadata as scalar expressions.
+func (b *Builder) addComputedColsForTable(tabMeta *opt.TableMeta) {
+	tableScope := scope{builder: b}
+	tab := tabMeta.Table
+	for i, n := 0, tab.ColumnCount(); i < n; i++ {
+		tabCol := tab.Column(i)
+		if !tabCol.IsComputed() {
+			continue
+		}
+		expr, err := parser.ParseExpr(tabCol.ComputedExprStr())
+		if err != nil {
+			continue
+		}
+
+		if len(tableScope.cols) == 0 {
+			tableScope.appendColumnsFromTable(tabMeta, &tabMeta.Alias)
+		}
+
+		if texpr := tableScope.resolveAndRequireType(expr, types.Any); texpr != nil {
+			colID := tabMeta.MetaID.ColumnID(i)
+			scalar := b.buildScalar(texpr, &tableScope, nil, nil, nil)
+			tabMeta.AddComputedCol(colID, scalar)
 		}
 	}
 }
@@ -698,15 +749,15 @@ func (b *Builder) flushCTEs(expr memo.RelExpr) memo.RelExpr {
 // See Builder.buildStmt for a description of the remaining input and
 // return values.
 func (b *Builder) buildSelectStmt(
-	stmt tree.SelectStatement, desiredTypes []*types.T, inScope *scope,
+	stmt tree.SelectStatement, locking lockingSpec, desiredTypes []*types.T, inScope *scope,
 ) (outScope *scope) {
 	// NB: The case statements are sorted lexicographically.
 	switch stmt := stmt.(type) {
 	case *tree.ParenSelect:
-		return b.buildStmt(stmt.Select, desiredTypes, inScope)
+		return b.buildSelect(stmt.Select, locking, desiredTypes, inScope)
 
 	case *tree.SelectClause:
-		return b.buildSelectClause(stmt, nil /* orderBy */, desiredTypes, inScope)
+		return b.buildSelectClause(stmt, nil /* orderBy */, locking, desiredTypes, inScope)
 
 	case *tree.UnionClause:
 		return b.buildUnionClause(stmt, desiredTypes, inScope)
@@ -719,46 +770,34 @@ func (b *Builder) buildSelectStmt(
 	}
 }
 
-func (b *Builder) processWiths(
-	with *tree.With, inScope *scope, buildStmt func(inScope *scope) *scope,
-) *scope {
-	inScope = b.buildCTEs(with, inScope)
-	prevAtRoot := inScope.atRoot
-	inScope.atRoot = false
-	outScope := buildStmt(inScope)
-	inScope.atRoot = prevAtRoot
-	return outScope
-}
-
 // buildSelect builds a set of memo groups that represent the given select
 // expression.
 //
 // See Builder.buildStmt for a description of the remaining input and
 // return values.
 func (b *Builder) buildSelect(
-	stmt *tree.Select, desiredTypes []*types.T, inScope *scope,
+	stmt *tree.Select, locking lockingSpec, desiredTypes []*types.T, inScope *scope,
 ) (outScope *scope) {
 	wrapped := stmt.Select
+	with := stmt.With
 	orderBy := stmt.OrderBy
 	limit := stmt.Limit
-	forLocked := stmt.ForLocked.Strength
-
-	switch forLocked {
-	case tree.ForNone:
-	case tree.ForUpdate:
-	case tree.ForNoKeyUpdate:
-	case tree.ForShare:
-	case tree.ForKeyShare:
-		// CockroachDB treats all of the FOR LOCKED modes as no-ops. Since all
-		// transactions are serializable in CockroachDB, clients can't observe
-		// whether or not FOR UPDATE (or any of the other weaker modes) actually
-		// created a lock. This behavior may improve as the transaction model gains
-		// more capabilities.
-	}
+	locking.apply(stmt.Locking)
 
 	for s, ok := wrapped.(*tree.ParenSelect); ok; s, ok = wrapped.(*tree.ParenSelect) {
 		stmt = s.Select
 		wrapped = stmt.Select
+		if stmt.With != nil {
+			if with != nil {
+				// (WITH ... (WITH ...))
+				// Currently we are unable to nest the scopes inside ParenSelect so we
+				// must refuse the syntax so that the query does not get invalid results.
+				panic(unimplemented.NewWithIssue(
+					24303, "multiple WITH clauses in parentheses",
+				))
+			}
+			with = s.Select.With
+		}
 		if stmt.OrderBy != nil {
 			if orderBy != nil {
 				panic(pgerror.Newf(
@@ -775,22 +814,52 @@ func (b *Builder) buildSelect(
 			}
 			limit = stmt.Limit
 		}
+		if stmt.Locking != nil {
+			locking.apply(stmt.Locking)
+		}
 	}
 
+	return b.processWiths(with, inScope, func(inScope *scope) *scope {
+		return b.buildSelectStmtWithoutParens(
+			wrapped, orderBy, limit, locking, desiredTypes, inScope,
+		)
+	})
+}
+
+// buildSelectStmtWithoutParens builds a set of memo groups that represent
+// the given select statement components. The wrapped select statement can
+// be any variant except ParenSelect, which should be unwrapped by callers.
+//
+// See Builder.buildStmt for a description of the remaining input and
+// return values.
+func (b *Builder) buildSelectStmtWithoutParens(
+	wrapped tree.SelectStatement,
+	orderBy tree.OrderBy,
+	limit *tree.Limit,
+	locking lockingSpec,
+	desiredTypes []*types.T,
+	inScope *scope,
+) (outScope *scope) {
 	// NB: The case statements are sorted lexicographically.
-	switch t := stmt.Select.(type) {
+	switch t := wrapped.(type) {
+	case *tree.ParenSelect:
+		panic(errors.AssertionFailedf(
+			"%T in buildSelectStmtWithoutParens", wrapped))
+
 	case *tree.SelectClause:
-		outScope = b.buildSelectClause(t, orderBy, desiredTypes, inScope)
+		outScope = b.buildSelectClause(t, orderBy, locking, desiredTypes, inScope)
 
 	case *tree.UnionClause:
+		b.rejectIfLocking(locking, "UNION/INTERSECT/EXCEPT")
 		outScope = b.buildUnionClause(t, desiredTypes, inScope)
 
 	case *tree.ValuesClause:
+		b.rejectIfLocking(locking, "VALUES")
 		outScope = b.buildValuesClause(t, desiredTypes, inScope)
 
 	default:
 		panic(pgerror.Newf(pgcode.FeatureNotSupported,
-			"unknown select statement: %T", stmt.Select))
+			"unknown select statement: %T", wrapped))
 	}
 
 	if outScope.ordering.Empty() && orderBy != nil {
@@ -824,9 +893,13 @@ func (b *Builder) buildSelect(
 // See Builder.buildStmt for a description of the remaining input and
 // return values.
 func (b *Builder) buildSelectClause(
-	sel *tree.SelectClause, orderBy tree.OrderBy, desiredTypes []*types.T, inScope *scope,
+	sel *tree.SelectClause,
+	orderBy tree.OrderBy,
+	locking lockingSpec,
+	desiredTypes []*types.T,
+	inScope *scope,
 ) (outScope *scope) {
-	fromScope := b.buildFrom(sel.From, inScope)
+	fromScope := b.buildFrom(sel.From, locking, inScope)
 	b.processWindowDefs(sel, fromScope)
 	b.buildWhere(sel.Where, fromScope)
 
@@ -869,6 +942,7 @@ func (b *Builder) buildSelectClause(
 	}
 
 	b.buildWindow(outScope, fromScope)
+	b.validateLockingInFrom(sel, locking, fromScope)
 
 	// Construct the projection.
 	b.constructProjectForScope(outScope, projectionsScope)
@@ -888,7 +962,7 @@ func (b *Builder) buildSelectClause(
 //
 // See Builder.buildStmt for a description of the remaining input and return
 // values.
-func (b *Builder) buildFrom(from tree.From, inScope *scope) (outScope *scope) {
+func (b *Builder) buildFrom(from tree.From, locking lockingSpec, inScope *scope) (outScope *scope) {
 	// The root AS OF clause is recognized and handled by the executor. The only
 	// thing that must be done at this point is to ensure that if any timestamps
 	// are specified, the root SELECT was an AS OF SYSTEM TIME and that the time
@@ -898,12 +972,12 @@ func (b *Builder) buildFrom(from tree.From, inScope *scope) (outScope *scope) {
 	}
 
 	if len(from.Tables) > 0 {
-		outScope = b.buildFromTables(from.Tables, inScope)
+		outScope = b.buildFromTables(from.Tables, locking, inScope)
 	} else {
 		outScope = inScope.push()
 		outScope.expr = b.factory.ConstructValues(memo.ScalarListWithEmptyTuple, &memo.ValuesPrivate{
 			Cols: opt.ColList{},
-			ID:   b.factory.Metadata().NextValuesID(),
+			ID:   b.factory.Metadata().NextUniqueID(),
 		})
 	}
 
@@ -945,7 +1019,7 @@ func (b *Builder) buildWhere(where *tree.Where, inScope *scope) {
 	// Wrap the filter in a FiltersOp.
 	inScope.expr = b.factory.ConstructSelect(
 		inScope.expr.(memo.RelExpr),
-		memo.FiltersExpr{{Condition: filter}},
+		memo.FiltersExpr{b.factory.ConstructFiltersItem(filter)},
 	)
 }
 
@@ -954,16 +1028,18 @@ func (b *Builder) buildWhere(where *tree.Where, inScope *scope) {
 //
 // See Builder.buildStmt for a description of the remaining input and
 // return values.
-func (b *Builder) buildFromTables(tables tree.TableExprs, inScope *scope) (outScope *scope) {
+func (b *Builder) buildFromTables(
+	tables tree.TableExprs, locking lockingSpec, inScope *scope,
+) (outScope *scope) {
 	// If there are any lateral data sources, we need to build the join tree
 	// left-deep instead of right-deep.
 	for i := range tables {
 		if b.exprIsLateral(tables[i]) {
 			telemetry.Inc(sqltelemetry.LateralJoinUseCounter)
-			return b.buildFromWithLateral(tables, inScope)
+			return b.buildFromWithLateral(tables, locking, inScope)
 		}
 	}
-	return b.buildFromTablesRightDeep(tables, inScope)
+	return b.buildFromTablesRightDeep(tables, locking, inScope)
 }
 
 // buildFromTablesRightDeep recursively builds a series of InnerJoin
@@ -984,16 +1060,16 @@ func (b *Builder) buildFromTables(tables tree.TableExprs, inScope *scope) (outSc
 // See Builder.buildStmt for a description of the remaining input and
 // return values.
 func (b *Builder) buildFromTablesRightDeep(
-	tables tree.TableExprs, inScope *scope,
+	tables tree.TableExprs, locking lockingSpec, inScope *scope,
 ) (outScope *scope) {
-	outScope = b.buildDataSource(tables[0], nil /* indexFlags */, inScope)
+	outScope = b.buildDataSource(tables[0], nil /* indexFlags */, locking, inScope)
 
 	// Recursively build table join.
 	tables = tables[1:]
 	if len(tables) == 0 {
 		return outScope
 	}
-	tableScope := b.buildFromTablesRightDeep(tables, inScope)
+	tableScope := b.buildFromTablesRightDeep(tables, locking, inScope)
 
 	// Check that the same table name is not used multiple times.
 	b.validateJoinTableNames(outScope, tableScope)
@@ -1032,8 +1108,10 @@ func (b *Builder) exprIsLateral(t tree.TableExpr) bool {
 //
 //   buildFromTablesRightDeep: a JOIN (b JOIN c)
 //   buildFromWithLateral:     (a JOIN b) JOIN c
-func (b *Builder) buildFromWithLateral(tables tree.TableExprs, inScope *scope) (outScope *scope) {
-	outScope = b.buildDataSource(tables[0], nil /* indexFlags */, inScope)
+func (b *Builder) buildFromWithLateral(
+	tables tree.TableExprs, locking lockingSpec, inScope *scope,
+) (outScope *scope) {
+	outScope = b.buildDataSource(tables[0], nil /* indexFlags */, locking, inScope)
 	for i := 1; i < len(tables); i++ {
 		scope := inScope
 		// Lateral expressions need to be able to refer to the expressions that
@@ -1041,7 +1119,7 @@ func (b *Builder) buildFromWithLateral(tables tree.TableExprs, inScope *scope) (
 		if b.exprIsLateral(tables[i]) {
 			scope = outScope
 		}
-		tableScope := b.buildDataSource(tables[i], nil /* indexFlags */, scope)
+		tableScope := b.buildDataSource(tables[i], nil /* indexFlags */, locking, scope)
 
 		// Check that the same table name is not used multiple times.
 		b.validateJoinTableNames(outScope, tableScope)
@@ -1073,4 +1151,116 @@ func (b *Builder) validateAsOf(asOf tree.AsOfClause) {
 		panic(unimplementedWithIssueDetailf(35712, "",
 			"cannot specify AS OF SYSTEM TIME with different timestamps"))
 	}
+}
+
+// validateLockingInFrom checks for operations that are not supported with FOR
+// [KEY] UPDATE/SHARE. If a locking clause was specified with the select and an
+// incompatible operation is in use, a locking error is raised.
+func (b *Builder) validateLockingInFrom(
+	sel *tree.SelectClause, locking lockingSpec, fromScope *scope,
+) {
+	if !locking.isSet() {
+		// No FOR [KEY] UPDATE/SHARE locking modes in scope.
+		return
+	}
+
+	switch {
+	case sel.Distinct:
+		b.raiseLockingContextError(locking, "DISTINCT clause")
+
+	case sel.GroupBy != nil:
+		b.raiseLockingContextError(locking, "GROUP BY clause")
+
+	case sel.Having != nil:
+		b.raiseLockingContextError(locking, "HAVING clause")
+
+	case fromScope.groupby != nil && fromScope.groupby.hasAggregates():
+		b.raiseLockingContextError(locking, "aggregate functions")
+
+	case len(fromScope.windows) != 0:
+		b.raiseLockingContextError(locking, "window functions")
+
+	case len(fromScope.srfs) != 0:
+		b.raiseLockingContextError(locking, "set-returning functions in the target list")
+	}
+
+	for _, li := range locking {
+		// Validate locking strength.
+		switch li.Strength {
+		case tree.ForNone:
+			// AST nodes should not be created with this locking strength.
+			panic(errors.AssertionFailedf("locking item without strength"))
+		case tree.ForUpdate, tree.ForNoKeyUpdate, tree.ForShare, tree.ForKeyShare:
+			// CockroachDB treats all of the FOR LOCKED modes as no-ops. Since all
+			// transactions are serializable in CockroachDB, clients can't observe
+			// whether or not FOR UPDATE (or any of the other weaker modes) actually
+			// created a lock. This behavior may improve as the transaction model gains
+			// more capabilities.
+		default:
+			panic(errors.AssertionFailedf("unknown locking strength: %s", li.Strength))
+		}
+
+		// Validating locking wait policy.
+		switch li.WaitPolicy {
+		case tree.LockWaitBlock:
+			// Default.
+		case tree.LockWaitSkip:
+			panic(unimplementedWithIssueDetailf(40476, "",
+				"SKIP LOCKED lock wait policy is not supported"))
+		case tree.LockWaitError:
+			panic(unimplementedWithIssueDetailf(40476, "",
+				"NOWAIT lock wait policy is not supported"))
+		default:
+			panic(errors.AssertionFailedf("unknown locking wait policy: %s", li.WaitPolicy))
+		}
+
+		// Validate locking targets by checking that all targets are well-formed
+		// and all point to real relations present in the FROM clause.
+		for _, target := range li.Targets {
+			// Insist on unqualified alias names here. We could probably do
+			// something smarter, but it's better to just mirror Postgres
+			// exactly. See transformLockingClause in Postgres' source.
+			if target.CatalogName != "" || target.SchemaName != "" {
+				panic(pgerror.Newf(pgcode.Syntax,
+					"%s must specify unqualified relation names", li.Strength))
+			}
+
+			// Search for the target in fromScope. If a target is missing from
+			// the scope then raise an error. This will end up looping over all
+			// columns in scope for each of the locking targets. We could use a
+			// more efficient data structure (e.g. a hash map of relation names)
+			// to improve the time complexity here, but we expect the number of
+			// columns to be small enough that doing so is likely not worth it.
+			found := false
+			for _, col := range fromScope.cols {
+				if target.TableName == col.table.TableName {
+					found = true
+					break
+				}
+			}
+			if !found {
+				panic(pgerror.Newf(
+					pgcode.UndefinedTable,
+					"relation %q in %s clause not found in FROM clause",
+					target.TableName, li.Strength,
+				))
+			}
+		}
+	}
+}
+
+// rejectIfLocking raises a locking error if a locking clause was specified.
+func (b *Builder) rejectIfLocking(locking lockingSpec, context string) {
+	if !locking.isSet() {
+		// No FOR [KEY] UPDATE/SHARE locking modes in scope.
+		return
+	}
+	b.raiseLockingContextError(locking, context)
+}
+
+// raiseLockingContextError raises an error indicating that a row-level locking
+// clause is not permitted in the specified context. locking.isSet() must be true.
+func (b *Builder) raiseLockingContextError(locking lockingSpec, context string) {
+	panic(pgerror.Newf(pgcode.FeatureNotSupported,
+		"%s is not allowed with %s", locking.get().Strength, context))
 }

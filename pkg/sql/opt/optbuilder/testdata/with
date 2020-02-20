@@ -619,7 +619,7 @@ build
 WITH t(x) AS (WITH t(x) AS (SELECT 1) SELECT x * 10 FROM t) SELECT x + 2 FROM t
 ----
 with &1 (t)
- ├── columns: "?column?":5(int)
+ ├── columns: "?column?":5(int!null)
  ├── project
  │    ├── columns: "?column?":1(int!null)
  │    ├── values
@@ -627,9 +627,9 @@ with &1 (t)
  │    └── projections
  │         └── const: 1 [type=int]
  └── with &2 (t)
-      ├── columns: "?column?":5(int)
+      ├── columns: "?column?":5(int!null)
       ├── project
-      │    ├── columns: "?column?":3(int)
+      │    ├── columns: "?column?":3(int!null)
       │    ├── with-scan &1 (t)
       │    │    ├── columns: x:2(int!null)
       │    │    └── mapping:
@@ -639,9 +639,9 @@ with &1 (t)
       │              ├── variable: x [type=int]
       │              └── const: 10 [type=int]
       └── project
-           ├── columns: "?column?":5(int)
+           ├── columns: "?column?":5(int!null)
            ├── with-scan &2 (t)
-           │    ├── columns: x:4(int)
+           │    ├── columns: x:4(int!null)
            │    └── mapping:
            │         └──  "?column?":3(int) => x:4(int)
            └── projections
@@ -911,7 +911,7 @@ with &2 (t)
  │    │    └── tuple [type=tuple{int}]
  │    │         └── const: 1 [type=int]
  │    └── project
- │         ├── columns: "?column?":4(int)
+ │         ├── columns: "?column?":4(int!null)
  │         ├── select
  │         │    ├── columns: n:3(int!null)
  │         │    ├── with-scan &1 (t)
@@ -973,7 +973,7 @@ with &2 (included_parts)
  │         ├── columns: p.part:11(string!null) p.sub_part:12(string) p.quantity:13(int)
  │         └── select
  │              ├── columns: sub_part:8(string!null) part:9(string) quantity:10(int) p.part:11(string!null) p.sub_part:12(string) p.quantity:13(int) p.rowid:14(int!null)
- │              ├── inner-join (hash)
+ │              ├── inner-join (cross)
  │              │    ├── columns: sub_part:8(string) part:9(string) quantity:10(int) p.part:11(string) p.sub_part:12(string) p.quantity:13(int) p.rowid:14(int!null)
  │              │    ├── with-scan &1 (included_parts)
  │              │    │    ├── columns: sub_part:8(string) part:9(string) quantity:10(int)
@@ -1031,7 +1031,7 @@ with &2 (search_graph)
  │    ├── initial columns: g.id:1(int) g.link:2(int) g.data:3(string) "?column?":4(int) array:5(int[]) bool:6(bool)
  │    ├── recursive columns: g.id:13(int) g.link:14(int) g.data:15(string) "?column?":22(int) "?column?":23(int[]) "?column?":24(bool)
  │    ├── project
- │    │    ├── columns: "?column?":4(int!null) array:5(int[]) bool:6(bool!null) g.id:1(int!null) g.link:2(int) g.data:3(string)
+ │    │    ├── columns: "?column?":4(int!null) array:5(int[]!null) bool:6(bool!null) g.id:1(int!null) g.link:2(int) g.data:3(string)
  │    │    ├── scan g
  │    │    │    └── columns: g.id:1(int!null) g.link:2(int) g.data:3(string)
  │    │    └── projections
@@ -1043,7 +1043,7 @@ with &2 (search_graph)
  │         ├── columns: "?column?":22(int) "?column?":23(int[]) "?column?":24(bool) g.id:13(int!null) g.link:14(int) g.data:15(string)
  │         ├── select
  │         │    ├── columns: g.id:13(int!null) g.link:14(int) g.data:15(string) id:16(int) link:17(int!null) data:18(string) depth:19(int) path:20(int[]) cycle:21(bool!null)
- │         │    ├── inner-join (hash)
+ │         │    ├── inner-join (cross)
  │         │    │    ├── columns: g.id:13(int!null) g.link:14(int) g.data:15(string) id:16(int) link:17(int) data:18(string) depth:19(int) path:20(int[]) cycle:21(bool)
  │         │    │    ├── scan g
  │         │    │    │    └── columns: g.id:13(int!null) g.link:14(int) g.data:15(string)
@@ -1106,7 +1106,7 @@ with &2 (cte)
  │    │    └── projections
  │    │         └── const: 0 [type=int]
  │    └── project
- │         ├── columns: "?column?":6(int) "?column?":7(int)
+ │         ├── columns: "?column?":6(int!null) "?column?":7(int)
  │         ├── select
  │         │    ├── columns: a:4(int!null) b:5(int)
  │         │    ├── with-scan &1 (cte)
@@ -1154,7 +1154,7 @@ with &2 (cte)
  │    │         ├── const: 0 [type=int]
  │    │         └── const: 1 [type=int]
  │    └── project
- │         ├── columns: "?column?":7(int)
+ │         ├── columns: "?column?":7(int!null)
  │         ├── select
  │         │    ├── columns: a:5(int!null) b:6(int)
  │         │    ├── with-scan &1 (cte)
@@ -1298,7 +1298,7 @@ with &2 (foo)
       │    │         └── const: 2 [type=int]
       │    └── project
       │         ├── columns: "?column?":11(int) "?column?":12(int)
-      │         ├── inner-join (hash)
+      │         ├── inner-join (cross)
       │         │    ├── columns: a:7(int) b:8(int) a:9(int) b:10(int)
       │         │    ├── with-scan &2 (foo)
       │         │    │    ├── columns: a:7(int) b:8(int)
@@ -1392,9 +1392,9 @@ with &1 (b)
       │    ├──  w:5 => x:1
       │    └──  column6:6 => rowid:2
       └── project
-           ├── columns: column6:6(int) w:5(int)
+           ├── columns: column6:6(int) w:5(int!null)
            ├── project
-           │    ├── columns: w:5(int)
+           │    ├── columns: w:5(int!null)
            │    ├── with-scan &1 (b)
            │    │    ├── columns: z:4(int!null)
            │    │    └── mapping:

@@ -53,10 +53,10 @@ func TestHeartbeatFindsOutAboutAbortedTransaction(t *testing.T) {
 		Knobs: base.TestingKnobs{
 			Store: &storage.StoreTestingKnobs{
 				TestingProposalFilter: func(args storagebase.ProposalFilterArgs) *roachpb.Error {
-					// We'll eventually expect to see an EndTransaction(commit=false) with
-					// the right intents.
-					if args.Req.IsSingleEndTransactionRequest() {
-						et := args.Req.Requests[0].GetInner().(*roachpb.EndTransactionRequest)
+					// We'll eventually expect to see an EndTxn(commit=false)
+					// with the right intents.
+					if args.Req.IsSingleEndTxnRequest() {
+						et := args.Req.Requests[0].GetInner().(*roachpb.EndTxnRequest)
 						if !et.Commit && et.Key.Equal(key) &&
 							reflect.DeepEqual(et.IntentSpans, []roachpb.Span{{Key: key}, {Key: key2}}) {
 							atomic.StoreInt64(&cleanupSeen, 1)
@@ -72,7 +72,7 @@ func TestHeartbeatFindsOutAboutAbortedTransaction(t *testing.T) {
 
 	push := func(ctx context.Context, key roachpb.Key) error {
 		// Conflicting transaction that pushes the above transaction.
-		conflictTxn := client.NewTxn(ctx, origDB, 0 /* gatewayNodeID */, client.RootTxn)
+		conflictTxn := client.NewTxn(ctx, origDB, 0 /* gatewayNodeID */)
 		// We need to explicitly set a high priority for the push to happen.
 		if err := conflictTxn.SetUserPriority(roachpb.MaxUserPriority); err != nil {
 			return err
@@ -98,7 +98,7 @@ func TestHeartbeatFindsOutAboutAbortedTransaction(t *testing.T) {
 		s.DistSenderI().(*kv.DistSender),
 	)
 	db := client.NewDB(ambient, tsf, s.Clock())
-	txn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */, client.RootTxn)
+	txn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */)
 	if err := txn.Put(ctx, key, "val"); err != nil {
 		t.Fatal(err)
 	}
@@ -118,8 +118,7 @@ func TestHeartbeatFindsOutAboutAbortedTransaction(t *testing.T) {
 		return nil
 	})
 
-	// Check that an EndTransaction(commit=false) with the right intents has been
-	// sent.
+	// Check that an EndTxn(commit=false) with the right intents has been sent.
 	testutils.SucceedsSoon(t, func() error {
 		if atomic.LoadInt64(&cleanupSeen) == 0 {
 			return fmt.Errorf("no cleanup sent yet")

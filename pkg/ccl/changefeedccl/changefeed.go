@@ -12,10 +12,11 @@ import (
 	"context"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
+	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvfeed"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
@@ -23,14 +24,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/span"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
-)
-
-var changefeedPollInterval = settings.RegisterNonNegativeDurationSetting(
-	"changefeed.experimental_poll_interval",
-	"polling interval for the prototype changefeed implementation",
-	1*time.Second,
 )
 
 const (
@@ -56,9 +52,9 @@ type emitEntry struct {
 func kvsToRows(
 	leaseMgr *sql.LeaseManager,
 	details jobspb.ChangefeedDetails,
-	inputFn func(context.Context) (bufferEntry, error),
+	inputFn func(context.Context) (kvfeed.Event, error),
 ) func(context.Context) ([]emitEntry, error) {
-	_, withDiff := details.Opts[optDiff]
+	_, withDiff := details.Opts[changefeedbase.OptDiff]
 	rfCache := newRowFetcherCache(leaseMgr)
 
 	var kvs row.SpanKVFetcher
@@ -185,28 +181,29 @@ func kvsToRows(
 			if err != nil {
 				return nil, err
 			}
-			if input.kv.Key != nil {
+			switch input.Type() {
+			case kvfeed.KVEvent:
+				kv := input.KV()
 				if log.V(3) {
-					log.Infof(ctx, "changed key %s %s", input.kv.Key, input.kv.Value.Timestamp)
+					log.Infof(ctx, "changed key %s %s", kv.Key, kv.Value.Timestamp)
 				}
-				schemaTimestamp := input.kv.Value.Timestamp
+				schemaTimestamp := kv.Value.Timestamp
 				prevSchemaTimestamp := schemaTimestamp
-				if input.backfillTimestamp != (hlc.Timestamp{}) {
-					schemaTimestamp = input.backfillTimestamp
+				if backfillTs := input.BackfillTimestamp(); backfillTs != (hlc.Timestamp{}) {
+					schemaTimestamp = backfillTs
 					prevSchemaTimestamp = schemaTimestamp.Prev()
 				}
 				output, err = appendEmitEntryForKV(
-					ctx, output, input.kv, input.prevVal,
+					ctx, output, kv, input.PrevValue(),
 					schemaTimestamp, prevSchemaTimestamp,
-					input.bufferGetTimestamp)
+					input.BufferGetTimestamp())
 				if err != nil {
 					return nil, err
 				}
-			}
-			if input.resolved != nil {
+			case kvfeed.ResolvedEvent:
 				output = append(output, emitEntry{
-					resolved:           input.resolved,
-					bufferGetTimestamp: input.bufferGetTimestamp,
+					resolved:           input.Resolved(),
+					bufferGetTimestamp: input.BufferGetTimestamp(),
 				})
 			}
 			if output != nil {
@@ -225,7 +222,7 @@ func kvsToRows(
 func emitEntries(
 	settings *cluster.Settings,
 	details jobspb.ChangefeedDetails,
-	sf *spanFrontier,
+	sf *span.Frontier,
 	encoder Encoder,
 	sink Sink,
 	inputFn func(context.Context) ([]emitEntry, error),
@@ -238,9 +235,9 @@ func emitEntries(
 		// being tracked by the local span frontier. The poller should not be forwarding
 		// row updates that have timestamps less than or equal to any resolved timestamp
 		// it's forwarded before.
-		// TODO(aayush): This should be an assertion once we're confident this can never
+		// TODO(dan): This should be an assertion once we're confident this can never
 		// happen under any circumstance.
-		if !sf.Frontier().Less(row.updated) {
+		if row.updated.LessEq(sf.Frontier()) {
 			log.Errorf(ctx, "cdc ux violation: detected timestamp %s that is less than "+
 				"or equal to the local frontier %s.", cloudStorageFormatTime(row.updated),
 				cloudStorageFormatTime(sf.Frontier()))
@@ -323,13 +320,13 @@ func emitEntries(
 		// is not changing), then this is sufficient and we don't have to do
 		// anything fancy with timers.
 		var timeBetweenFlushes time.Duration
-		if r, ok := details.Opts[optResolvedTimestamps]; ok && r != `` {
+		if r, ok := details.Opts[changefeedbase.OptResolvedTimestamps]; ok && r != `` {
 			var err error
 			if timeBetweenFlushes, err = time.ParseDuration(r); err != nil {
 				return nil, err
 			}
 		} else {
-			timeBetweenFlushes = changefeedPollInterval.Get(&settings.SV) / 5
+			timeBetweenFlushes = changefeedbase.TableDescriptorPollInterval.Get(&settings.SV) / 5
 		}
 		if len(resolvedSpans) == 0 || timeutil.Since(lastFlush) < timeBetweenFlushes {
 			return nil, nil
@@ -359,7 +356,7 @@ func emitEntries(
 func checkpointResolvedTimestamp(
 	ctx context.Context,
 	jobProgressedFn func(context.Context, jobs.HighWaterProgressedFn) error,
-	sf *spanFrontier,
+	sf *span.Frontier,
 ) error {
 	resolved := sf.Frontier()
 	var resolvedSpans []jobspb.ResolvedSpan

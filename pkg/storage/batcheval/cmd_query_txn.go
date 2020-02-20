@@ -16,7 +16,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/spanset"
@@ -25,7 +24,7 @@ import (
 )
 
 func init() {
-	RegisterCommand(roachpb.QueryTxn, declareKeysQueryTransaction, QueryTxn)
+	RegisterReadOnlyCommand(roachpb.QueryTxn, declareKeysQueryTransaction, QueryTxn)
 }
 
 func declareKeysQueryTransaction(
@@ -43,7 +42,7 @@ func declareKeysQueryTransaction(
 // other txns which are waiting on this transaction in order
 // to find dependency cycles.
 func QueryTxn(
-	ctx context.Context, batch engine.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, reader engine.Reader, cArgs CommandArgs, resp roachpb.Response,
 ) (result.Result, error) {
 	args := cArgs.Args.(*roachpb.QueryTxnRequest)
 	h := cArgs.Header
@@ -52,12 +51,7 @@ func QueryTxn(
 	if h.Txn != nil {
 		return result.Result{}, ErrTransactionUnsupported
 	}
-	// TODO(nvanbenschoten): old clusters didn't attach header timestamps to
-	// QueryTxn requests, so only perform this check for clusters that will
-	// always attach a valid timestamps.
-	checkHeaderTS := cluster.Version.IsActive(
-		ctx, cArgs.EvalCtx.ClusterSettings(), cluster.VersionQueryTxnTimestamp)
-	if h.Timestamp.Less(args.Txn.WriteTimestamp) && checkHeaderTS {
+	if h.Timestamp.Less(args.Txn.WriteTimestamp) {
 		// This condition must hold for the timestamp cache access to be safe.
 		return result.Result{}, errors.Errorf("request timestamp %s less than txn timestamp %s", h.Timestamp, args.Txn.WriteTimestamp)
 	}
@@ -68,7 +62,7 @@ func QueryTxn(
 
 	// Fetch transaction record; if missing, attempt to synthesize one.
 	if ok, err := engine.MVCCGetProto(
-		ctx, batch, key, hlc.Timestamp{}, &reply.QueriedTxn, engine.MVCCGetOptions{},
+		ctx, reader, key, hlc.Timestamp{}, &reply.QueriedTxn, engine.MVCCGetOptions{},
 	); err != nil {
 		return result.Result{}, err
 	} else if !ok {
@@ -76,6 +70,7 @@ func QueryTxn(
 		// Attempt to synthesize it from the provided TxnMeta.
 		reply.QueriedTxn = SynthesizeTxnFromMeta(cArgs.EvalCtx, args.Txn)
 	}
+
 	// Get the list of txns waiting on this txn.
 	reply.WaitingTxns = cArgs.EvalCtx.GetTxnWaitQueue().GetDependents(args.Txn.ID)
 	return result.Result{}, nil

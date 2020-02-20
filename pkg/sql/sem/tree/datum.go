@@ -65,7 +65,7 @@ var (
 	DZero = NewDInt(0)
 
 	// DTimeMaxTimeRegex is a compiled regex for parsing the 24:00 time value.
-	DTimeMaxTimeRegex = regexp.MustCompile("^24:00($|(:00$)|(:00.0+$))")
+	DTimeMaxTimeRegex = regexp.MustCompile(`^([0-9-]*(\s|T))?\s*24:00(:00(.0+)?)?\s*$`)
 )
 
 // Datum represents a SQL value.
@@ -1198,24 +1198,35 @@ type collationEnvironmentCacheEntry struct {
 	collator *collate.Collator
 }
 
-func (env *CollationEnvironment) getCacheEntry(locale string) collationEnvironmentCacheEntry {
+func (env *CollationEnvironment) getCacheEntry(
+	locale string,
+) (collationEnvironmentCacheEntry, error) {
 	entry, ok := env.cache[locale]
 	if !ok {
 		if env.cache == nil {
 			env.cache = make(map[string]collationEnvironmentCacheEntry)
 		}
-		entry = collationEnvironmentCacheEntry{locale, collate.New(language.MustParse(locale))}
+		tag, err := language.Parse(locale)
+		if err != nil {
+			err = errors.NewAssertionErrorWithWrappedErrf(err, "failed to parse locale %q", locale)
+			return collationEnvironmentCacheEntry{}, err
+		}
+
+		entry = collationEnvironmentCacheEntry{locale, collate.New(tag)}
 		env.cache[locale] = entry
 	}
-	return entry
+	return entry, nil
 }
 
 // NewDCollatedString is a helper routine to create a *DCollatedString. Panics
 // if locale is invalid. Not safe for concurrent use.
 func NewDCollatedString(
 	contents string, locale string, env *CollationEnvironment,
-) *DCollatedString {
-	entry := env.getCacheEntry(locale)
+) (*DCollatedString, error) {
+	entry, err := env.getCacheEntry(locale)
+	if err != nil {
+		return nil, err
+	}
 	if env.buffer == nil {
 		env.buffer = &collate.Buffer{}
 	}
@@ -1223,7 +1234,7 @@ func NewDCollatedString(
 	d := DCollatedString{contents, entry.locale, make([]byte, len(key))}
 	copy(d.Key, key)
 	env.buffer.Reset()
-	return &d
+	return &d, nil
 }
 
 // AmbiguousFormat implements the Datum interface.
@@ -1463,26 +1474,29 @@ func (d *DUuid) Next(_ *EvalContext) (Datum, bool) {
 
 // IsMax implements the Datum interface.
 func (d *DUuid) IsMax(_ *EvalContext) bool {
-	return d.equal(dMaxUUID)
+	return d.equal(DMaxUUID)
 }
 
 // IsMin implements the Datum interface.
 func (d *DUuid) IsMin(_ *EvalContext) bool {
-	return d.equal(dMinUUID)
+	return d.equal(DMinUUID)
 }
 
-var dMinUUID = NewDUuid(DUuid{uuid.UUID{}})
-var dMaxUUID = NewDUuid(DUuid{uuid.UUID{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+// DMinUUID is the min UUID.
+var DMinUUID = NewDUuid(DUuid{uuid.UUID{}})
+
+// DMaxUUID is the max UUID.
+var DMaxUUID = NewDUuid(DUuid{uuid.UUID{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
 	0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}})
 
 // Min implements the Datum interface.
 func (*DUuid) Min(_ *EvalContext) (Datum, bool) {
-	return dMinUUID, true
+	return DMinUUID, true
 }
 
 // Max implements the Datum interface.
 func (*DUuid) Max(_ *EvalContext) (Datum, bool) {
-	return dMaxUUID, true
+	return DMaxUUID, true
 }
 
 // AmbiguousFormat implements the Datum interface.
@@ -1608,12 +1622,12 @@ func (d *DIPAddr) Next(_ *EvalContext) (Datum, bool) {
 
 // IsMax implements the Datum interface.
 func (d *DIPAddr) IsMax(_ *EvalContext) bool {
-	return d.equal(dMaxIPAddr)
+	return d.equal(DMaxIPAddr)
 }
 
 // IsMin implements the Datum interface.
 func (d *DIPAddr) IsMin(_ *EvalContext) bool {
-	return d.equal(dMinIPAddr)
+	return d.equal(DMinIPAddr)
 }
 
 // dIPv4 and dIPv6 min and maxes use ParseIP because the actual byte constant is
@@ -1629,18 +1643,20 @@ var dIPv6max = ipaddr.Addr(uint128.FromBytes([]byte(net.ParseIP("ffff:ffff:ffff:
 var dMaxIPv4Addr = NewDIPAddr(DIPAddr{ipaddr.IPAddr{Family: ipaddr.IPv4family, Addr: dIPv4max, Mask: 32}})
 var dMinIPv6Addr = NewDIPAddr(DIPAddr{ipaddr.IPAddr{Family: ipaddr.IPv6family, Addr: dIPv6min, Mask: 0}})
 
-// dMinIPAddr and dMaxIPAddr are used as the DIPAddr global min and max.
-var dMinIPAddr = NewDIPAddr(DIPAddr{ipaddr.IPAddr{Family: ipaddr.IPv4family, Addr: dIPv4min, Mask: 0}})
-var dMaxIPAddr = NewDIPAddr(DIPAddr{ipaddr.IPAddr{Family: ipaddr.IPv6family, Addr: dIPv6max, Mask: 128}})
+// DMinIPAddr is the min DIPAddr.
+var DMinIPAddr = NewDIPAddr(DIPAddr{ipaddr.IPAddr{Family: ipaddr.IPv4family, Addr: dIPv4min, Mask: 0}})
+
+// DMaxIPAddr is the max DIPaddr.
+var DMaxIPAddr = NewDIPAddr(DIPAddr{ipaddr.IPAddr{Family: ipaddr.IPv6family, Addr: dIPv6max, Mask: 128}})
 
 // Min implements the Datum interface.
 func (*DIPAddr) Min(_ *EvalContext) (Datum, bool) {
-	return dMinIPAddr, true
+	return DMinIPAddr, true
 }
 
 // Max implements the Datum interface.
 func (*DIPAddr) Max(_ *EvalContext) (Datum, bool) {
-	return dMaxIPAddr, true
+	return DMaxIPAddr, true
 }
 
 // AmbiguousFormat implements the Datum interface.
@@ -1693,7 +1709,6 @@ func NewDDateFromTime(t time.Time) (*DDate, error) {
 // parsing dates, times, and timestamps. A nil value is generally
 // acceptable and will result in reasonable defaults being applied.
 type ParseTimeContext interface {
-	duration.Context
 	// GetRelativeParseTime returns the transaction time in the session's
 	// timezone (i.e. now()). This is used to calculate relative dates,
 	// like "tomorrow", and also provides a default time.Location for
@@ -1707,21 +1722,14 @@ var _ ParseTimeContext = &simpleParseTimeContext{}
 
 // NewParseTimeContext constructs a ParseTimeContext that returns
 // the given values.
-func NewParseTimeContext(mode duration.AdditionMode, relativeParseTime time.Time) ParseTimeContext {
+func NewParseTimeContext(relativeParseTime time.Time) ParseTimeContext {
 	return &simpleParseTimeContext{
-		AdditionMode:      mode,
 		RelativeParseTime: relativeParseTime,
 	}
 }
 
 type simpleParseTimeContext struct {
-	AdditionMode      duration.AdditionMode
 	RelativeParseTime time.Time
-}
-
-// GetAdditionMode implements ParseTimeContext.
-func (ctx simpleParseTimeContext) GetAdditionMode() duration.AdditionMode {
-	return ctx.AdditionMode
 }
 
 // GetRelativeParseTime implements ParseTimeContext.
@@ -1862,21 +1870,23 @@ func MakeDTime(t timeofday.TimeOfDay) *DTime {
 
 // ParseDTime parses and returns the *DTime Datum value represented by the
 // provided string, or an error if parsing is unsuccessful.
-func ParseDTime(ctx ParseTimeContext, s string) (*DTime, error) {
+func ParseDTime(ctx ParseTimeContext, s string, precision time.Duration) (*DTime, error) {
 	now := relativeParseTime(ctx)
 
-	// special case on 24:00 and 24:00:00 as the parser
+	// Special case on 24:00 and 24:00:00 as the parser
 	// does not handle these correctly.
 	if DTimeMaxTimeRegex.MatchString(s) {
 		return MakeDTime(timeofday.Time2400), nil
 	}
+
+	s = timeutil.ReplaceLibPQTimePrefix(s)
 
 	t, err := pgdate.ParseTime(now, pgdate.ParseModeYMD, s)
 	if err != nil {
 		// Build our own error message to avoid exposing the dummy date.
 		return nil, makeParseError(s, types.Time, nil)
 	}
-	return MakeDTime(timeofday.FromTime(t)), nil
+	return MakeDTime(timeofday.FromTime(t).Round(precision)), nil
 }
 
 // ResolvedType implements the TypedExpr interface.
@@ -1897,6 +1907,11 @@ func (d *DTime) Compare(ctx *EvalContext, other Datum) int {
 func (d *DTime) Prev(_ *EvalContext) (Datum, bool) {
 	prev := *d - 1
 	return &prev, true
+}
+
+// Round returns a new DTime to the specified precision.
+func (d *DTime) Round(precision time.Duration) *DTime {
+	return MakeDTime(timeofday.TimeOfDay(*d).Round(precision))
 }
 
 // Next implements the Datum interface.
@@ -1955,8 +1970,10 @@ type DTimeTZ struct {
 }
 
 var (
-	dMinTimeTZ = NewDTimeTZFromOffset(timeofday.Min, timetz.MinTimeTZOffsetSecs)
-	dMaxTimeTZ = NewDTimeTZFromOffset(timeofday.Time2400, timetz.MaxTimeTZOffsetSecs)
+	// DMinTimeTZ is the min TimeTZ.
+	DMinTimeTZ = NewDTimeTZFromOffset(timeofday.Min, timetz.MinTimeTZOffsetSecs)
+	// DMaxTimeTZ is the max TimeTZ.
+	DMaxTimeTZ = NewDTimeTZFromOffset(timeofday.Time2400, timetz.MaxTimeTZOffsetSecs)
 )
 
 // NewDTimeTZ creates a DTimeTZ from a timetz.TimeTZ.
@@ -1981,9 +1998,9 @@ func NewDTimeTZFromLocation(t timeofday.TimeOfDay, loc *time.Location) *DTimeTZ 
 
 // ParseDTimeTZ parses and returns the *DTime Datum value represented by the
 // provided string, or an error if parsing is unsuccessful.
-func ParseDTimeTZ(ctx ParseTimeContext, s string) (*DTimeTZ, error) {
+func ParseDTimeTZ(ctx ParseTimeContext, s string, precision time.Duration) (*DTimeTZ, error) {
 	now := relativeParseTime(ctx)
-	d, err := timetz.ParseTimeTZ(now, s)
+	d, err := timetz.ParseTimeTZ(now, s, precision)
 	if err != nil {
 		return nil, err
 	}
@@ -2022,22 +2039,27 @@ func (d *DTimeTZ) Next(ctx *EvalContext) (Datum, bool) {
 
 // IsMax implements the Datum interface.
 func (d *DTimeTZ) IsMax(_ *EvalContext) bool {
-	return d.TimeOfDay == dMaxTimeTZ.TimeOfDay && d.OffsetSecs == timetz.MaxTimeTZOffsetSecs
+	return d.TimeOfDay == DMaxTimeTZ.TimeOfDay && d.OffsetSecs == timetz.MaxTimeTZOffsetSecs
 }
 
 // IsMin implements the Datum interface.
 func (d *DTimeTZ) IsMin(_ *EvalContext) bool {
-	return d.TimeOfDay == dMinTimeTZ.TimeOfDay && d.OffsetSecs == timetz.MinTimeTZOffsetSecs
+	return d.TimeOfDay == DMinTimeTZ.TimeOfDay && d.OffsetSecs == timetz.MinTimeTZOffsetSecs
 }
 
 // Max implements the Datum interface.
 func (d *DTimeTZ) Max(_ *EvalContext) (Datum, bool) {
-	return dMaxTimeTZ, true
+	return DMaxTimeTZ, true
+}
+
+// Round returns a new DTimeTZ to the specified precision.
+func (d *DTimeTZ) Round(precision time.Duration) *DTimeTZ {
+	return NewDTimeTZ(d.TimeTZ.Round(precision))
 }
 
 // Min implements the Datum interface.
 func (d *DTimeTZ) Min(_ *EvalContext) (Datum, bool) {
-	return dMinTimeTZ, true
+	return DMinTimeTZ, true
 }
 
 // AmbiguousFormat implements the Datum interface.
@@ -2087,7 +2109,7 @@ func ParseDTimestamp(ctx ParseTimeContext, s string, precision time.Duration) (*
 	}
 	// Truncate the timezone. DTimestamp doesn't carry its timezone around.
 	_, offset := t.Zone()
-	t = duration.Add(ctx, t, duration.FromInt64(int64(offset))).UTC()
+	t = t.Add(time.Duration(offset) * time.Second).UTC()
 	return MakeDTimestamp(t, precision), nil
 }
 
@@ -2125,7 +2147,9 @@ func (*DTimestamp) ResolvedType() *types.T {
 	return types.Timestamp
 }
 
-func timeFromDatum(ctx *EvalContext, d Datum) (time.Time, bool) {
+// timeFromDatumForComparison gets the time from a datum object to use
+// strictly for comparison usage.
+func timeFromDatumForComparison(ctx *EvalContext, d Datum) (time.Time, bool) {
 	d = UnwrapDatum(ctx, d)
 	switch t := d.(type) {
 	case *DDate:
@@ -2135,11 +2159,17 @@ func timeFromDatum(ctx *EvalContext, d Datum) (time.Time, bool) {
 		}
 		return ts.Time, true
 	case *DTimestampTZ:
-		return t.stripTimeZone(ctx).Time, true
-	case *DTimestamp:
 		return t.Time, true
+	case *DTimestamp:
+		// Normalize to the timezone of the context.
+		_, zoneOffset := t.Time.In(ctx.GetLocation()).Zone()
+		ts := t.Time.In(ctx.GetLocation()).Add(-time.Duration(zoneOffset) * time.Second)
+		return ts, true
 	case *DTime:
-		return timeofday.TimeOfDay(*t).ToTime(), true
+		// Normalize to the timezone of the context.
+		toTime := timeofday.TimeOfDay(*t).ToTime()
+		_, zoneOffsetSecs := toTime.In(ctx.GetLocation()).Zone()
+		return toTime.In(ctx.GetLocation()).Add(-time.Duration(zoneOffsetSecs) * time.Second), true
 	case *DTimeTZ:
 		return t.ToTime(), true
 	default:
@@ -2148,8 +2178,8 @@ func timeFromDatum(ctx *EvalContext, d Datum) (time.Time, bool) {
 }
 
 func compareTimestamps(ctx *EvalContext, l Datum, r Datum) int {
-	lTime, lOk := timeFromDatum(ctx, l)
-	rTime, rOk := timeFromDatum(ctx, r)
+	lTime, lOk := timeFromDatumForComparison(ctx, l)
+	rTime, rOk := timeFromDatumForComparison(ctx, r)
 	if !lOk || !rOk {
 		panic(makeUnsupportedComparisonMessage(l, r))
 	}
@@ -2159,17 +2189,33 @@ func compareTimestamps(ctx *EvalContext, l Datum, r Datum) int {
 	if rTime.Before(lTime) {
 		return 1
 	}
+
 	// If either side is a TimeTZ, then we must compare timezones before
-	// when comparing.
-	// This is a special quirk of TimeTZ and does not apply to TimestampTZ.
-	lOffset := int32(0)
-	rOffset := int32(0)
-	if _, ok := l.(*DTimeTZ); ok {
+	// when comparing. If comparing a non-TimeTZ value, and the times are
+	// equal, then we must compare relative to the current zone we are at.
+	//
+	// This is a special quirk of TimeTZ and does not apply to TimestampTZ,
+	// as TimestampTZ does not store a timezone offset and is based on
+	// the current zone.
+	_, leftIsTimeTZ := l.(*DTimeTZ)
+	_, rightIsTimeTZ := r.(*DTimeTZ)
+
+	// If neither side is TimeTZ, this is always equal at this point.
+	if !leftIsTimeTZ && !rightIsTimeTZ {
+		return 0
+	}
+
+	_, zoneOffset := ctx.GetRelativeParseTime().Zone()
+	lOffset := int32(-zoneOffset)
+	rOffset := int32(-zoneOffset)
+
+	if leftIsTimeTZ {
 		lOffset = l.(*DTimeTZ).OffsetSecs
 	}
-	if _, ok := r.(*DTimeTZ); ok {
+	if rightIsTimeTZ {
 		rOffset = r.(*DTimeTZ).OffsetSecs
 	}
+
 	if lOffset > rOffset {
 		return 1
 	}
@@ -2256,12 +2302,16 @@ func MakeDTimestampTZ(t time.Time, precision time.Duration) *DTimestampTZ {
 }
 
 // MakeDTimestampTZFromDate creates a DTimestampTZ from a DDate.
+// This will be equivalent to the midnight of the given zone.
 func MakeDTimestampTZFromDate(loc *time.Location, d *DDate) (*DTimestampTZ, error) {
 	t, err := d.ToTime()
 	if err != nil {
 		return nil, err
 	}
-	return MakeDTimestampTZ(t.In(loc), time.Microsecond), nil
+	// Normalize to the correct zone.
+	t = t.In(loc)
+	_, offset := t.Zone()
+	return MakeDTimestampTZ(t.Add(time.Duration(-offset)*time.Second), time.Microsecond), nil
 }
 
 // ParseDTimestampTZ parses and returns the *DTimestampTZ Datum value represented by
@@ -2274,6 +2324,7 @@ func ParseDTimestampTZ(
 	if err != nil {
 		return nil, err
 	}
+	// Always normalize time to the current location.
 	return MakeDTimestampTZ(t, precision), nil
 }
 
@@ -2388,8 +2439,8 @@ func (d *DTimestampTZ) stripTimeZone(ctx *EvalContext) *DTimestamp {
 // location, returning a timestamp without a timezone.
 func (d *DTimestampTZ) EvalAtTimeZone(ctx *EvalContext, loc *time.Location) *DTimestamp {
 	_, locOffset := d.Time.In(loc).Zone()
-	newTime := duration.Add(ctx, d.Time.UTC(), duration.FromInt64(int64(locOffset)))
-	return MakeDTimestamp(newTime, time.Microsecond)
+	t := d.Time.UTC().Add(time.Duration(locOffset) * time.Second).UTC()
+	return MakeDTimestamp(t, time.Microsecond)
 }
 
 // DInterval is the interval Datum.
@@ -2397,70 +2448,58 @@ type DInterval struct {
 	duration.Duration
 }
 
-// DurationField is the type of a postgres duration field.
-// https://www.postgresql.org/docs/9.6/static/datatype-datetime.html
-type DurationField int
-
-// These constants designate the various time parts of an interval.
-const (
-	_ DurationField = iota
-	Year
-	Month
-	Day
-	Hour
-	Minute
-	Second
-
-	// While not technically part of the SQL standard for intervals, we provide
-	// Millisecond as a field to allow code to parse intervals with a default unit
-	// of milliseconds, which is useful for some internal use cases like
-	// statement_timeout.
-	Millisecond
-)
+// NewDInterval creates a new DInterval.
+func NewDInterval(d duration.Duration, itm types.IntervalTypeMetadata) *DInterval {
+	ret := &DInterval{Duration: d}
+	truncateDInterval(ret, itm)
+	return ret
+}
 
 // ParseDInterval parses and returns the *DInterval Datum value represented by the provided
 // string, or an error if parsing is unsuccessful.
 func ParseDInterval(s string) (*DInterval, error) {
-	return ParseDIntervalWithField(s, Second)
+	return ParseDIntervalWithTypeMetadata(s, types.DefaultIntervalTypeMetadata)
 }
 
 // truncateDInterval truncates the input DInterval downward to the nearest
 // interval quantity specified by the DurationField input.
-func truncateDInterval(d *DInterval, field DurationField) {
-	switch field {
-	case Year:
+// If precision is set for seconds, this will instead round at the second layer.
+func truncateDInterval(d *DInterval, itm types.IntervalTypeMetadata) {
+	switch itm.DurationField.DurationType {
+	case types.IntervalDurationType_YEAR:
 		d.Duration.Months = d.Duration.Months - d.Duration.Months%12
 		d.Duration.Days = 0
 		d.Duration.SetNanos(0)
-	case Month:
+	case types.IntervalDurationType_MONTH:
 		d.Duration.Days = 0
 		d.Duration.SetNanos(0)
-	case Day:
+	case types.IntervalDurationType_DAY:
 		d.Duration.SetNanos(0)
-	case Hour:
+	case types.IntervalDurationType_HOUR:
 		d.Duration.SetNanos(d.Duration.Nanos() - d.Duration.Nanos()%time.Hour.Nanoseconds())
-	case Minute:
+	case types.IntervalDurationType_MINUTE:
 		d.Duration.SetNanos(d.Duration.Nanos() - d.Duration.Nanos()%time.Minute.Nanoseconds())
-	case Second:
-		// Postgres doesn't truncate to whole seconds.
+	case types.IntervalDurationType_SECOND, types.IntervalDurationType_UNSET:
+		if itm.PrecisionIsSet || itm.Precision > 0 {
+			prec := TimeFamilyPrecisionToRoundDuration(itm.Precision)
+			d.Duration.SetNanos(time.Duration(d.Duration.Nanos()).Round(prec).Nanoseconds())
+		}
 	}
 }
 
-// ParseDIntervalWithField is like ParseDInterval, but it also takes a
-// DurationField that both specifies the units for unitless, numeric intervals
-// and also specifies the precision of the interval. Any precision in the input
-// interval that's higher than the DurationField value will be truncated
-// downward.
-func ParseDIntervalWithField(s string, field DurationField) (*DInterval, error) {
-	d, err := parseDInterval(s, field)
+// ParseDIntervalWithTypeMetadata is like ParseDInterval, but it also takes a
+// types.IntervalTypeMetadata that both specifies the units for unitless, numeric intervals
+// and also specifies the precision of the interval.
+func ParseDIntervalWithTypeMetadata(s string, itm types.IntervalTypeMetadata) (*DInterval, error) {
+	d, err := parseDInterval(s, itm)
 	if err != nil {
 		return nil, err
 	}
-	truncateDInterval(d, field)
+	truncateDInterval(d, itm)
 	return d, nil
 }
 
-func parseDInterval(s string, field DurationField) (*DInterval, error) {
+func parseDInterval(s string, itm types.IntervalTypeMetadata) (*DInterval, error) {
 	// At this time the only supported interval formats are:
 	// - SQL standard.
 	// - Postgres compatible.
@@ -2480,33 +2519,11 @@ func parseDInterval(s string, field DurationField) (*DInterval, error) {
 			return nil, makeParseError(s, types.Interval, err)
 		}
 		return &DInterval{Duration: dur}, nil
-	} else if f, err := strconv.ParseFloat(s, 64); err == nil {
-		// An interval that's just a number uses the field as its unit.
-		// All numbers are rounded down unless the precision is SECOND.
-		ret := &DInterval{Duration: duration.Duration{}}
-		switch field {
-		case Year:
-			ret.Months = int64(f) * 12
-		case Month:
-			ret.Months = int64(f)
-		case Day:
-			ret.Days = int64(f)
-		case Hour:
-			ret.SetNanos(time.Hour.Nanoseconds() * int64(f))
-		case Minute:
-			ret.SetNanos(time.Minute.Nanoseconds() * int64(f))
-		case Second:
-			ret.SetNanos(int64(float64(time.Second.Nanoseconds()) * f))
-		case Millisecond:
-			ret.SetNanos(int64(float64(time.Millisecond.Nanoseconds()) * f))
-		default:
-			return nil, errors.AssertionFailedf("unhandled DurationField constant %d", field)
-		}
-		return ret, nil
-	} else if strings.IndexFunc(s, unicode.IsLetter) == -1 {
+	}
+	if strings.IndexFunc(s, unicode.IsLetter) == -1 {
 		// If it has no letter, then we're most likely working with a SQL standard
 		// interval, as both postgres and golang have letter(s) and iso8601 has been tested.
-		dur, err := sqlStdToDuration(s)
+		dur, err := sqlStdToDuration(s, itm)
 		if err != nil {
 			return nil, makeParseError(s, types.Interval, err)
 		}
@@ -2515,7 +2532,7 @@ func parseDInterval(s string, field DurationField) (*DInterval, error) {
 
 	// We're either a postgres string or a Go duration.
 	// Our postgres syntax parser also supports golang, so just use that for both.
-	dur, err := parseDuration(s)
+	dur, err := parseDuration(s, itm)
 	if err != nil {
 		return nil, makeParseError(s, types.Interval, err)
 	}
@@ -2659,7 +2676,7 @@ func MustBeDJSON(e Expr) DJSON {
 }
 
 // AsJSON converts a datum into our standard json representation.
-func AsJSON(d Datum) (json.JSON, error) {
+func AsJSON(d Datum, loc *time.Location) (json.JSON, error) {
 	switch t := d.(type) {
 	case *DBool:
 		return json.FromBool(bool(*t)), nil
@@ -2678,7 +2695,7 @@ func AsJSON(d Datum) (json.JSON, error) {
 	case *DArray:
 		builder := json.NewArrayBuilder(t.Len())
 		for _, e := range t.Array {
-			j, err := AsJSON(e)
+			j, err := AsJSON(e, loc)
 			if err != nil {
 				return nil, err
 			}
@@ -2693,7 +2710,7 @@ func AsJSON(d Datum) (json.JSON, error) {
 		t.maybePopulateType()
 		labels := t.typ.TupleLabels()
 		for i, e := range t.D {
-			j, err := AsJSON(e)
+			j, err := AsJSON(e, loc)
 			if err != nil {
 				return nil, err
 			}
@@ -2711,7 +2728,7 @@ func AsJSON(d Datum) (json.JSON, error) {
 		// without the T separator. This causes some compatibility problems
 		// with certain JSON consumers, so we'll use an alternate formatting
 		// path here to maintain consistency with PostgreSQL.
-		return json.FromString(t.Time.Format(time.RFC3339Nano)), nil
+		return json.FromString(t.Time.In(loc).Format(time.RFC3339Nano)), nil
 	case *DTimestamp:
 		// This is RFC3339Nano, but without the TZ fields.
 		return json.FromString(t.UTC().Format("2006-01-02T15:04:05.999999999")), nil
@@ -3361,6 +3378,14 @@ func (d *DArray) Format(ctx *FmtCtx) {
 	if ctx.HasFlags(fmtPgwireFormat) {
 		d.pgwireFormat(ctx)
 		return
+	}
+
+	// If we want to export arrays, we need to ensure that
+	// the datums within the arrays are formatted with enclosing quotes etc.
+	if ctx.HasFlags(FmtExport) {
+		oldFlags := ctx.flags
+		ctx.flags = oldFlags & ^FmtExport | FmtParsable
+		defer func() { ctx.flags = oldFlags }()
 	}
 
 	ctx.WriteString("ARRAY[")

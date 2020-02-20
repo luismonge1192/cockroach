@@ -30,6 +30,7 @@ import (
 func registerFollowerReads(r *testRegistry) {
 	r.Add(testSpec{
 		Name:       "follower-reads/nodes=3",
+		Owner:      OwnerKV,
 		Cluster:    makeClusterSpec(3 /* nodeCount */, cpu(2), geo()),
 		MinVersion: "v19.1.0",
 		Run:        runFollowerReadsTest,
@@ -88,7 +89,7 @@ func runFollowerReadsTest(ctx context.Context, t *test, c *cluster) {
 	if r, err := db.ExecContext(ctx, "CREATE TABLE test.test ( k INT8, v INT8, PRIMARY KEY (k) )"); err != nil {
 		t.Fatalf("failed to create table: %v %v", err, r)
 	}
-
+	waitForFullReplication(t, db)
 	const rows = 100
 	const concurrency = 32
 	sem := make(chan struct{}, concurrency)

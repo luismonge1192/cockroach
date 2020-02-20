@@ -531,6 +531,11 @@ func (sb *statisticsBuilder) makeTableStatistics(tabID opt.TableID) *props.Stati
 				// Make sure the distinct count is at least 1, for the same reason as
 				// the row count above.
 				colStat.DistinctCount = max(colStat.DistinctCount, 1)
+
+				// Make sure the values are consistent in case some of the column stats
+				// were added at different times (and therefore have a different row
+				// count).
+				sb.finalizeFromRowCount(colStat, stats.RowCount)
 			}
 		}
 	}
@@ -666,7 +671,7 @@ func (sb *statisticsBuilder) buildSelect(sel *SelectExpr, relProps *props.Relati
 	// equivalencies derived from input expressions.
 	var equivFD props.FuncDepSet
 	for i := range sel.Filters {
-		equivFD.AddEquivFrom(&sel.Filters[i].ScalarProps(sel.Memo()).FuncDeps)
+		equivFD.AddEquivFrom(&sel.Filters[i].ScalarProps().FuncDeps)
 	}
 	equivReps := equivFD.EquivReps()
 
@@ -895,8 +900,7 @@ func (sb *statisticsBuilder) buildJoin(
 
 	// Calculate distinct counts for constrained columns in the ON conditions
 	// ----------------------------------------------------------------------
-	// TODO(rytaft): use histogram for joins.
-	numUnappliedConjuncts, constrainedCols, _ := sb.applyFilter(h.filters, join, relProps)
+	numUnappliedConjuncts, constrainedCols, histCols := sb.applyFilter(h.filters, join, relProps)
 
 	// Try to reduce the number of columns used for selectivity
 	// calculation based on functional dependencies.
@@ -941,7 +945,8 @@ func (sb *statisticsBuilder) buildJoin(
 		s.ApplySelectivity(sb.selectivityFromEquivalencies(equivReps, &h.filtersFD, join, s))
 	}
 
-	s.ApplySelectivity(sb.selectivityFromDistinctCounts(constrainedCols, join, s))
+	s.ApplySelectivity(sb.selectivityFromHistograms(histCols, join, s))
+	s.ApplySelectivity(sb.selectivityFromDistinctCounts(constrainedCols.Difference(histCols), join, s))
 	s.ApplySelectivity(sb.selectivityFromUnappliedConjuncts(numUnappliedConjuncts))
 	s.ApplySelectivity(sb.selectivityFromNullsRemoved(join, relProps, constrainedCols))
 
@@ -1004,8 +1009,8 @@ func (sb *statisticsBuilder) buildJoin(
 		s.ColStats.Clear()
 	}
 
-	// Loop through all colSets added in this step, and adjust null counts and
-	// distinct counts.
+	// Loop through all colSets added in this step, and adjust null counts,
+	// distinct counts, and histograms.
 	for i := 0; i < s.ColStats.Count(); i++ {
 		colStat := s.ColStats.Get(i)
 		leftSideCols := leftCols.Intersection(colStat.Cols)
@@ -1049,6 +1054,10 @@ func (sb *statisticsBuilder) buildJoin(
 			// Ensure distinct count is non-zero.
 			colStat.DistinctCount = max(colStat.DistinctCount, 1)
 		}
+
+		// We don't yet calculate histograms correctly for joins, so remove any
+		// histograms that have been created above.
+		colStat.Histogram = nil
 	}
 
 	sb.finalizeFromCardinality(relProps)
@@ -1474,8 +1483,16 @@ func (sb *statisticsBuilder) buildGroupBy(groupNode RelExpr, relProps *props.Rel
 	groupingColSet := groupNode.Private().(*GroupingPrivate).GroupingCols
 
 	if groupingColSet.Empty() {
-		// ScalarGroupBy or GroupBy with empty grouping columns.
-		s.RowCount = 1
+		if groupNode.Op() == opt.ScalarGroupByOp {
+			// ScalarGroupBy always returns exactly one row.
+			s.RowCount = 1
+		} else {
+			// GroupBy with empty grouping columns returns 0 or 1 rows, depending
+			// on whether input has rows. If input has < 1 row, use that, as that
+			// represents the probability of having 0 vs. 1 rows.
+			inputStats := sb.statsFromChild(groupNode, 0 /* childIdx */)
+			s.RowCount = min(1, inputStats.RowCount)
+		}
 	} else {
 		// Estimate the row count based on the distinct count of the grouping
 		// columns.
@@ -1965,7 +1982,7 @@ func (sb *statisticsBuilder) buildProjectSet(
 	// children.
 	var zipRowCount float64
 	for i := range projectSet.Zip {
-		if fn, ok := projectSet.Zip[i].Func.(*FunctionExpr); ok {
+		if fn, ok := projectSet.Zip[i].Fn.(*FunctionExpr); ok {
 			if fn.Overload.Generator != nil {
 				// TODO(rytaft): We may want to estimate the number of rows based on
 				// the type of generator function and its parameters.
@@ -2022,7 +2039,7 @@ func (sb *statisticsBuilder) colStatProjectSet(
 		for i := range projectSet.Zip {
 			item := &projectSet.Zip[i]
 			if item.Cols.ToSet().Intersects(reqZipCols) {
-				if fn, ok := item.Func.(*FunctionExpr); ok && fn.Overload.Generator != nil {
+				if fn, ok := item.Fn.(*FunctionExpr); ok && fn.Overload.Generator != nil {
 					// The columns(s) contain a generator function.
 					// TODO(rytaft): We may want to determine which generator function the
 					// requested columns correspond to, and estimate the distinct count and
@@ -2052,7 +2069,7 @@ func (sb *statisticsBuilder) colStatProjectSet(
 					zipColsNullCount += (s.RowCount - inputStats.RowCount) * (1 - zipColsNullCount/s.RowCount)
 				}
 
-				if item.ScalarProps(projectSet.Memo()).OuterCols.Intersects(inputProps.OutputCols) {
+				if item.ScalarProps().OuterCols.Intersects(inputProps.OutputCols) {
 					// The column(s) are correlated with the input, so they may have a
 					// distinct value for each distinct row of the input.
 					zipColsDistinctCount *= inputStats.RowCount * unknownDistinctCountRatio
@@ -2105,9 +2122,14 @@ func (sb *statisticsBuilder) colStatWithScan(
 	withProps := withScan.BindingProps
 	inColSet := opt.TranslateColSet(colSet, withScan.OutCols, withScan.InCols)
 
+	// We cannot call colStatLeaf on &withProps.Stats directly because it can
+	// modify it.
+	var statsCopy props.Statistics
+	statsCopy.CopyFrom(&withProps.Stats)
+
 	// TODO(rytaft): This would be more accurate if we could access the WithExpr
 	// itself.
-	inColStat := sb.colStatLeaf(inColSet, &withProps.Stats, &withProps.FuncDeps, withProps.NotNullCols)
+	inColStat := sb.colStatLeaf(inColSet, &statsCopy, &withProps.FuncDeps, withProps.NotNullCols)
 
 	colStat, _ := s.ColStats.Add(colSet)
 	colStat.DistinctCount = inColStat.DistinctCount
@@ -2525,6 +2547,15 @@ func countJSONPaths(conjunct *FiltersItem) int {
 func (sb *statisticsBuilder) applyFilter(
 	filters FiltersExpr, e RelExpr, relProps *props.Relational,
 ) (numUnappliedConjuncts float64, constrainedCols, histCols opt.ColSet) {
+	if lookupJoin, ok := e.(*LookupJoinExpr); ok {
+		// Special hack for lookup joins. Add constant filters from the equality
+		// conditions.
+		// TODO(rytaft): the correct way to do this is probably to fully implement
+		// histograms in Project and Join expressions, and use them in
+		// selectivityFromEquivalencies. See Issue #38082.
+		filters = append(filters, lookupJoin.ConstFilters...)
+	}
+
 	applyConjunct := func(conjunct *FiltersItem) {
 		if isEqualityWithTwoVars(conjunct.Condition) {
 			// We'll handle equalities later.
@@ -2557,7 +2588,7 @@ func (sb *statisticsBuilder) applyFilter(
 		// make sure that we don't include columns that were only present in
 		// equality conjuncts such as var1=var2. The selectivity of these conjuncts
 		// will be accounted for in selectivityFromEquivalencies.
-		scalarProps := conjunct.ScalarProps(e.Memo())
+		scalarProps := conjunct.ScalarProps()
 		constrainedCols.UnionWith(scalarProps.OuterCols)
 		if scalarProps.Constraints != nil {
 			histColsLocal := sb.applyConstraintSet(

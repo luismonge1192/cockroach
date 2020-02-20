@@ -156,7 +156,8 @@ var varGen = map[string]sessionVar{
 			case "utf8", "unicode", "cp65001":
 				return nil
 			default:
-				return unimplemented.Newf("client_encoding "+encoding,
+				return unimplemented.NewWithIssueDetailf(35882,
+					"client_encoding "+encoding,
 					"unimplemented client encoding: %q", encoding)
 			}
 		},
@@ -184,8 +185,8 @@ var varGen = map[string]sessionVar{
 
 			if len(dbName) != 0 {
 				// Verify database descriptor exists.
-				if _, err := evalCtx.schemaAccessors.logical.GetDatabaseDesc(ctx, evalCtx.Txn, dbName,
-					tree.DatabaseLookupFlags{Required: true}); err != nil {
+				if _, err := evalCtx.schemaAccessors.logical.GetDatabaseDesc(ctx, evalCtx.Txn,
+					dbName, tree.DatabaseLookupFlags{Required: true}); err != nil {
 					return "", err
 				}
 			}
@@ -325,20 +326,22 @@ var varGen = map[string]sessionVar{
 	},
 
 	// CockroachDB extension.
-	`experimental_force_split_at`: {
-		GetStringVal: makeBoolGetStringValFn(`experimental_force_split_at`),
+	`experimental_enable_primary_key_changes`: {
+		GetStringVal: makeBoolGetStringValFn(`experimental_enable_primary_key_changes`),
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
 			b, err := parsePostgresBool(s)
 			if err != nil {
 				return err
 			}
-			m.SetForceSplitAt(b)
+			m.SetPrimaryKeyChangesEnabled(b)
 			return nil
 		},
 		Get: func(evalCtx *extendedEvalContext) string {
-			return formatBoolAsPostgresSetting(evalCtx.SessionData.ForceSplitAt)
+			return formatBoolAsPostgresSetting(evalCtx.SessionData.PrimaryKeyChangesEnabled)
 		},
-		GlobalDefault: globalFalse,
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(primaryKeyChangesEnabledClusterMode.Get(sv))
+		},
 	},
 
 	// CockroachDB extension.
@@ -380,6 +383,25 @@ var varGen = map[string]sessionVar{
 		},
 		GlobalDefault: func(sv *settings.Values) string {
 			return strconv.FormatInt(ReorderJoinsLimitClusterValue.Get(sv), 10)
+		},
+	},
+
+	// CockroachDB extension.
+	`require_explicit_primary_keys`: {
+		GetStringVal: makeBoolGetStringValFn(`require_explicit_primary_keys`),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			b, err := parsePostgresBool(s)
+			if err != nil {
+				return err
+			}
+			m.SetRequireExplicitPrimaryKeys(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData.RequireExplicitPrimaryKeys)
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(requireExplicitPrimaryKeysClusterMode.Get(sv))
 		},
 	},
 
@@ -459,6 +481,25 @@ var varGen = map[string]sessionVar{
 		},
 		GlobalDefault: func(sv *settings.Values) string {
 			return formatBoolAsPostgresSetting(optDrivenFKClusterMode.Get(sv))
+		},
+	},
+
+	// CockroachDB extension.
+	`enable_insert_fast_path`: {
+		GetStringVal: makeBoolGetStringValFn(`enable_insert_fast_path`),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			b, err := parsePostgresBool(s)
+			if err != nil {
+				return err
+			}
+			m.SetInsertFastPath(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData.InsertFastPath)
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(insertFastPathClusterMode.Get(sv))
 		},
 	},
 
@@ -617,7 +658,7 @@ var varGen = map[string]sessionVar{
 		},
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
 			paths := strings.Split(s, ",")
-			m.SetSearchPath(sessiondata.MakeSearchPath(paths))
+			m.UpdateSearchPath(paths)
 			return nil
 		},
 		Get: func(evalCtx *extendedEvalContext) string {
@@ -810,8 +851,7 @@ var varGen = map[string]sessionVar{
 		GlobalDefault: func(_ *settings.Values) string { return "" },
 	},
 
-	// TODO(arul): Update this comment when temp tables work is done.
-	// Still under development
+	// CockroachDB extension.
 	`experimental_enable_temp_tables`: {
 		GetStringVal: makeBoolGetStringValFn(`experimental_enable_temp_tables`),
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
@@ -825,7 +865,28 @@ var varGen = map[string]sessionVar{
 		Get: func(evalCtx *extendedEvalContext) string {
 			return formatBoolAsPostgresSetting(evalCtx.SessionData.TempTablesEnabled)
 		},
-		GlobalDefault: globalFalse,
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(temporaryTablesEnabledClusterMode.Get(sv))
+		},
+	},
+
+	// CockroachDB extension.
+	`experimental_enable_hash_sharded_indexes`: {
+		GetStringVal: makeBoolGetStringValFn(`experimental_enable_hash_sharded_indexes`),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			b, err := parsePostgresBool(s)
+			if err != nil {
+				return err
+			}
+			m.SetHashShardedIndexesEnabled(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData.HashShardedIndexesEnabled)
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(hashShardedIndexesEnabledClusterMode.Get(sv))
+		},
 	},
 }
 

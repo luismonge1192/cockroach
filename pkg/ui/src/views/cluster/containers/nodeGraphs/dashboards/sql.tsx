@@ -26,7 +26,17 @@ export default function (props: GraphDashboardProps) {
       tooltip={`The total number of active SQL connections ${tooltipSelection}.`}
     >
       <Axis label="connections">
-        <Metric name="cr.node.sql.conns" title="Client Connections" />
+        {
+          _.map(nodeIDs, (node) => (
+            <Metric
+              key={node}
+              name="cr.node.sql.conns"
+              title={nodeDisplayName(nodesSummary, node)}
+              sources={[node]}
+              downsampleMax
+            />
+          ))
+        }
       </Axis>
     </LineGraph>,
 
@@ -148,7 +158,7 @@ export default function (props: GraphDashboardProps) {
     </LineGraph>,
 
     <LineGraph
-      title="Execution Latency: 99th percentile"
+      title="KV Execution Latency: 99th percentile"
       tooltip={
         `The 99th percentile of latency between query requests and responses over a
           1 minute period. Values are displayed individually for each node.`
@@ -170,7 +180,7 @@ export default function (props: GraphDashboardProps) {
     </LineGraph>,
 
     <LineGraph
-      title="Execution Latency: 90th percentile"
+      title="KV Execution Latency: 90th percentile"
       tooltip={
         `The 90th percentile of latency between query requests and responses over a
            1 minute period. Values are displayed individually for each node.`

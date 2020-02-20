@@ -328,7 +328,7 @@ func (c *coster) computeValuesCost(values *memo.ValuesExpr) memo.Cost {
 }
 
 func (c *coster) computeHashJoinCost(join memo.RelExpr) memo.Cost {
-	if join.Private().(*memo.JoinPrivate).Flags.DisallowHashJoin {
+	if !join.Private().(*memo.JoinPrivate).Flags.Has(memo.AllowHashJoinStoreRight) {
 		return hugeCost
 	}
 	leftRowCount := join.Child(0).(memo.RelExpr).Relational().Stats.RowCount
@@ -401,6 +401,14 @@ func (c *coster) computeLookupJoinCost(join *memo.LookupJoinExpr) memo.Cost {
 	// Since the matching rows in the table may not all be in the same range, this
 	// counts as random I/O.
 	perLookupCost := memo.Cost(randIOCostFactor)
+	if !join.LookupColsAreTableKey {
+		// If the lookup columns don't form a key, execution will have to limit
+		// KV batches which prevents running requests to multiple nodes in parallel.
+		// An experiment on a 4 node cluster with a table with 100k rows split into
+		// 100 ranges showed that a "non-parallel" lookup join is about 5 times
+		// slower.
+		perLookupCost *= 5
+	}
 	cost := memo.Cost(leftRowCount) * perLookupCost
 
 	// Each lookup might retrieve many rows; add the IO cost of retrieving the
@@ -475,8 +483,13 @@ func (c *coster) computeSetCost(set memo.RelExpr) memo.Cost {
 }
 
 func (c *coster) computeGroupingCost(grouping memo.RelExpr, required *physical.Required) memo.Cost {
+	// Start with some extra fixed overhead, since the grouping operators have
+	// setup overhead that is greater than other operators like Project. This
+	// can matter for rules like ReplaceMaxWithLimit.
+	cost := memo.Cost(cpuCostFactor)
+
 	// Add the CPU cost of emitting the rows.
-	cost := memo.Cost(grouping.Relational().Stats.RowCount) * cpuCostFactor
+	cost += memo.Cost(grouping.Relational().Stats.RowCount) * cpuCostFactor
 
 	// GroupBy must process each input row once. Cost per row depends on the
 	// number of grouping columns and the number of aggregates.

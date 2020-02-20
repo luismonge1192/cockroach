@@ -13,6 +13,7 @@ package sql
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 
@@ -41,7 +42,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
-	"github.com/opentracing/opentracing-go"
+	opentracing "github.com/opentracing/opentracing-go"
 )
 
 // To allow queries to send out flow RPCs in parallel, we use a pool of workers
@@ -115,7 +116,7 @@ func (dsp *DistSQLPlanner) initRunners() {
 func (dsp *DistSQLPlanner) setupFlows(
 	ctx context.Context,
 	evalCtx *extendedEvalContext,
-	txnCoordMeta *roachpb.TxnCoordMeta,
+	leafInputState *roachpb.LeafTxnInputState,
 	flows map[roachpb.NodeID]*execinfrapb.FlowSpec,
 	recv *DistSQLReceiver,
 	localState distsql.LocalState,
@@ -132,10 +133,10 @@ func (dsp *DistSQLPlanner) setupFlows(
 
 	evalCtxProto := execinfrapb.MakeEvalContext(&evalCtx.EvalContext)
 	setupReq := execinfrapb.SetupFlowRequest{
-		TxnCoordMeta: txnCoordMeta,
-		Version:      execinfra.Version,
-		EvalContext:  evalCtxProto,
-		TraceKV:      evalCtx.Tracing.KVTracingEnabled(),
+		LeafTxnInputState: leafInputState,
+		Version:           execinfra.Version,
+		EvalContext:       evalCtxProto,
+		TraceKV:           evalCtx.Tracing.KVTracingEnabled(),
 	}
 
 	// Start all the flows except the flow on this node (there is always a flow on
@@ -169,9 +170,10 @@ func (dsp *DistSQLPlanner) setupFlows(
 						Cfg: &execinfra.ServerConfig{
 							DiskMonitor: &mon.BytesMonitor{},
 							Settings:    dsp.st,
+							ClusterID:   &dsp.rpcCtx.ClusterID,
 						},
 						NodeID: -1,
-					}, spec.Processors, fuseOpt,
+					}, spec.Processors, fuseOpt, recv,
 				); err != nil {
 					// Vectorization attempt failed with an error.
 					returnVectorizationSetupError := false
@@ -185,7 +187,7 @@ func (dsp *DistSQLPlanner) setupFlows(
 							rsidx := spec.Processors[0].Core.LocalPlanNode.RowSourceIdx
 							if rsidx != nil {
 								lp := localState.LocalProcs[*rsidx]
-								if z, ok := lp.(rowexec.VectorizeAlwaysException); ok {
+								if z, ok := lp.(colflow.VectorizeAlwaysException); ok {
 									if z.IsException() {
 										returnVectorizationSetupError = false
 									}
@@ -288,8 +290,8 @@ func (dsp *DistSQLPlanner) Run(
 	ctx := planCtx.ctx
 
 	var (
-		localState   distsql.LocalState
-		txnCoordMeta *roachpb.TxnCoordMeta
+		localState     distsql.LocalState
+		leafInputState *roachpb.LeafTxnInputState
 	)
 	// NB: putting part of evalCtx in localState means it might be mutated down
 	// the line.
@@ -301,14 +303,13 @@ func (dsp *DistSQLPlanner) Run(
 	} else if txn != nil {
 		// If the plan is not local, we will have to set up leaf txns using the
 		// txnCoordMeta.
-		meta, err := txn.GetTxnCoordMetaOrRejectClient(ctx)
+		tis, err := txn.GetLeafTxnInputStateOrRejectClient(ctx)
 		if err != nil {
 			log.Infof(ctx, "%s: %s", clientRejectedMsg, err)
 			recv.SetError(err)
 			return func() {}
 		}
-		meta.StripRootToLeaf()
-		txnCoordMeta = &meta
+		leafInputState = &tis
 	}
 
 	if err := planCtx.sanityCheckAddresses(); err != nil {
@@ -325,10 +326,10 @@ func (dsp *DistSQLPlanner) Run(
 	if logPlanDiagram {
 		log.VEvent(ctx, 1, "creating plan diagram")
 		var stmtStr string
-		if planCtx.planner != nil {
+		if planCtx.planner != nil && planCtx.planner.stmt != nil {
 			stmtStr = planCtx.planner.stmt.String()
 		}
-		_, url, err := execinfrapb.GeneratePlanDiagramURL(stmtStr, flows)
+		_, url, err := execinfrapb.GeneratePlanDiagramURL(stmtStr, flows, false /* showInputTypes */)
 		if err != nil {
 			log.Infof(ctx, "Error generating diagram: %s", err)
 		} else {
@@ -352,7 +353,7 @@ func (dsp *DistSQLPlanner) Run(
 		localState.IsLocal = true
 	}
 
-	ctx, flow, err := dsp.setupFlows(ctx, evalCtx, txnCoordMeta, flows, recv, localState, vectorizedThresholdMet)
+	ctx, flow, err := dsp.setupFlows(ctx, evalCtx, leafInputState, flows, recv, localState, vectorizedThresholdMet)
 	if err != nil {
 		recv.SetError(err)
 		return func() {}
@@ -440,12 +441,6 @@ type DistSQLReceiver struct {
 	// Once set, no more rows are accepted.
 	commErr error
 
-	// txnAbortedErr is atomically set to an errWrap when the KV txn finishes
-	// asynchronously. Further results should not be returned to the client, as
-	// they risk missing seeing their own writes. Upon the next Push(), err is set
-	// and ConsumerStatus is set to ConsumerClosed.
-	txnAbortedErr atomic.Value
-
 	row    tree.Datums
 	status execinfra.ConsumerStatus
 	alloc  sqlbase.DatumAlloc
@@ -459,7 +454,7 @@ type DistSQLReceiver struct {
 	// The transaction in which the flow producing data for this
 	// receiver runs. The DistSQLReceiver updates the transaction in
 	// response to RetryableTxnError's and when distributed processors
-	// pass back TxnCoordMeta objects via ProducerMetas. Nil if no
+	// pass back LeafTxnFinalState objects via ProducerMetas. Nil if no
 	// transaction should be updated on errors (i.e. if the flow overall
 	// doesn't run in a transaction).
 	txn *client.Txn
@@ -472,12 +467,9 @@ type DistSQLReceiver struct {
 	// statement.
 	bytesRead int64
 	rowsRead  int64
-}
 
-// errWrap is a container for an error, for use with atomic.Value, which
-// requires that all of things stored in it must have the same concrete type.
-type errWrap struct {
-	err error
+	expectedRowsRead int64
+	progressAtomic   *uint64
 }
 
 // rowResultWriter is a subset of CommandResult to be used with the
@@ -497,11 +489,13 @@ type metadataResultWriter interface {
 
 type metadataCallbackWriter struct {
 	rowResultWriter
-	fn func(ctx context.Context, meta *execinfrapb.ProducerMetadata)
+	fn func(ctx context.Context, meta *execinfrapb.ProducerMetadata) error
 }
 
 func (w *metadataCallbackWriter) AddMeta(ctx context.Context, meta *execinfrapb.ProducerMetadata) {
-	w.fn(ctx, meta)
+	if err := w.fn(ctx, meta); err != nil {
+		w.SetError(err)
+	}
 }
 
 // errOnlyResultWriter is a rowResultWriter that only supports receiving an
@@ -565,21 +559,6 @@ func MakeDistSQLReceiver(
 		stmtType:     stmtType,
 		tracing:      tracing,
 	}
-	// If this receiver is part of a distributed flow and isn't using the root
-	// transaction, we need to sure that the flow is canceled when the root
-	// transaction finishes (i.e. it is abandoned, aborted, or committed), so that
-	// we don't return results to the client that might have missed seeing their
-	// own writes. The committed case shouldn't happen. This isn't necessary if
-	// the flow is running locally and is using the root transaction.
-	//
-	// TODO(andrei): Instead of doing this, should we lift this transaction
-	// monitoring to connExecutor and have it cancel the SQL txn's context? Or for
-	// that matter, should the TxnCoordSender cancel the context itself?
-	if r.txn != nil && r.txn.Type() == client.LeafTxn {
-		r.txn.OnCurrentIncarnationFinish(func(err error) {
-			r.txnAbortedErr.Store(errWrap{err: err})
-		})
-	}
 	return r
 }
 
@@ -618,14 +597,16 @@ func (r *DistSQLReceiver) Push(
 	row sqlbase.EncDatumRow, meta *execinfrapb.ProducerMetadata,
 ) execinfra.ConsumerStatus {
 	if meta != nil {
-		if meta.TxnCoordMeta != nil {
+		if meta.LeafTxnFinalState != nil {
 			if r.txn != nil {
-				if r.txn.ID() == meta.TxnCoordMeta.Txn.ID {
-					r.txn.AugmentTxnCoordMeta(r.ctx, *meta.TxnCoordMeta)
+				if r.txn.ID() == meta.LeafTxnFinalState.Txn.ID {
+					if err := r.txn.UpdateRootWithLeafFinalState(r.ctx, meta.LeafTxnFinalState); err != nil {
+						r.resultWriter.SetError(err)
+					}
 				}
 			} else {
 				r.resultWriter.SetError(
-					errors.Errorf("received a leaf TxnCoordMeta (%s); but have no root", meta.TxnCoordMeta))
+					errors.Errorf("received a leaf final state (%s); but have no root", meta.LeafTxnFinalState))
 			}
 		}
 		if meta.Err != nil {
@@ -671,6 +652,10 @@ func (r *DistSQLReceiver) Push(
 		if meta.Metrics != nil {
 			r.bytesRead += meta.Metrics.BytesRead
 			r.rowsRead += meta.Metrics.RowsRead
+			if r.progressAtomic != nil && r.expectedRowsRead != 0 {
+				progress := float64(r.rowsRead) / float64(r.expectedRowsRead)
+				atomic.StoreUint64(r.progressAtomic, math.Float64bits(progress))
+			}
 			meta.Metrics.Release()
 			meta.Release()
 		}
@@ -678,9 +663,6 @@ func (r *DistSQLReceiver) Push(
 			metaWriter.AddMeta(r.ctx, meta)
 		}
 		return r.status
-	}
-	if r.resultWriter.Err() == nil && r.txnAbortedErr.Load() != nil {
-		r.resultWriter.SetError(r.txnAbortedErr.Load().(errWrap).err)
 	}
 	if r.resultWriter.Err() == nil && r.ctx.Err() != nil {
 		r.resultWriter.SetError(r.ctx.Err())
@@ -770,9 +752,6 @@ var (
 
 // ProducerDone is part of the RowReceiver interface.
 func (r *DistSQLReceiver) ProducerDone() {
-	if r.txn != nil {
-		r.txn.OnCurrentIncarnationFinish(nil)
-	}
 	if r.closed {
 		panic("double close")
 	}
@@ -1004,6 +983,7 @@ func (dsp *DistSQLPlanner) PlanAndRun(
 		return func() {}
 	}
 	dsp.FinalizePlan(planCtx, &physPlan)
+	recv.expectedRowsRead = int64(physPlan.TotalEstimatedScannedRows)
 	return dsp.Run(planCtx, txn, &physPlan, recv, evalCtx, nil /* finishedSetupFn */)
 }
 
@@ -1017,7 +997,16 @@ func (dsp *DistSQLPlanner) PlanAndRunPostqueries(
 	recv *DistSQLReceiver,
 	maybeDistribute bool,
 ) bool {
+	prevSteppingMode := planner.Txn().ConfigureStepping(ctx, client.SteppingEnabled)
+	defer func() { _ = planner.Txn().ConfigureStepping(ctx, prevSteppingMode) }()
 	for _, postqueryPlan := range postqueryPlans {
+		// We place a sequence point before every postquery, so
+		// that each subsequent postquery can observe the writes
+		// by the previous step.
+		if err := planner.Txn().Step(ctx); err != nil {
+			recv.SetError(err)
+			return false
+		}
 		if err := dsp.planAndRunPostquery(
 			ctx,
 			postqueryPlan,

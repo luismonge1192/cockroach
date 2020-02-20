@@ -14,7 +14,6 @@ import (
 	"context"
 	"fmt"
 	"runtime"
-	"strconv"
 	"strings"
 	"time"
 
@@ -61,18 +60,11 @@ func registerVersion(r *testRegistry) {
 		}
 
 		m := newMonitor(ctx, c, c.Range(1, nodes))
-		for i, cmd := range workloads {
+		for _, cmd := range workloads {
 			cmd := cmd // loop-local copy
-			i := i     // ditto
 			m.Go(func(ctx context.Context) error {
 				cmd = fmt.Sprintf(cmd, nodes)
-				// Direct stderr only to disk. We expect errors from the workload as
-				// nodes are stopped and started.
-				childL, err := t.l.ChildLogger("workload"+strconv.Itoa(i), quietStderr)
-				if err != nil {
-					return err
-				}
-				return c.RunL(ctx, childL, c.Node(nodes+1), cmd)
+				return c.RunE(ctx, c.Node(nodes+1), cmd)
 			})
 		}
 
@@ -129,24 +121,7 @@ func registerVersion(r *testRegistry) {
 			stop := func(node int) error {
 				m.ExpectDeath()
 				l.Printf("stopping node %d\n", node)
-				port := fmt.Sprintf("{pgport:%d}", node)
-				// Note that the following command line needs to run against both v2.0
-				// and the current branch. Do not change it in a manner that is
-				// incompatible with 2.0.
-				if err := c.RunE(ctx, c.Node(node), "./cockroach quit --insecure --port="+port); err != nil {
-					return err
-				}
-				// NB: we still call Stop to make sure the process is dead when we try
-				// to restart it (or we'll catch an error from the RocksDB dir being
-				// locked). This won't happen unless run with --local due to timing.
-				// However, it serves as a reminder that `./cockroach quit` doesn't yet
-				// work well enough -- ideally all listeners and engines are closed by
-				// the time it returns to the client.
-				//
-				// TODO(tschottdorf): should return an error. I doubt that we want to
-				// call these *testing.T-style methods on goroutines.
-				c.Stop(ctx, c.Node(node))
-				return nil
+				return c.StopCockroachGracefullyOnNode(ctx, node)
 			}
 
 			var oldVersion string
@@ -236,6 +211,7 @@ func registerVersion(r *testRegistry) {
 	for _, n := range []int{3, 5} {
 		r.Add(testSpec{
 			Name:       fmt.Sprintf("version/mixed/nodes=%d", n),
+			Owner:      OwnerKV,
 			MinVersion: "v2.1.0",
 			Cluster:    makeClusterSpec(n + 1),
 			Run: func(ctx context.Context, t *test, c *cluster) {

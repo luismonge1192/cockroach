@@ -730,6 +730,28 @@ SELECT log(10.0::float), log(100.000::decimal)
 ----
 1 2.0000000000000000000
 
+query R
+SELECT log(2.0::float, 4.0::float)
+----
+2
+
+query R
+SELECT log(2.0::decimal, 4.0::decimal)
+----
+2.0000000000000000000
+
+query error cannot take logarithm of a negative number
+SELECT log(2.0::float, -10.0::float)
+
+query error cannot take logarithm of zero
+SELECT log(2.0::float, 0.0::float)
+
+query error cannot take logarithm of a negative number
+SELECT log(2.0::decimal, -10.0::decimal)
+
+query error cannot take logarithm of zero
+SELECT log(2.0::decimal, 0.0::decimal)
+
 query error cannot take logarithm of a negative number
 SELECT log(-100.000::decimal)
 
@@ -2083,12 +2105,13 @@ SELECT oid(3), oid(0), oid(12023948723)
 3  0  12023948723
 
 query T
-SELECT to_english(i) FROM (VALUES (1), (13), (617), (-2)) AS a(i)
+SELECT to_english(i) FROM (VALUES (1), (13), (617), (-2), (-9223372036854775808)) AS a(i)
 ----
 one
 one-three
 six-one-seven
 minus-two
+minus-nine-two-two-three-three-seven-two-zero-three-six-eight-five-four-seven-seven-five-eight-zero-eight
 
 # Do some basic sanity checking of the variadic hash functions.
 query BBBBBBBBB
@@ -2321,12 +2344,14 @@ SELECT pg_get_function_result((select oid from pg_proc where proname='variance' 
 ----
 numeric
 
-
-# Slight incompatibility: in Postgres, the latter returns SETOF anyelement.
-query TT
-SELECT pg_get_function_result('pg_sleep'::regproc), pg_get_function_result('unnest'::regproc)
+query T
+SELECT pg_get_function_result('pg_sleep'::regproc)
 ----
-bool  anyelement
+bool
+
+# Note in Postgres <= 9.5, returns SETOF anyelement.
+query error pq: more than one function named 'unnest'
+SELECT pg_get_function_result('unnest'::regproc);
 
 # Regression test for #40297.
 statement ok
@@ -2350,3 +2375,191 @@ query B
 SELECT (1, 2) IN ((2, 3), NULL)
 ----
 NULL
+
+# Test for regression in hex functions.
+subtest regression_41707
+
+# The int8 casts make it match postgres behavior - unfortunately, we do not default to int4.
+query TTTTTTT
+select to_hex(-2147483649), to_hex(-2147483648::int8), to_hex(-1::int8), to_hex(0), to_hex(1), to_hex(2147483647), to_hex(2147483648)
+----
+ffffffff7fffffff  ffffffff80000000  ffffffffffffffff  0  1  7fffffff  80000000
+
+query T
+select to_hex(E'\\047\\134'::bytea)
+----
+275c
+
+query T
+select to_hex('abc')
+----
+616263
+
+# Test crdb_internal commands which execute as root, but
+# only checks for permissions afterwards.
+subtest crdb_internal_privileged_only
+
+user root
+
+statement ok
+CREATE DATABASE root_test
+
+statement ok
+CREATE TABLE root_test.t(a int)
+
+statement ok
+ALTER DATABASE root_test CONFIGURE ZONE USING num_replicas = 5
+
+query I
+SELECT crdb_internal.get_namespace_id(0, 'does_not_exist')
+----
+NULL
+
+query I
+SELECT crdb_internal.get_namespace_id(0, 'root_test')
+----
+61
+
+query I
+SELECT crdb_internal.get_namespace_id(crdb_internal.get_namespace_id(0, 'root_test'), 't')
+----
+62
+
+query T
+SELECT crdb_internal.get_zone_config(-1)::string
+----
+NULL
+
+query T
+SELECT crdb_internal.get_zone_config(crdb_internal.get_namespace_id(0, 'root_test'))::string
+----
+\x280550015801
+
+query T
+SELECT crdb_internal.get_zone_config(crdb_internal.get_namespace_id(crdb_internal.get_namespace_id(0, 'root_test'), 't'))::string
+----
+NULL
+
+# switch users -- this one has no permissions so expect errors
+user testuser
+
+query I
+SELECT crdb_internal.get_namespace_id(0, 'does_not_exist')
+----
+NULL
+
+query error insufficient privilege
+SELECT crdb_internal.get_namespace_id(0, 'root_test')
+
+query T
+SELECT crdb_internal.get_zone_config(-1)::string
+----
+NULL
+
+query error insufficient privilege
+SELECT crdb_internal.get_zone_config(61)::string -- based on root query. having no permissions blocks us from this test rapidly changing though.
+
+# give testuser permissions on everything and retest
+user root
+
+statement ok
+GRANT ALL ON DATABASE root_test TO testuser
+
+statement ok
+GRANT ALL ON root_test.t TO testuser
+
+user testuser
+
+query I
+SELECT crdb_internal.get_namespace_id(0, 'root_test')
+----
+61
+
+query I
+SELECT crdb_internal.get_namespace_id(crdb_internal.get_namespace_id(0, 'root_test'), 't')
+----
+62
+
+query T
+SELECT crdb_internal.get_zone_config(crdb_internal.get_namespace_id(0, 'root_test'))::string
+----
+\x280550015801
+
+query T
+SELECT crdb_internal.get_zone_config(crdb_internal.get_namespace_id(crdb_internal.get_namespace_id(0, 'root_test'), 't'))::string
+----
+NULL
+
+# reset state to default
+user root
+
+statement ok
+DROP DATABASE root_test CASCADE
+
+# Test for timezone builtin.
+subtest timezone_test
+
+statement ok
+SET TIME ZONE -3
+
+query T
+SELECT timezone('UTC+6', '1970-01-01 01:00')
+----
+1969-12-31 22:00:00 +0000 +0000
+
+query T
+SELECT timezone('UTC+6', '1970-01-01 01:00'::time)
+----
+0000-01-01 22:00:00 -0600 -0600
+
+query T
+SELECT timezone('UTC+6', '1970-01-01 01:00'::timetz)
+----
+0000-01-01 22:00:00 -0600 -0600
+
+query T
+SELECT timezone('UTC+6', '1970-01-01 01:00'::timestamp)
+----
+1970-01-01 04:00:00 -0300 -0300
+
+query T
+SELECT timezone('UTC+6', '1970-01-01 01:00'::timestamptz)
+----
+1969-12-31 22:00:00 +0000 +0000
+
+# These test the reciprocal works the other way around.
+# TODO(otan): delete these after 20.1.
+query T
+SELECT timezone('1970-01-01 01:00', 'UTC+6')
+----
+1969-12-31 22:00:00 +0000 +0000
+
+query T
+SELECT timezone('1970-01-01 01:00'::time, 'UTC+6')
+----
+0000-01-01 22:00:00 -0600 -0600
+
+query T
+SELECT timezone('1970-01-01 01:00'::timetz, 'UTC+6')
+----
+0000-01-01 22:00:00 -0600 -0600
+
+query T
+SELECT timezone('1970-01-01 01:00'::timestamp, 'UTC+6')
+----
+1970-01-01 04:00:00 -0300 -0300
+
+query T
+SELECT timezone('1970-01-01 01:00'::timestamptz, 'UTC+6')
+----
+1969-12-31 22:00:00 +0000 +0000
+
+statement ok
+SET TIME ZONE +0
+
+subtest getdatabaseencoding
+
+query T
+SELECT getdatabaseencoding()
+----
+UTF8

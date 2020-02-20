@@ -16,7 +16,7 @@
 import _ from "lodash";
 import moment from "moment";
 import { createSelector } from "reselect";
-import { Store, Dispatch } from "redux";
+import { Store, Dispatch, Action } from "redux";
 import { ThunkAction } from "redux-thunk";
 
 import { LocalSetting } from "./localsettings";
@@ -25,7 +25,7 @@ import {
   saveUIData, loadUIData, isInFlight, UIDataState, UIDataStatus,
 } from "./uiData";
 import { refreshCluster, refreshNodes, refreshVersion, refreshHealth } from "./apiReducers";
-import { nodeStatusesSelector, livenessByNodeIDSelector } from "./nodes";
+import { singleVersionSelector, versionsSelector } from "src/redux/nodes";
 import { AdminUIState } from "./state";
 import * as docsURL from "src/util/docs";
 
@@ -92,7 +92,7 @@ export const instructionsBoxCollapsedSelector = createSelector(
 );
 
 export function setInstructionsBoxCollapsed(collapsed: boolean) {
-  return (dispatch: Dispatch<AdminUIState>) => {
+  return (dispatch: Dispatch<Action, AdminUIState>) => {
     dispatch(instructionsBoxCollapsedSetting.set(collapsed));
     dispatch(saveUIData({
       key: INSTRUCTIONS_BOX_COLLAPSED_KEY,
@@ -106,23 +106,6 @@ export function setInstructionsBoxCollapsed(collapsed: boolean) {
 ////////////////////////////////////////
 export const staggeredVersionDismissedSetting = new LocalSetting(
   "staggered_version_dismissed", localSettingsSelector, false,
-);
-
-export const versionsSelector = createSelector(
-  nodeStatusesSelector,
-  livenessByNodeIDSelector,
-  (nodeStatuses, livenessStatusByNodeID) =>
-    _.chain(nodeStatuses)
-      // Ignore nodes for which we don't have any build info.
-      .filter((status) => !!status.build_info )
-      // Exclude this node if it's known to be decommissioning.
-      .filter((status) => !status.desc ||
-                          !livenessStatusByNodeID[status.desc.node_id] ||
-                          !livenessStatusByNodeID[status.desc.node_id].decommissioning)
-      // Collect the surviving nodes' build tags.
-      .map((status) => status.build_info.tag)
-      .uniq()
-      .value(),
 );
 
 /**
@@ -147,7 +130,7 @@ export const staggeredVersionWarningSelector = createSelector(
       text: `We have detected that multiple versions of CockroachDB are running
       in this cluster. This may be part of a normal rolling upgrade process, but
       should be investigated if this is unexpected.`,
-      dismiss: (dispatch: Dispatch<AdminUIState>) => {
+      dismiss: (dispatch: Dispatch<Action, AdminUIState>) => {
         dispatch(staggeredVersionDismissedSetting.set(true));
         return Promise.resolve();
       },
@@ -249,7 +232,7 @@ export const disconnectedAlertSelector = createSelector(
     return {
       level: AlertLevel.CRITICAL,
       title: "We're currently having some trouble fetching updated data. If this persists, it might be a good idea to check your network connection to the CockroachDB cluster.",
-      dismiss: (dispatch: Dispatch<AdminUIState>) => {
+      dismiss: (dispatch: Dispatch<Action, AdminUIState>) => {
         dispatch(disconnectedDismissedLocalSetting.set(moment()));
         return Promise.resolve();
       },
@@ -280,18 +263,6 @@ export const bannerAlertsSelector = createSelector(
   disconnectedAlertSelector,
   (...alerts: Alert[]): Alert[] => {
     return _.without(alerts, null, undefined);
-  },
-);
-
-// Select the current build version of the cluster, returning undefined if the
-// cluster's version is currently staggered.
-const singleVersionSelector = createSelector(
-  versionsSelector,
-  (builds) => {
-    if (!builds || builds.length !== 1) {
-      return undefined;
-    }
-    return builds[0];
   },
 );
 

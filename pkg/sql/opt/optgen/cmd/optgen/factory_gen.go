@@ -11,6 +11,7 @@
 package main
 
 import (
+	"fmt"
 	"io"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optgen/lang"
@@ -68,10 +69,11 @@ func (g *factoryGen) genConstructFuncs() {
 	defines := g.compiled.Defines.
 		WithoutTag("Enforcer").
 		WithoutTag("List").
-		WithoutTag("ListItem").
 		WithoutTag("Private")
 
 	for _, define := range defines {
+		fields := g.md.childAndPrivateFields(define)
+
 		// Generate Construct method.
 		format := "// Construct%s constructs an expression for the %s operator.\n"
 		g.w.writeIndent(format, define.Name, define.Name)
@@ -79,13 +81,15 @@ func (g *factoryGen) genConstructFuncs() {
 
 		g.w.nestIndent("func (_f *Factory) Construct%s(\n", define.Name)
 
-		for _, field := range define.Fields {
+		for _, field := range fields {
 			fieldTyp := g.md.typeOf(field)
 			fieldName := g.md.fieldName(field)
 			g.w.writeIndent("%s %s,\n", unTitle(fieldName), fieldTyp.asParam())
 		}
 
-		if define.Tags.Contains("Relational") {
+		if define.Tags.Contains("ListItem") {
+			g.w.unnest(fmt.Sprintf(") memo.%s", define.Name))
+		} else if define.Tags.Contains("Relational") {
 			g.w.unnest(") memo.RelExpr")
 		} else {
 			g.w.unnest(") opt.ScalarExpr")
@@ -93,30 +97,50 @@ func (g *factoryGen) genConstructFuncs() {
 
 		g.w.nest(" {\n")
 
-		// Only include normalization rules for the current define.
-		rules := g.compiled.LookupMatchingRules(string(define.Name)).WithTag("Normalize")
-		sortRulesByPriority(rules)
-		for _, rule := range rules {
-			g.ruleGen.genRule(rule)
-		}
-		if len(rules) > 0 {
-			g.w.newline()
-		}
+		if define.Tags.Contains("ListItem") {
+			g.w.writeIndent("item := memo.%s{", define.Name)
+			for i, field := range fields {
+				fieldTyp := g.md.typeOf(field)
+				fieldName := g.md.fieldName(field)
 
-		g.w.writeIndent("e := _f.mem.Memoize%s(", define.Name)
-		for i, field := range define.Fields {
-			if i != 0 {
-				g.w.write(", ")
+				if i != 0 {
+					g.w.write(", ")
+				}
+
+				// Use fieldStorePrefix, since a parameter is being stored in a field.
+				g.w.write("%s: %s%s", fieldName, fieldStorePrefix(fieldTyp), unTitle(fieldName))
 			}
-			g.w.write("%s", unTitle(g.md.fieldName(field)))
-		}
-
-		g.w.write(")\n")
-
-		if define.Tags.Contains("Relational") {
-			g.w.writeIndent("return _f.onConstructRelational(e)\n")
+			g.w.write("}\n")
+			if define.Tags.Contains("ScalarProps") {
+				g.w.writeIndent("item.PopulateProps(_f.mem)\n")
+			}
+			g.w.writeIndent("return item\n")
 		} else {
-			g.w.writeIndent("return _f.onConstructScalar(e)\n")
+			// Only include normalization rules for the current define.
+			rules := g.compiled.LookupMatchingRules(string(define.Name)).WithTag("Normalize")
+			sortRulesByPriority(rules)
+			for _, rule := range rules {
+				g.ruleGen.genRule(rule)
+			}
+			if len(rules) > 0 {
+				g.w.newline()
+			}
+
+			g.w.writeIndent("e := _f.mem.Memoize%s(", define.Name)
+			for i, field := range fields {
+				if i != 0 {
+					g.w.write(", ")
+				}
+				g.w.write("%s", unTitle(g.md.fieldName(field)))
+			}
+
+			g.w.write(")\n")
+
+			if define.Tags.Contains("Relational") {
+				g.w.writeIndent("return _f.onConstructRelational(e)\n")
+			} else {
+				g.w.writeIndent("return _f.onConstructScalar(e)\n")
+			}
 		}
 
 		g.w.unnest("}\n\n")
@@ -134,19 +158,19 @@ func (g *factoryGen) genReplace() {
 	g.w.writeIndent("// ancestors via a calls to the corresponding factory Construct methods. Here\n")
 	g.w.writeIndent("// is example usage:\n")
 	g.w.writeIndent("//\n")
-	g.w.writeIndent("//   var replace func(e opt.Expr, replace ReplaceFunc) opt.Expr\n")
-	g.w.writeIndent("//   replace = func(e opt.Expr, replace ReplaceFunc) opt.Expr {\n")
+	g.w.writeIndent("//   var replace func(e opt.Expr) opt.Expr\n")
+	g.w.writeIndent("//   replace = func(e opt.Expr) opt.Expr {\n")
 	g.w.writeIndent("//     if e.Op() == opt.VariableOp {\n")
 	g.w.writeIndent("//       return getReplaceVar(e)\n")
 	g.w.writeIndent("//     }\n")
-	g.w.writeIndent("//     return e.Replace(e, replace)\n")
+	g.w.writeIndent("//     return factory.Replace(e, replace)\n")
 	g.w.writeIndent("//   }\n")
 	g.w.writeIndent("//   replace(root, replace)\n")
 	g.w.writeIndent("//\n")
 	g.w.writeIndent("// Here, all variables in the tree are being replaced by some other expression\n")
 	g.w.writeIndent("// in a pre-order traversal of the tree. Post-order traversal is trivially\n")
-	g.w.writeIndent("// achieved by moving the e.Replace call to the top of the replace function\n")
-	g.w.writeIndent("// rather than bottom.\n")
+	g.w.writeIndent("// achieved by moving the factory.Replace call to the top of the replace\n")
+	g.w.writeIndent("// function rather than bottom.\n")
 	g.w.nestIndent("func (f *Factory) Replace(e opt.Expr, replace ReplaceFunc) opt.Expr {\n")
 	g.w.writeIndent("switch t := e.(type) {\n")
 
@@ -168,7 +192,7 @@ func (g *factoryGen) genReplace() {
 						unTitle(childName), unTitle(childName), childTyp.friendlyName, childName)
 				} else {
 					g.w.writeIndent("%s := replace(t.%s).(%s)\n",
-						unTitle(childName), childName, childTyp.name)
+						unTitle(childName), childName, childTyp.asField())
 				}
 			}
 
@@ -191,7 +215,6 @@ func (g *factoryGen) genReplace() {
 			g.w.writeIndent("return f.Construct%s(", define.Name)
 			for i, child := range childFields {
 				childName := g.md.fieldName(child)
-
 				if i != 0 {
 					g.w.write(", ")
 				}
@@ -201,11 +224,11 @@ func (g *factoryGen) genReplace() {
 				if len(childFields) != 0 {
 					g.w.write(", ")
 				}
-				if g.md.typeOf(privateField).passByVal {
-					g.w.write("t.%s", g.md.fieldName(privateField))
-				} else {
-					g.w.write("&t.%s", g.md.fieldName(privateField))
-				}
+
+				// Use fieldLoadPrefix, since the private field is being passed as
+				// a parameter to the Construct method.
+				privateTyp := g.md.typeOf(privateField)
+				g.w.write("%st.%s", fieldLoadPrefix(privateTyp), g.md.fieldName(privateField))
 			}
 			g.w.write(")\n")
 			g.w.unnest("}\n")
@@ -239,11 +262,15 @@ func (g *factoryGen) genReplace() {
 		g.w.writeIndent("var newList []%s\n", itemTyp.name)
 		g.w.nestIndent("for i := range list {\n")
 		if itemTyp.isGenerated {
-			g.w.writeIndent("before := list[i].%s\n", g.md.fieldName(itemDefine.Fields[0]))
-			g.w.writeIndent("after := replace(before).(%s)\n", g.md.lookupType(string(itemDefine.Fields[0].Type)).fullName)
+			// Assume that first field in the item is the only expression.
+			firstFieldName := g.md.fieldName(itemDefine.Fields[0])
+			firstFieldTyp := g.md.lookupType(string(itemDefine.Fields[0].Type))
+			g.w.writeIndent("before := list[i].%s\n", firstFieldName)
+			g.w.writeIndent("after := replace(before).(%s)\n", firstFieldTyp.name)
 		} else {
+			// This is for cases like list of opt.ScalarExpr.
 			g.w.writeIndent("before := list[i]\n")
-			g.w.writeIndent("after := replace(before).(%s)\n", itemTyp.fullName)
+			g.w.writeIndent("after := replace(before).(%s)\n", itemTyp.name)
 		}
 		g.w.nestIndent("if before != after {\n")
 		g.w.nestIndent("if newList == nil {\n")
@@ -251,15 +278,20 @@ func (g *factoryGen) genReplace() {
 		g.w.writeIndent("copy(newList, list[:i])\n")
 		g.w.unnest("}\n")
 		if itemTyp.isGenerated {
-			g.w.writeIndent("newList[i].%s = after\n", g.md.fieldName(itemDefine.Fields[0]))
-
-			// Now copy additional exported private fields.
-			for _, field := range expandFields(g.compiled, itemDefine)[1:] {
-				if isExportedField(field) {
-					fieldName := g.md.fieldName(field)
-					g.w.writeIndent("newList[i].%s = list[i].%s\n", fieldName, fieldName)
+			// Construct new list item.
+			g.w.writeIndent("newList[i] = f.Construct%s(after", itemDefine.Name)
+			for i, field := range g.md.childAndPrivateFields(itemDefine) {
+				if i == 0 {
+					continue
 				}
+
+				// Use fieldLoadPrefix, since the field is a parameter to the
+				// Construct method.
+				fieldName := g.md.fieldName(field)
+				fieldTyp := g.md.typeOf(field)
+				g.w.write(", %slist[i].%s", fieldLoadPrefix(fieldTyp), fieldName)
 			}
+			g.w.write(")\n")
 		} else {
 			g.w.writeIndent("newList[i] = after\n")
 		}
@@ -313,19 +345,25 @@ func (g *factoryGen) genCopyAndReplaceDefault() {
 						g.w.writeIndent("f.copyAndReplaceDefault%s(t.%s, replace),\n",
 							childTyp.friendlyName, childName)
 					} else {
-						g.w.writeIndent("f.invokeReplace(t.%s, replace).(%s),\n", childName, childTyp.name)
+						g.w.writeIndent("f.invokeReplace(t.%s, replace).(%s),\n", childName, childTyp.asField())
 					}
 				}
 				if privateField != nil {
+					// Use fieldLoadPrefix, since the field is a parameter to the
+					// Construct method.
 					fieldName := g.md.fieldName(privateField)
-					g.w.writeIndent("%st.%s,\n", g.md.fieldLoadPrefix(privateField), fieldName)
+					fieldTyp := g.md.typeOf(privateField)
+					g.w.writeIndent("%st.%s,\n", fieldLoadPrefix(fieldTyp), fieldName)
 				}
 				g.w.unnest(")\n")
 			} else {
 				g.w.writeIndent("return f.mem.Memoize%s(", define.Name)
 				if privateField != nil {
+					// Use fieldLoadPrefix, since the field is a parameter to the
+					// Memoize method.
 					fieldName := g.md.fieldName(privateField)
-					g.w.write("%st.%s", g.md.fieldLoadPrefix(privateField), fieldName)
+					fieldTyp := g.md.typeOf(privateField)
+					g.w.write("%st.%s", fieldLoadPrefix(fieldTyp), fieldName)
 				}
 				g.w.write(")\n")
 			}
@@ -365,9 +403,18 @@ func (g *factoryGen) genCopyAndReplaceDefault() {
 					g.w.writeIndent("dst[i].%s = src[i].%s\n", fieldName, fieldName)
 				}
 			}
+
+			// Populate scalar properties.
+			if itemDefine.Tags.Contains("ScalarProps") {
+				g.w.writeIndent("dst[i].PopulateProps(f.mem)\n")
+			}
+
+			// Do validation checks on expression in race builds.
+			g.w.writeIndent("f.mem.CheckExpr(&dst[i])\n")
 		} else {
 			g.w.writeIndent("dst[i] = f.invokeReplace(src[i], replace).(%s)\n", itemType.fullName)
 		}
+
 		g.w.unnest("}\n")
 		g.w.writeIndent("return dst\n")
 		g.w.unnest("}\n\n")
@@ -414,15 +461,11 @@ func (g *factoryGen) genDynamicConstruct() {
 		g.w.writeIndent("case opt.%sOp:\n", define.Name)
 		g.w.nestIndent("return f.Construct%s(\n", define.Name)
 
-		for i, field := range define.Fields {
-			fieldTyp := g.md.typeOf(field)
-			if fieldTyp.isPointer {
-				g.w.writeIndent("args[%d].(%s),\n", i, fieldTyp.name)
-			} else if fieldTyp.passByVal {
-				g.w.writeIndent("*args[%d].(*%s),\n", i, fieldTyp.name)
-			} else {
-				g.w.writeIndent("args[%d].(*%s),\n", i, fieldTyp.name)
-			}
+		for i, field := range g.md.childAndPrivateFields(define) {
+			// Use castFromDynamicParam, since a dynamic parameter of type interface{}
+			// is being passed as a parameter to Construct.
+			arg := fmt.Sprintf("args[%d]", i)
+			g.w.writeIndent("%s,\n", castFromDynamicParam(arg, g.md.typeOf(field)))
 		}
 
 		g.w.unnest(")\n")

@@ -40,23 +40,30 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	_ "github.com/lib/pq"
-	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 )
 
+const (
+	aws   = "aws"
+	gce   = "gce"
+	azure = "azure"
+)
+
 var (
-	local       bool
-	cockroach   string
-	cloud                    = "gce"
-	encrypt     encryptValue = "false"
-	workload    string
-	roachprod   string
-	buildTag    string
-	clusterName string
-	clusterWipe bool
-	zonesF      string
-	teamCity    bool
+	local        bool
+	cockroach    string
+	cloud                     = gce
+	encrypt      encryptValue = "false"
+	instanceType string
+	workload     string
+	roachprod    string
+	buildTag     string
+	clusterName  string
+	clusterWipe  bool
+	zonesF       string
+	teamCity     bool
 )
 
 type encryptValue string
@@ -328,7 +335,7 @@ func execCmd(ctx context.Context, l *logger, args ...string) error {
 	l.Printf("> %s\n", strings.Join(args, " "))
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 
-	debugStdoutBuffer, _ := circbuf.NewBuffer(1024)
+	debugStdoutBuffer, _ := circbuf.NewBuffer(4096)
 	debugStderrBuffer, _ := circbuf.NewBuffer(1024)
 
 	// Do a dance around https://github.com/golang/go/issues/23019.
@@ -474,6 +481,29 @@ func MachineTypeToCPUs(s string) int {
 		}
 	}
 
+	// Azure doesn't have a standard way to size machines.
+	// This method is implemented for the default machine type.
+	// Not all of Azure machine types contain the number of vCPUs int he size and
+	// the sizing naming scheme is dependent on the machine type family.
+	switch s {
+	case "Standard_D2_v3":
+		return 2
+	case "Standard_D4_v3":
+		return 4
+	case "Standard_D8_v3":
+		return 8
+	case "Standard_D16_v3":
+		return 16
+	case "Standard_D32_v3":
+		return 32
+	case "Standard_D48_v3":
+		return 48
+	case "Standard_D64_v3":
+		return 64
+	}
+
+	// TODO(pbardea): Non-default Azure machine types are not supported
+	// and will return unknown machine type error.
 	fmt.Fprintf(os.Stderr, "unknown machine type: %s\n", s)
 	os.Exit(1)
 	return -1
@@ -501,6 +531,7 @@ func awsMachineType(cpus int) string {
 	}
 }
 
+// Default GCE machine type when none is specified.
 func gceMachineType(cpus int) string {
 	// TODO(peter): This is awkward: below 16 cpus, use n1-standard so that the
 	// machines have a decent amount of RAM. We could use customer machine
@@ -510,6 +541,60 @@ func gceMachineType(cpus int) string {
 		return fmt.Sprintf("n1-standard-%d", cpus)
 	}
 	return fmt.Sprintf("n1-highcpu-%d", cpus)
+}
+
+func azureMachineType(cpus int) string {
+	switch {
+	case cpus <= 2:
+		return "Standard_D2_v3"
+	case cpus <= 4:
+		return "Standard_D4_v3"
+	case cpus <= 8:
+		return "Standard_D8_v3"
+	case cpus <= 16:
+		return "Standard_D16_v3"
+	case cpus <= 36:
+		return "Standard_D32_v3"
+	case cpus <= 48:
+		return "Standard_D48_v3"
+	case cpus <= 64:
+		return "Standard_D64_v3"
+	default:
+		panic(fmt.Sprintf("no azure machine type with %d cpus", cpus))
+	}
+}
+
+func machineTypeFlag(machineType string) string {
+	switch cloud {
+	case aws:
+		if isSSD(machineType) {
+			return "--aws-machine-type-ssd"
+		}
+		return "--aws-machine-type"
+	case gce:
+		return "--gce-machine-type"
+	case azure:
+		return "--azure-machine-type"
+	default:
+		panic(fmt.Sprintf("unsupported cloud: %s\n", cloud))
+	}
+}
+
+func isSSD(machineType string) bool {
+	if cloud != aws {
+		panic("can only differentiate SSDs based on machine type on AWS")
+	}
+
+	typeAndSize := strings.Split(machineType, ".")
+	if len(typeAndSize) == 2 {
+		awsType := typeAndSize[0]
+		// All SSD machine types that we use end in 'd or begins with i3 (e.g. i3, i3en).
+		return strings.HasPrefix(awsType, "i3") || strings.HasSuffix(awsType, "d")
+	}
+
+	fmt.Fprint(os.Stderr, "aws machine type does not match expected format 'type.size' (e.g. c5d.4xlarge)", machineType)
+	os.Exit(1)
+	return false
 }
 
 type testI interface {
@@ -628,11 +713,15 @@ func (s clusterSpec) String() string {
 	return str
 }
 
+func firstZone(zones string) string {
+	return strings.SplitN(zones, ",", 2)[0]
+}
+
 func (s *clusterSpec) args() []string {
 	var args []string
 
 	switch cloud {
-	case "aws":
+	case aws:
 		if s.Zones != "" {
 			fmt.Fprintf(os.Stderr, "zones spec not yet supported on AWS: %s\n", s.Zones)
 			os.Exit(1)
@@ -643,18 +732,49 @@ func (s *clusterSpec) args() []string {
 		}
 
 		args = append(args, "--clouds=aws")
+	case azure:
+		args = append(args, "--clouds=azure")
 	}
 
 	if !local && s.CPUs != 0 {
-		switch cloud {
-		case "aws":
-			args = append(args, "--aws-machine-type-ssd="+awsMachineType(s.CPUs))
-		case "gce":
-			args = append(args, "--gce-machine-type="+gceMachineType(s.CPUs))
+		// Use the machine type specified as a CLI flag.
+		machineType := instanceType
+		if len(machineType) == 0 {
+			// If no machine type was specified, choose one
+			// based on the cloud and CPU count.
+			switch cloud {
+			case aws:
+				machineType = awsMachineType(s.CPUs)
+			case gce:
+				machineType = gceMachineType(s.CPUs)
+			case azure:
+				machineType = azureMachineType(s.CPUs)
+			}
 		}
+		if cloud == aws {
+			if isSSD(machineType) {
+				args = append(args, "--local-ssd=true")
+			} else {
+				args = append(args, "--local-ssd=false")
+			}
+		}
+		machineTypeArg := machineTypeFlag(machineType) + "=" + machineType
+		args = append(args, machineTypeArg)
 	}
 	if s.Zones != "" {
-		args = append(args, "--gce-zones="+s.Zones)
+		switch cloud {
+		case gce:
+			if s.Geo {
+				args = append(args, "--gce-zones="+s.Zones)
+			} else {
+				args = append(args, "--gce-zones="+firstZone(s.Zones))
+			}
+		case azure:
+			args = append(args, "--azure-locations="+s.Zones)
+		default:
+			fmt.Fprintf(os.Stderr, "specifying zones is not yet supported on %s", cloud)
+			os.Exit(1)
+		}
 	}
 	if s.Geo {
 		args = append(args, "--geo")
@@ -785,9 +905,12 @@ func (p clusterReusePolicyOption) apply(spec *clusterSpec) {
 //
 // A cluster is safe for concurrent use by multiple goroutines.
 type cluster struct {
-	name   string
-	tag    string
-	spec   clusterSpec
+	name string
+	tag  string
+	spec clusterSpec
+	// status is used to communicate the test's status. The callback is a noop
+	// until the cluster is passed to a test, at which point it's hooked up to
+	// test.Status().
 	status func(...interface{})
 	t      testI
 	// r is the registry tracking this cluster. Destroying the cluster will
@@ -961,7 +1084,11 @@ func (f *clusterFactory) newCluster(
 	sargs := []string{roachprod, "create", c.name, "-n", fmt.Sprint(c.spec.NodeCount)}
 	sargs = append(sargs, cfg.spec.args()...)
 	if !local && zonesF != "" && cfg.spec.Zones == "" {
-		sargs = append(sargs, "--gce-zones="+zonesF)
+		if cfg.spec.Geo {
+			sargs = append(sargs, "--gce-zones="+zonesF)
+		} else {
+			sargs = append(sargs, "--gce-zones="+firstZone(zonesF))
+		}
 	}
 	if !cfg.useIOBarrier {
 		sargs = append(sargs, "--local-ssd-no-ext4-barrier")
@@ -1082,6 +1209,29 @@ func (c *cluster) setTest(t testI) {
 	}
 }
 
+// StopCockroachGracefullyOnNode stops a running cockroach instance on the requested
+// node before a version upgrade.
+func (c *cluster) StopCockroachGracefullyOnNode(ctx context.Context, node int) error {
+	port := fmt.Sprintf("{pgport:%d}", node)
+	// Note that the following command line needs to run against both v2.1
+	// and the current branch. Do not change it in a manner that is
+	// incompatible with 2.1.
+	if err := c.RunE(ctx, c.Node(node), "./cockroach quit --insecure --port="+port); err != nil {
+		return err
+	}
+	// TODO (rohany): This comment below might be out of date.
+	// NB: we still call Stop to make sure the process is dead when we try
+	// to restart it (or we'll catch an error from the RocksDB dir being
+	// locked). This won't happen unless run with --local due to timing.
+	// However, it serves as a reminder that `./cockroach quit` doesn't yet
+	// work well enough -- ideally all listeners and engines are closed by
+	// the time it returns to the client.
+	c.Stop(ctx, c.Node(node))
+	// TODO(tschottdorf): should return an error. I doubt that we want to
+	//  call these *testing.T-style methods on goroutines.
+	return nil
+}
+
 // Save marks the cluster as "saved" so that it doesn't get destroyed.
 func (c *cluster) Save(ctx context.Context, msg string, l *logger) {
 	l.PrintfCtx(ctx, "saving cluster %s for debugging (--debug specified)", c)
@@ -1133,7 +1283,9 @@ func (c *cluster) validate(ctx context.Context, nodes clusterSpec, l *logger) er
 	if cpus := nodes.CPUs; cpus != 0 {
 		for i, vm := range cDetails.VMs {
 			vmCPUs := MachineTypeToCPUs(vm.MachineType)
-			if vmCPUs < cpus {
+			// vmCPUs will be negative if the machine type is unknown. Give unknown
+			// machine types the benefit of the doubt.
+			if vmCPUs > 0 && vmCPUs < cpus {
 				return fmt.Errorf("node %d has %d CPUs, test requires %d", i, vmCPUs, cpus)
 			}
 		}
@@ -1316,7 +1468,7 @@ func (c *cluster) FailOnReplicaDivergence(ctx context.Context, t *test) {
 			ctx, "find live node", 5*time.Second,
 			func(ctx context.Context) error {
 				db = c.Conn(ctx, i)
-				_, err := db.ExecContext(ctx, `SELECT 1`)
+				_, err := db.ExecContext(ctx, `;`)
 				return err
 			},
 		); err != nil {
@@ -1575,7 +1727,7 @@ func (c *cluster) Get(ctx context.Context, l *logger, src, dest string, opts ...
 
 // Put a string into the specified file on the remote(s).
 func (c *cluster) PutString(
-	ctx context.Context, l *logger, content, dest string, mode os.FileMode, opts ...option,
+	ctx context.Context, content, dest string, mode os.FileMode, opts ...option,
 ) error {
 	if ctx.Err() != nil {
 		return errors.Wrap(ctx.Err(), "cluster.PutString error")
@@ -1599,7 +1751,7 @@ func (c *cluster) PutString(
 	// NB: we intentionally don't remove the temp files. This is because roachprod
 	// will symlink them when running locally.
 
-	if err := execCmd(ctx, l, roachprod, "put", c.makeNodes(opts...), src, dest); err != nil {
+	if err := execCmd(ctx, c.l, roachprod, "put", c.makeNodes(opts...), src, dest); err != nil {
 		return errors.Wrap(err, "PutString")
 	}
 	return nil
@@ -1778,7 +1930,7 @@ func (c *cluster) Wipe(ctx context.Context, opts ...option) {
 
 // Run a command on the specified node.
 func (c *cluster) Run(ctx context.Context, node nodeListOption, args ...string) {
-	err := c.RunL(ctx, c.l, node, args...)
+	err := c.RunE(ctx, node, args...)
 	if err != nil {
 		c.t.Fatal(err)
 	}
@@ -1804,9 +1956,59 @@ func (c *cluster) Install(
 		append([]string{roachprod, "install", c.makeNodes(node), "--"}, args...)...)
 }
 
-// RunE runs a command on the specified node, returning an error.
+var reOnlyAlphanumeric = regexp.MustCompile(`[^a-zA-Z0-9]+`)
+
+// cmdLogFileName comes up with a log file to use for the given argument string.
+func cmdLogFileName(t time.Time, nodes nodeListOption, args ...string) string {
+	// Make sure we treat {"./cockroach start"} like {"./cockroach", "start"}.
+	args = strings.Split(strings.Join(args, " "), " ")
+	prefix := []string{reOnlyAlphanumeric.ReplaceAllString(args[0], "")}
+	for _, arg := range args[1:] {
+		if s := reOnlyAlphanumeric.ReplaceAllString(arg, ""); s != arg {
+			break
+		}
+		prefix = append(prefix, arg)
+	}
+	s := strings.Join(prefix, "_")
+	const maxLen = 70
+	if len(s) > maxLen {
+		s = s[:maxLen]
+	}
+	logFile := fmt.Sprintf(
+		"run_%s_n%s_%s",
+		t.Format(`150405.000`),
+		nodes.String()[1:],
+		s,
+	)
+	return logFile
+}
+
+// RunE runs a command on the specified node, returning an error. The output
+// will be redirected to a file which is logged via the cluster-wide logger in
+// case of an error. Logs will sort chronologically and those belonging to
+// failing invocations will be suffixed `.failed.log`.
 func (c *cluster) RunE(ctx context.Context, node nodeListOption, args ...string) error {
-	return c.RunL(ctx, c.l, node, args...)
+	cmdString := strings.Join(args, " ")
+	logFile := cmdLogFileName(timeutil.Now(), node, args...)
+
+	// NB: we set no prefix because it's only going to a file anyway.
+	l, err := c.l.ChildLogger(logFile, quietStderr, quietStdout)
+	if err != nil {
+		return err
+	}
+	c.l.PrintfCtx(ctx, "> %s", cmdString)
+	err = c.RunL(ctx, l, node, args...)
+	l.Printf("> result: %+v", err)
+	if err := ctx.Err(); err != nil {
+		l.Printf("(note: incoming context was canceled: %s", err)
+	}
+	physicalFileName := l.file.Name()
+	l.close()
+	if err != nil {
+		_ = os.Rename(physicalFileName, strings.TrimSuffix(physicalFileName, ".log")+".failed.log")
+	}
+	err = errors.Wrapf(err, "output in %s", logFile)
+	return err
 }
 
 // RunL runs a command on the specified node, returning an error.
@@ -2151,7 +2353,7 @@ func (m *monitor) WaitE() error {
 		return errors.New("already failed")
 	}
 
-	return m.wait(roachprod, "monitor", m.nodes)
+	return errors.Wrap(m.wait(roachprod, "monitor", m.nodes), "monitor failure")
 }
 
 func (m *monitor) Wait() {
@@ -2159,7 +2361,10 @@ func (m *monitor) Wait() {
 		// If the test has failed, don't try to limp along.
 		return
 	}
-	if err := m.WaitE(); err != nil && !m.t.Failed() {
+	if err := m.WaitE(); err != nil {
+		// Note that we used to avoid fataling again if we had already fatal'ed.
+		// However, this error here might be the one to actually report, see:
+		// https://github.com/cockroachdb/cockroach/issues/44436
 		m.t.Fatal(err)
 	}
 }
@@ -2204,8 +2409,12 @@ func (m *monitor) wait(args ...string) error {
 			m.cancel()
 			wg.Done()
 		}()
-		setErr(m.g.Wait())
+		setErr(errors.Wrap(m.g.Wait(), "monitor task failed"))
 	}()
+
+	setMonitorCmdErr := func(err error) {
+		setErr(errors.Wrap(err, "monitor command failure"))
+	}
 
 	// 2. The second goroutine forks/execs the monitoring command.
 	pipeR, pipeW := io.Pipe()
@@ -2221,7 +2430,7 @@ func (m *monitor) wait(args ...string) error {
 
 		monL, err := m.l.ChildLogger(`MONITOR`)
 		if err != nil {
-			setErr(err)
+			setMonitorCmdErr(err)
 			return
 		}
 		defer monL.close()
@@ -2233,7 +2442,7 @@ func (m *monitor) wait(args ...string) error {
 			if err != context.Canceled && !strings.Contains(err.Error(), "killed") {
 				// The expected reason for an error is that the monitor was killed due
 				// to the context being canceled. Any other error is an actual error.
-				setErr(err)
+				setMonitorCmdErr(err)
 				return
 			}
 		}

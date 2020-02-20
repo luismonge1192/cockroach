@@ -13,6 +13,7 @@ import React from "react";
 import { createSelector } from "reselect";
 import { connect } from "react-redux";
 import Helmet from "react-helmet";
+import { withRouter } from "react-router-dom";
 
 import Loading from "src/views/shared/components/loading";
 import { ToolTipWrapper } from "src/views/shared/components/toolTip";
@@ -109,7 +110,7 @@ class DataDistribution extends React.Component<DataDistributionProps> {
     return (
       <div className="data-distribution">
         <div className="data-distribution__zone-config-sidebar">
-          <h2>
+          <h2 className="base-heading">
             Zone Configs{" "}
             <div className="section-heading__tooltip">
               <ToolTipWrapper text={ZONE_CONFIG_TEXT}>
@@ -148,7 +149,7 @@ interface DataDistributionPageProps {
   refreshLiveness: typeof refreshLiveness;
 }
 
-class DataDistributionPage extends React.Component<DataDistributionPageProps> {
+export class DataDistributionPage extends React.Component<DataDistributionPageProps> {
 
   componentDidMount() {
     this.props.refreshDataDistribution();
@@ -165,11 +166,9 @@ class DataDistributionPage extends React.Component<DataDistributionPageProps> {
   render() {
     return (
       <div>
-        <Helmet>
-          <title>Data Distribution</title>
-        </Helmet>
+        <Helmet title="Data Distribution" />
         <section className="section">
-          <h1>Data Distribution</h1>
+          <h1 className="base-heading page-title">Data Distribution</h1>
         </section>
         <section className="section">
           <Loading
@@ -206,7 +205,7 @@ const localityTreeErrors = createSelector(
 );
 
 // tslint:disable-next-line:variable-name
-const DataDistributionPageConnected = connect(
+const DataDistributionPageConnected = withRouter(connect(
   (state: AdminUIState) => ({
     dataDistribution: state.cachedData.dataDistribution,
     sortedZoneConfigs: sortedZoneConfigs(state),
@@ -218,7 +217,7 @@ const DataDistributionPageConnected = connect(
     refreshNodes,
     refreshLiveness,
   },
-)(DataDistributionPage);
+)(DataDistributionPage));
 
 export default DataDistributionPageConnected;
 

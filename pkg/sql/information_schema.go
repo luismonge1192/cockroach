@@ -25,7 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/vtable"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 const (
@@ -815,7 +815,7 @@ CREATE TABLE information_schema.referential_constraints (
 				if r, ok := matchOptionMap[fk.Match]; ok {
 					matchType = r
 				}
-				referencedIdx, err := refTable.FindIndexByID(fk.LegacyReferencedIndex)
+				referencedIdx, err := sqlbase.FindFKReferencedIndex(refTable, fk.ReferencedColumnIDs)
 				if err != nil {
 					return err
 				}
@@ -1194,6 +1194,7 @@ CREATE TABLE information_schema.table_constraints (
 	INITIALLY_DEFERRED STRING NOT NULL
 )`,
 	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		h := makeOidHasher()
 		return forEachTableDescWithTableLookup(ctx, p, dbContext, hideVirtual, /* virtual tables have no constraints */
 			func(
 				db *sqlbase.DatabaseDescriptor,
@@ -1225,7 +1226,35 @@ CREATE TABLE information_schema.table_constraints (
 						return err
 					}
 				}
-				return nil
+
+				// Unlike with pg_catalog.pg_constraint, Postgres also includes NOT
+				// NULL column constraints in information_schema.check_constraints.
+				// Cockroach doesn't track these constraints as check constraints,
+				// but we can pull them off of the table's column descriptors.
+				colNum := 0
+				return forEachColumnInTable(table, func(col *sqlbase.ColumnDescriptor) error {
+					colNum++
+					// NOT NULL column constraints are implemented as a CHECK in postgres.
+					conNameStr := tree.NewDString(fmt.Sprintf(
+						"%s_%s_%d_not_null", h.NamespaceOid(db, scName), defaultOid(table.ID), colNum,
+					))
+					if !col.Nullable {
+						if err := addRow(
+							dbNameStr,                // constraint_catalog
+							scNameStr,                // constraint_schema
+							conNameStr,               // constraint_name
+							dbNameStr,                // table_catalog
+							scNameStr,                // table_schema
+							tbNameStr,                // table_name
+							tree.NewDString("CHECK"), // constraint_type
+							yesOrNoDatum(false),      // is_deferrable
+							yesOrNoDatum(false),      // initially_deferred
+						); err != nil {
+							return err
+						}
+					}
+					return nil
+				})
 			})
 	},
 }
@@ -1317,6 +1346,7 @@ var (
 	tableTypeSystemView = tree.NewDString("SYSTEM VIEW")
 	tableTypeBaseTable  = tree.NewDString("BASE TABLE")
 	tableTypeView       = tree.NewDString("VIEW")
+	tableTypeTemporary  = tree.NewDString("LOCAL TEMPORARY")
 )
 
 var informationSchemaTablesTable = virtualSchemaTable{
@@ -1338,6 +1368,8 @@ https://www.postgresql.org/docs/9.5/infoschema-tables.html`,
 				} else if table.IsView() {
 					tableType = tableTypeView
 					insertable = noString
+				} else if table.Temporary {
+					tableType = tableTypeTemporary
 				}
 				dbNameStr := tree.NewDString(db.Name)
 				scNameStr := tree.NewDString(scName)
@@ -1407,9 +1439,16 @@ CREATE TABLE information_schema.views (
 func forEachSchemaName(
 	ctx context.Context, p *planner, db *sqlbase.DatabaseDescriptor, fn func(string) error,
 ) error {
-	scNames := []string{string(tree.PublicSchemaName)}
-	// Handle virtual schemas.
-	for _, schema := range p.getVirtualTabler().getEntries() {
+	schemaNames, err := getSchemaNames(ctx, p, db)
+	if err != nil {
+		return err
+	}
+	vtableEntries := p.getVirtualTabler().getEntries()
+	scNames := make([]string, 0, len(schemaNames)+len(vtableEntries))
+	for _, name := range schemaNames {
+		scNames = append(scNames, name)
+	}
+	for _, schema := range vtableEntries {
 		scNames = append(scNames, schema.desc.Name)
 	}
 	sort.Strings(scNames)
@@ -1542,6 +1581,29 @@ func forEachTableDescWithTableLookup(
 	return forEachTableDescWithTableLookupInternal(ctx, p, dbContext, virtualOpts, false /* allowAdding */, fn)
 }
 
+func getSchemaNames(
+	ctx context.Context, p *planner, dbContext *DatabaseDescriptor,
+) (map[sqlbase.ID]string, error) {
+	if dbContext != nil {
+		return p.Tables().getSchemasForDatabase(ctx, p.txn, dbContext.ID)
+	}
+	ret := make(map[sqlbase.ID]string)
+	dbs, err := p.Tables().getAllDatabaseDescriptors(ctx, p.txn)
+	if err != nil {
+		return nil, err
+	}
+	for _, db := range dbs {
+		schemas, err := p.Tables().getSchemasForDatabase(ctx, p.txn, db.ID)
+		if err != nil {
+			return nil, err
+		}
+		for id, name := range schemas {
+			ret[id] = name
+		}
+	}
+	return ret, nil
+}
+
 // forEachTableDescWithTableLookupInternal is the logic that supports
 // forEachTableDescWithTableLookup.
 //
@@ -1594,6 +1656,12 @@ func forEachTableDescWithTableLookupInternal(
 		}
 	}
 
+	// Generate all schema names, and keep a mapping.
+	schemaNames, err := getSchemaNames(ctx, p, dbContext)
+	if err != nil {
+		return err
+	}
+
 	// Physical descriptors next.
 	for _, tbID := range lCtx.tbIDs {
 		table := lCtx.tbDescs[tbID]
@@ -1601,7 +1669,11 @@ func forEachTableDescWithTableLookupInternal(
 		if table.Dropped() || !userCanSeeTable(ctx, p, table, allowAdding) || !parentExists {
 			continue
 		}
-		if err := fn(dbDesc, tree.PublicSchema, table, lCtx); err != nil {
+		scName, ok := schemaNames[table.GetParentSchemaID()]
+		if !ok {
+			return errors.AssertionFailedf("schema id %d not found", table.GetParentSchemaID())
+		}
+		if err := fn(dbDesc, scName, table, lCtx); err != nil {
 			return err
 		}
 	}

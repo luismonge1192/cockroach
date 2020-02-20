@@ -33,17 +33,8 @@ func registerEncryption(r *testRegistry) {
 			}
 		}
 
-		stop := func(node int) error {
-			port := fmt.Sprintf("{pgport:%d}", node)
-			if err := c.RunE(ctx, c.Node(node), "./cockroach quit --insecure --host=:"+port); err != nil {
-				return err
-			}
-			c.Stop(ctx, c.Node(node))
-			return nil
-		}
-
 		for i := 1; i <= nodes; i++ {
-			if err := stop(i); err != nil {
+			if err := c.StopCockroachGracefullyOnNode(ctx, i); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -85,6 +76,7 @@ func registerEncryption(r *testRegistry) {
 	for _, n := range []int{1} {
 		r.Add(testSpec{
 			Name:       fmt.Sprintf("encryption/nodes=%d", n),
+			Owner:      OwnerStorage,
 			MinVersion: "v2.1.0",
 			Cluster:    makeClusterSpec(n),
 			Run: func(ctx context.Context, t *test, c *cluster) {

@@ -13,9 +13,11 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
@@ -42,22 +44,16 @@ func CreateTestTableDescriptor(
 		nil, /* vt */
 		st,
 		stmt.AST.(*tree.CreateTable),
-		parentID, id,
+		parentID, keys.PublicSchemaID, id,
 		hlc.Timestamp{}, /* creationTime */
 		privileges,
 		nil, /* affected */
 		&semaCtx,
 		&evalCtx,
-		false, /* temporary */
+		&sessiondata.SessionData{}, /* sessionData */
+		false,                      /* temporary */
 	)
 	return desc.TableDescriptor, err
-}
-
-func makeTestingExtendedEvalContext(st *cluster.Settings) extendedEvalContext {
-	return extendedEvalContext{
-		EvalContext: tree.MakeTestingEvalContext(st),
-		Tracing:     &SessionTracing{},
-	}
 }
 
 // StmtBufReader is an exported interface for reading a StmtBuf.

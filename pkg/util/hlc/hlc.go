@@ -288,6 +288,10 @@ func (c *Clock) enforceWallTimeWithinBoundLocked() {
 }
 
 // PhysicalNow returns the local wall time.
+//
+// Note that, contrary to Now(), PhysicalNow does not take into consideration
+// higher clock signals received through Update(). If you want to take them into
+// consideration, use c.Now().GoTime().
 func (c *Clock) PhysicalNow() int64 {
 	return c.physicalClock()
 }
@@ -328,7 +332,7 @@ func (c *Clock) updateLocked(rt Timestamp, updateIfMaxOffsetExceeded bool) (Time
 	}
 
 	offset := time.Duration(rt.WallTime - physicalClock)
-	if c.maxOffset > 0 && c.maxOffset != timeutil.ClocklessMaxOffset && offset > c.maxOffset {
+	if c.maxOffset > 0 && offset > c.maxOffset {
 		err = fmt.Errorf("remote wall time is too far ahead (%s) to be trustworthy", offset)
 		if !updateIfMaxOffsetExceeded {
 			return Timestamp{}, err

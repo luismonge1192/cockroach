@@ -44,10 +44,9 @@ func TestNonVectorizedPanicDoesntHangServer(t *testing.T) {
 	}
 	base := flowinfra.NewFlowBase(
 		flowCtx,
-		nil,  /* flowReg */
-		nil,  /* syncFlowConsumer */
-		nil,  /* localProcessors */
-		true, /* isVectorized */
+		nil, /* flowReg */
+		nil, /* syncFlowConsumer */
+		nil, /* localProcessors */
 	)
 	flow := colflow.NewVectorizedFlow(base)
 
@@ -69,6 +68,9 @@ func TestNonVectorizedPanicDoesntHangServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	ctx, err = base.Setup(ctx, nil, flowinfra.FuseAggressively)
+	require.NoError(t, err)
 
 	base.SetProcessors([]execinfra.Processor{mat})
 	// This test specifically verifies that a flow doesn't get stuck in Wait for

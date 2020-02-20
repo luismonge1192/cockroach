@@ -222,7 +222,7 @@ func TestAggregatorOneFunc(t *testing.T) {
 				{7},
 				{8},
 			},
-			batchSize:       4,
+			batchSize:       3,
 			outputBatchSize: 1,
 			name:            "CarryBetweenInputAndOutputBatches",
 		},
@@ -369,6 +369,47 @@ func TestAggregatorMultiFunc(t *testing.T) {
 			name:          "AvgSumSingleInputBatch",
 			convToDecimal: true,
 		},
+		{
+			aggFns: []execinfrapb.AggregatorSpec_Func{
+				execinfrapb.AggregatorSpec_BOOL_AND,
+				execinfrapb.AggregatorSpec_BOOL_OR,
+			},
+			aggCols: [][]uint32{
+				{1}, {1},
+			},
+			input: tuples{
+				{0, true},
+				{1, false},
+				{2, true},
+				{2, false},
+				{3, true},
+				{3, true},
+				{4, false},
+				{4, false},
+				{5, false},
+				{5, nil},
+				{6, nil},
+				{6, true},
+				{7, nil},
+				{7, false},
+				{7, true},
+				{8, nil},
+				{8, nil},
+			},
+			colTypes: []coltypes.T{coltypes.Int64, coltypes.Bool},
+			expected: tuples{
+				{true, true},
+				{false, false},
+				{false, true},
+				{true, true},
+				{false, false},
+				{false, false},
+				{true, true},
+				{false, true},
+				{nil, nil},
+			},
+			name: "BoolAndOrBatch",
+		},
 	}
 
 	for _, agg := range aggTypes {
@@ -392,29 +433,32 @@ func TestAggregatorAllFunctions(t *testing.T) {
 		{
 			aggFns: []execinfrapb.AggregatorSpec_Func{
 				execinfrapb.AggregatorSpec_ANY_NOT_NULL,
+				execinfrapb.AggregatorSpec_ANY_NOT_NULL,
 				execinfrapb.AggregatorSpec_AVG,
 				execinfrapb.AggregatorSpec_COUNT_ROWS,
 				execinfrapb.AggregatorSpec_COUNT,
 				execinfrapb.AggregatorSpec_SUM,
 				execinfrapb.AggregatorSpec_MIN,
 				execinfrapb.AggregatorSpec_MAX,
+				execinfrapb.AggregatorSpec_BOOL_AND,
+				execinfrapb.AggregatorSpec_BOOL_OR,
 			},
-			aggCols:  [][]uint32{{0}, {1}, {}, {1}, {2}, {2}, {2}},
-			colTypes: []coltypes.T{coltypes.Int64, coltypes.Decimal, coltypes.Int64},
+			aggCols:  [][]uint32{{0}, {4}, {1}, {}, {1}, {2}, {2}, {2}, {3}, {3}},
+			colTypes: []coltypes.T{coltypes.Int64, coltypes.Decimal, coltypes.Int64, coltypes.Bool, coltypes.Bytes},
 			input: tuples{
-				{0, 3.1, 2},
-				{0, 1.1, 3},
-				{1, 1.1, 1},
-				{1, 4.1, 0},
-				{2, 1.1, 1},
-				{3, 4.1, 0},
-				{3, 5.1, 0},
+				{0, 3.1, 2, true, "zero"},
+				{0, 1.1, 3, false, "zero"},
+				{1, 1.1, 1, false, "one"},
+				{1, 4.1, 0, false, "one"},
+				{2, 1.1, 1, true, "two"},
+				{3, 4.1, 0, false, "three"},
+				{3, 5.1, 0, true, "three"},
 			},
 			expected: tuples{
-				{0, 2.1, 2, 2, 5, 2, 3},
-				{1, 2.6, 2, 2, 1, 0, 1},
-				{2, 1.1, 1, 1, 1, 1, 1},
-				{3, 4.6, 2, 2, 0, 0, 0},
+				{0, "zero", 2.1, 2, 2, 5, 2, 3, false, true},
+				{1, "one", 2.6, 2, 2, 1, 0, 1, false, false},
+				{2, "two", 1.1, 1, 1, 1, 1, 1, true, true},
+				{3, "three", 4.6, 2, 2, 0, 0, 0, false, true},
 			},
 			convToDecimal: true,
 		},
@@ -431,20 +475,22 @@ func TestAggregatorAllFunctions(t *testing.T) {
 				execinfrapb.AggregatorSpec_MIN,
 				execinfrapb.AggregatorSpec_MAX,
 				execinfrapb.AggregatorSpec_AVG,
+				execinfrapb.AggregatorSpec_BOOL_AND,
+				execinfrapb.AggregatorSpec_BOOL_OR,
 			},
-			aggCols:  [][]uint32{{0}, {1}, {}, {1}, {1}, {2}, {2}, {2}, {1}},
-			colTypes: []coltypes.T{coltypes.Int64, coltypes.Decimal, coltypes.Int64},
+			aggCols:  [][]uint32{{0}, {1}, {}, {1}, {1}, {2}, {2}, {2}, {1}, {3}, {3}},
+			colTypes: []coltypes.T{coltypes.Int64, coltypes.Decimal, coltypes.Int64, coltypes.Bool, coltypes.Bool},
 			input: tuples{
-				{nil, 1.1, 4},
-				{0, nil, nil},
-				{0, 3.1, 5},
-				{1, nil, nil},
-				{1, nil, nil},
+				{nil, 1.1, 4, true},
+				{0, nil, nil, nil},
+				{0, 3.1, 5, nil},
+				{1, nil, nil, nil},
+				{1, nil, nil, false},
 			},
 			expected: tuples{
-				{nil, 1.1, 1, 1, 1.1, 4, 4, 4, 1.1},
-				{0, 3.1, 2, 1, 3.1, 5, 5, 5, 3.1},
-				{1, nil, 2, 0, nil, nil, nil, nil, nil},
+				{nil, 1.1, 1, 1, 1.1, 4, 4, 4, 1.1, true, true},
+				{0, 3.1, 2, 1, 3.1, 5, 5, 5, 3.1, nil, nil},
+				{1, nil, 2, 0, nil, nil, nil, nil, nil, false, false},
 			},
 			convToDecimal: true,
 		},
@@ -476,6 +522,11 @@ func TestAggregatorRandom(t *testing.T) {
 	rng, _ := randutil.NewPseudoRand()
 	ctx := context.Background()
 	for _, groupSize := range []int{1, 2, int(coldata.BatchSize()) / 4, int(coldata.BatchSize()) / 2} {
+		if groupSize == 0 {
+			// We might be varying coldata.BatchSize() so that when it is divided by
+			// 4, groupSize is 0. We want to skip such configuration.
+			continue
+		}
 		for _, numInputBatches := range []int{1, 2, 64} {
 			for _, hasNulls := range []bool{true, false} {
 				for _, agg := range aggTypes {
@@ -495,7 +546,7 @@ func TestAggregatorRandom(t *testing.T) {
 							curGroup := -1
 							for i := range groups {
 								if i%groupSize == 0 {
-									expRowCounts = append(expRowCounts, int64(groupSize))
+									expRowCounts = append(expRowCounts, 0)
 									expCounts = append(expCounts, 0)
 									expSums = append(expSums, 0)
 									expMins = append(expMins, 2048)
@@ -508,8 +559,11 @@ func TestAggregatorRandom(t *testing.T) {
 								// slower.
 								aggCol[i] = 2048 * (rng.Float64() - 0.5)
 
+								// NULL values contribute to the row count, so we're updating
+								// the row counts outside of the if block.
+								expRowCounts[curGroup]++
 								if hasNulls && rng.Float64() < nullProbability {
-									aggColNulls.SetNull(uint16(i))
+									aggColNulls.SetNull64(uint64(i))
 								} else {
 									expNulls[curGroup] = false
 									expCounts[curGroup]++
@@ -569,16 +623,16 @@ func TestAggregatorRandom(t *testing.T) {
 
 									expNull := expNulls[tupleIdx]
 									if expNull {
-										if !sumCol.Nulls().NullAt(uint16(j)) {
+										if !sumCol.Nulls().NullAt(j) {
 											t.Fatalf("Found non-null sum %f, expected null, idx %d of batch %d", sum, j, i)
 										}
-										if !minCol.Nulls().NullAt(uint16(j)) {
+										if !minCol.Nulls().NullAt(j) {
 											t.Fatalf("Found non-null min %f, expected null, idx %d of batch %d", sum, j, i)
 										}
-										if !maxCol.Nulls().NullAt(uint16(j)) {
+										if !maxCol.Nulls().NullAt(j) {
 											t.Fatalf("Found non-null max %f, expected null, idx %d of batch %d", sum, j, i)
 										}
-										if !avgCol.Nulls().NullAt(uint16(j)) {
+										if !avgCol.Nulls().NullAt(j) {
 											t.Fatalf("Found non-null avg %f, expected null, idx %d of batch %d", sum, j, i)
 										}
 									} else {
@@ -631,6 +685,8 @@ func BenchmarkAggregator(b *testing.B) {
 		execinfrapb.AggregatorSpec_SUM,
 		execinfrapb.AggregatorSpec_MIN,
 		execinfrapb.AggregatorSpec_MAX,
+		execinfrapb.AggregatorSpec_BOOL_AND,
+		execinfrapb.AggregatorSpec_BOOL_OR,
 	} {
 		fName := execinfrapb.AggregatorSpec_Func_name[int32(aggFn)]
 		b.Run(fName, func(b *testing.B) {
@@ -639,6 +695,9 @@ func BenchmarkAggregator(b *testing.B) {
 					for _, groupSize := range []int{1, 2, int(coldata.BatchSize()) / 2, int(coldata.BatchSize())} {
 						for _, hasNulls := range []bool{false, true} {
 							for _, numInputBatches := range []int{64} {
+								if aggFn == execinfrapb.AggregatorSpec_BOOL_AND || aggFn == execinfrapb.AggregatorSpec_BOOL_OR {
+									typ = coltypes.Bool
+								}
 								b.Run(fmt.Sprintf("%s/%s/groupSize=%d/hasNulls=%t/numInputBatches=%d", agg.name, typ.String(),
 									groupSize, hasNulls, numInputBatches),
 									func(b *testing.B) {
@@ -675,6 +734,11 @@ func BenchmarkAggregator(b *testing.B) {
 											for i := range vals {
 												vals[i].SetInt64(rng.Int63() % 1024)
 											}
+										case coltypes.Bool:
+											vals := cols[1].Bool()
+											for i := range vals {
+												vals[i] = rng.Float64() < 0.5
+											}
 										}
 										source := newChunkingBatchSource(colTypes, cols, uint64(nTuples))
 
@@ -704,12 +768,7 @@ func BenchmarkAggregator(b *testing.B) {
 											a.(resetter).reset()
 											source.reset()
 											// Exhaust aggregator until all batches have been read.
-											foundTuples := 0
 											for b := a.Next(ctx); b.Length() != 0; b = a.Next(ctx) {
-												foundTuples += int(b.Length())
-											}
-											if foundTuples != nTuples/groupSize {
-												b.Fatalf("Found %d tuples, expected %d", foundTuples, nTuples/groupSize)
 											}
 										}
 									},
@@ -769,9 +828,9 @@ func TestHashAggregator(t *testing.T) {
 			input: tuples{
 				{0, 3},
 				{0, 4},
-				{hashTableBucketSize, 6},
+				{hashTableNumBuckets, 6},
 				{0, 5},
-				{hashTableBucketSize, 7},
+				{hashTableNumBuckets, 7},
 			},
 			colTypes:  []coltypes.T{coltypes.Int64, coltypes.Int64},
 			groupCols: []uint32{0},

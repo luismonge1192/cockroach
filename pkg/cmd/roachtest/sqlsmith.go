@@ -100,8 +100,16 @@ func registerSQLSmith(r *testRegistry) {
 		c.l.Printf("setup:\n%s", setup)
 		if _, err := conn.Exec(setup); err != nil {
 			t.Fatal(err)
+		} else {
+			logStmt(setup)
 		}
-		logStmt(setup)
+
+		stmt := "SET experimental_enable_primary_key_changes = true;"
+		if _, err := conn.Exec(stmt); err != nil {
+			t.Fatal(err)
+		} else {
+			logStmt(stmt)
+		}
 
 		const timeout = time.Minute
 		setStmtTimeout := fmt.Sprintf("SET statement_timeout='%s';", timeout.String())
@@ -142,13 +150,13 @@ func registerSQLSmith(r *testRegistry) {
 					// TODO(yuzefovich): once #41335 is implemented, go back to using a
 					// context with timeout.
 					_, err := conn.Exec(stmt)
-					if err != nil {
+					if err == nil {
 						logStmt(stmt)
 					}
 					done <- err
 				}(ctx)
 				select {
-				case <-time.After(timeout + 5*time.Second):
+				case <-time.After(timeout * 2):
 					t.Fatalf("query timed out, but did not cancel execution:\n%s;", stmt)
 				case err := <-done:
 					return err
@@ -182,9 +190,12 @@ func registerSQLSmith(r *testRegistry) {
 
 	register := func(setup, setting string) {
 		r.Add(testSpec{
-			Name:    fmt.Sprintf("sqlsmith/setup=%s/setting=%s", setup, setting),
-			Cluster: makeClusterSpec(4),
-			Timeout: time.Minute * 20,
+			Name: fmt.Sprintf("sqlsmith/setup=%s/setting=%s", setup, setting),
+			// NB: sqlsmith failures should never block a release.
+			Owner:      OwnerSQLExec,
+			Cluster:    makeClusterSpec(4),
+			MinVersion: "v20.1.0",
+			Timeout:    time.Minute * 20,
 			Run: func(ctx context.Context, t *test, c *cluster) {
 				runSQLSmith(ctx, t, c, setup, setting)
 			},
@@ -197,6 +208,8 @@ func registerSQLSmith(r *testRegistry) {
 		}
 	}
 	setups["seed-vec"] = sqlsmith.Setups["seed-vec"]
+	settings["ddl-nodrop"] = sqlsmith.Settings["ddl-nodrop"]
 	settings["vec"] = sqlsmith.SettingVectorize
 	register("seed-vec", "vec")
+	register("tpcc", "ddl-nodrop")
 }

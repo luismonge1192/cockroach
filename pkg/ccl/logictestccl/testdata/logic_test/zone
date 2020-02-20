@@ -9,7 +9,8 @@ CREATE TABLE t (
     k INT PRIMARY KEY,
     v STRING,
     INDEX secondary (k) STORING (v),
-    INDEX tertiary (k) STORING (v)
+    INDEX tertiary (k) STORING (v),
+    FAMILY (k, v)
 );
 
 # ------------------------------------------------------------------------------
@@ -38,6 +39,7 @@ EXPLAIN (OPT, CATALOG) SELECT * FROM t
 TABLE t
  ├── k int not null
  ├── v string
+ ├── FAMILY fam_0_k_v (k, v)
  ├── INDEX primary
  │    ├── k int not null
  │    └── ZONE
@@ -80,6 +82,7 @@ EXPLAIN (OPT, CATALOG) SELECT * FROM t
 TABLE t
  ├── k int not null
  ├── v string
+ ├── FAMILY fam_0_k_v (k, v)
  ├── INDEX primary
  │    ├── k int not null
  │    └── ZONE
@@ -142,6 +145,7 @@ EXPLAIN (OPT, CATALOG) SELECT * FROM t
 TABLE t
  ├── k int not null
  ├── v string
+ ├── FAMILY fam_0_k_v (k, v)
  ├── INDEX primary
  │    ├── k int not null
  │    └── ZONE
@@ -243,6 +247,7 @@ EXPLAIN (OPT, CATALOG) SELECT * FROM t
 TABLE t
  ├── k int not null
  ├── v string
+ ├── FAMILY fam_0_k_v (k, v)
  ├── INDEX primary
  │    ├── k int not null
  │    └── ZONE
@@ -295,6 +300,7 @@ EXPLAIN (OPT, CATALOG) SELECT * FROM t
 TABLE t
  ├── k int not null
  ├── v string
+ ├── FAMILY fam_0_k_v (k, v)
  ├── INDEX primary
  │    ├── k int not null
  │    └── ZONE
@@ -358,7 +364,8 @@ CREATE TABLE t36642 (
     k INT PRIMARY KEY,
     v STRING,
     INDEX secondary (k) STORING (v),
-    INDEX tertiary (k) STORING (v)
+    INDEX tertiary (k) STORING (v),
+    FAMILY (k, v)
 );
 
 statement ok
@@ -394,6 +401,7 @@ EXPLAIN (OPT, CATALOG) SELECT * FROM t
 TABLE t
  ├── k int not null
  ├── v string
+ ├── FAMILY fam_0_k_v (k, v)
  ├── INDEX primary
  │    ├── k int not null
  │    └── ZONE
@@ -424,7 +432,8 @@ CREATE TABLE t36644 (
     k INT PRIMARY KEY,
     v STRING,
     INDEX secondary (k) STORING (v),
-    INDEX tertiary (k) STORING (v)
+    INDEX tertiary (k) STORING (v),
+    FAMILY (k, v)
 );
 
 statement ok
@@ -473,8 +482,8 @@ query TT
 SHOW ZONE CONFIGURATION FOR PARTITION x1 OF TABLE t35756
 ----
 RANGE default  ALTER RANGE default CONFIGURE ZONE USING
-               range_min_bytes = 16777216,
-               range_max_bytes = 67108864,
+               range_min_bytes = 134217728,
+               range_max_bytes = 536870912,
                gc.ttlseconds = 90000,
                num_replicas = 3,
                constraints = '[]',
@@ -503,8 +512,8 @@ query TT
 SHOW ZONE CONFIGURATION FOR PARTITION x1_idx OF INDEX t38391@foo
 ----
 PARTITION x1_idx OF INDEX t38391@foo  ALTER PARTITION x1_idx OF INDEX t38391@foo CONFIGURE ZONE USING
-                                      range_min_bytes = 16777216,
-                                      range_max_bytes = 67108864,
+                                      range_min_bytes = 134217728,
+                                      range_max_bytes = 536870912,
                                       gc.ttlseconds = 31337,
                                       num_replicas = 3,
                                       constraints = '[]',
@@ -715,19 +724,19 @@ user testuser
 statement error only users with the admin role are allowed to alter system ranges
 ALTER RANGE default CONFIGURE ZONE USING num_replicas = 3
 
-statement error pq: user testuser does not have CREATE privilege on database auth
+statement error pq: user testuser does not have ZONECONFIG or CREATE privilege on database auth
 ALTER DATABASE auth CONFIGURE ZONE USING num_replicas = 3
 
 statement error pq: only users with the admin role are allowed to alter system tables
 ALTER TABLE system.jobs CONFIGURE ZONE USING num_replicas = 3
 
-statement error user testuser does not have CREATE privilege on relation t
+statement error pq: user testuser does not have ZONECONFIG or CREATE privilege on relation t
 ALTER TABLE auth.t CONFIGURE ZONE USING num_replicas = 3
 
-statement error user testuser does not have CREATE privilege on relation t
+statement error pq: user testuser does not have ZONECONFIG or CREATE privilege on relation t
 ALTER PARTITION p OF TABLE auth.t CONFIGURE ZONE USING num_replicas = 3
 
-statement error user testuser does not have CREATE privilege on relation t
+statement error pq: user testuser does not have ZONECONFIG or CREATE privilege on relation t
 ALTER PARTITION p OF INDEX auth.t@x CONFIGURE ZONE USING num_replicas = 3
 
 # Granting CREATE on databases and tables should allow CONFIGURE ZONE on those
@@ -745,8 +754,70 @@ user testuser
 statement ok
 ALTER DATABASE auth CONFIGURE ZONE USING num_replicas = 3
 
+user root
+
 statement ok
+REVOKE CREATE ON DATABASE auth FROM testuser;
+REVOKE CREATE ON TABLE auth.t FROM testuser;
+
+user testuser
+
+statement error pq: user testuser does not have ZONECONFIG or CREATE privilege on database auth
+ALTER DATABASE auth CONFIGURE ZONE USING num_replicas = 3
+
+statement error pq: user testuser does not have ZONECONFIG or CREATE privilege on relation t
 ALTER TABLE auth.t CONFIGURE ZONE USING num_replicas = 3
+
+
+# Granting ZONECONFIG privilege should allow configuring zones on database and tables
+user root
+
+statement ok
+CREATE TABLE auth.t2 (x INT PRIMARY KEY) PARTITION BY LIST (x) (
+  PARTITION p VALUES IN (1)
+);
+GRANT ZONECONFIG ON TABLE auth.t2 to testuser
+
+user testuser
+
+statement ok
+ALTER TABLE auth.t2 CONFIGURE ZONE USING num_replicas = 3
+
+user root
+
+statement ok
+REVOKE ZONECONFIG ON TABLE auth.t2 FROM testuser;
+GRANT ZONECONFIG ON DATABASE auth TO testuser
+
+user testuser
+
+statement ok
+ALTER DATABASE auth CONFIGURE ZONE USING num_replicas = 3
+
+# Existing tables should not inherit ZONECONFIG privilege
+statement error pq: user testuser does not have ZONECONFIG or CREATE privilege on relation t
+ALTER TABLE auth.t CONFIGURE ZONE USING num_replicas = 3
+
+# New tables should inherit ZONECONFIG privilege
+user root
+
+statement ok
+CREATE TABLE auth.t3 (x INT PRIMARY KEY) PARTITION BY LIST (x) (
+  PARTITION p VALUES IN (1)
+);
+CREATE INDEX x ON auth.t3 (x) PARTITION BY LIST (x) (
+  PARTITION p VALUES IN (1)
+);
+
+user testuser
+
+statement ok
+ALTER TABLE auth.t3 CONFIGURE ZONE USING num_replicas = 3
+
+# Index and rows (partitions) should inherit table permissions
+statement ok
+ALTER INDEX auth.t3@x CONFIGURE ZONE USING num_replicas=5;
+ALTER PARTITION p OF INDEX auth.t3@x CONFIGURE ZONE USING num_replicas = 3
 
 # Granting the admin role should allow configuring zones on system tables and
 # ranges.
@@ -792,20 +863,20 @@ query TTT
 SELECT table_name, index_name, full_config_sql FROM crdb_internal.zones WHERE
 table_name='t38074'
 ----
-t38074 NULL ALTER TABLE test.public.t38074 CONFIGURE ZONE USING
-                               range_min_bytes = 16777216,
-                               range_max_bytes = 67108864,
-                               gc.ttlseconds = 70000,
-                               num_replicas = 3,
-                               constraints = '[]',
-                               lease_preferences = '[]'
-t38074 i ALTER INDEX test.public.t38074@i CONFIGURE ZONE USING
-                               range_min_bytes = 16777216,
-                               range_max_bytes = 67108864,
-                               gc.ttlseconds = 80000,
-                               num_replicas = 3,
-                               constraints = '[]',
-                               lease_preferences = '[]'
+t38074  NULL  ALTER TABLE test.public.t38074 CONFIGURE ZONE USING
+        range_min_bytes = 134217728,
+        range_max_bytes = 536870912,
+        gc.ttlseconds = 70000,
+        num_replicas = 3,
+        constraints = '[]',
+        lease_preferences = '[]'
+t38074  i                         ALTER INDEX test.public.t38074@i CONFIGURE ZONE USING
+        range_min_bytes = 134217728,
+        range_max_bytes = 536870912,
+        gc.ttlseconds = 80000,
+        num_replicas = 3,
+        constraints = '[]',
+        lease_preferences = '[]'
 
 # Regression test for #39994: verify that certain fields have to be set in tandem in indexes and partitions.
 statement ok
@@ -957,4 +1028,3 @@ WHERE table_name = 'parent_modify' AND index_name IS NULL
 ----
 parent_modify  NULL  ALTER TABLE test.public.parent_modify CONFIGURE ZONE USING
                      gc.ttlseconds = 700
-

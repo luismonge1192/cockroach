@@ -93,21 +93,19 @@ message ForeignKeyConstraint {
   // fields on the index that they use. In versions 19.2 and later, we preserve
   // the semantics of the older FKs which were tied to indexes by specifying
   // the index as a field on this proto, since the migration process to have
-  // top-level FK fields on the table descriptor requires two releases. In 20.1,
-  // when all 19.2 nodes will be correctly handling the new FK representation,
-  // we will perform a migration to upgrade all table descriptors.
-  optional uint32 legacy_origin_index = 10 [(gogoproto.nullable) = false, (gogoproto.casttype) = "IndexID"];
+  // top-level FK fields on the table descriptor requires two releases.
+  // In 20.1, these fields are no longer read, but must continue to be written
+  // to maintain compatibility in mixed 19.2/20.1 clusters. In 20.2 these fields
+  // can _finally_ be removed.
+  // * When using the foreign key constraint, do not read from these fields! *
+  optional uint32 legacy_origin_index = 10
+    [(gogoproto.nullable) = false, (gogoproto.casttype) = "IndexID", deprecated = true];
   // LegacyReferencedIndex is the ID of the index used for the FK on the
   // referenced side. See the comment for LegacyOriginIndex.
-  optional uint32 legacy_referenced_index = 11 [(gogoproto.nullable) = false, (gogoproto.casttype) = "IndexID"];
-  // These fields are set when upgrading an old-style FK (stored on the index)
-  // into this kind. The purpose is to permit validation that downgrading this
-  // representation to the old representation (which happens when the cluster
-  // is in a mixed-version state containing VersionTopLevelForeignKeys) was done
-  // without creating any accidental changes to the foreign key references.
-  // They are only read and written in a mixed 19.1/19.2 cluster.
-  optional ForeignKeyReference legacy_upgraded_from_origin_reference = 12 [(gogoproto.nullable) = false, deprecated = true];
-  optional ForeignKeyReference legacy_upgraded_from_referenced_reference = 13 [(gogoproto.nullable) = false, deprecated = true];
+  optional uint32 legacy_referenced_index = 11
+    [(gogoproto.nullable) = false, (gogoproto.casttype) = "IndexID", deprecated = true];
+  // These fields were used for the 19.1 -> 19.2 foreign key migration.
+  reserved 12, 13;
 }
 
 message ColumnDescriptor {
@@ -201,6 +199,37 @@ message InterleaveDescriptor {
   // an encoded key. This means they are always in the far-to-near ancestor
   // order (e.g. grand-grand-parent, grand-parent, parent).
   repeated Ancestor ancestors = 1 [(gogoproto.nullable) = false];
+}
+
+// ShardedDescriptor represents an index (either primary or secondary) that is hash
+// sharded into a user-specified number of buckets.
+//
+// As as example, sample field values for the following table:
+//
+// CREATE TABLE abc (
+//   a INT PRIMARY KEY USING HASH WITH BUCKET_COUNT=10,  // column id: 1 
+//   b BYTES
+// );
+//
+// Sharded descriptor:
+//   name:          "a_shard"
+//   shard_buckets: 10
+//   column_names:  ["a"]
+message ShardedDescriptor {
+  option (gogoproto.equal) = true;
+  
+  // IsSharded indicates whether the index in question is a sharded one.
+  optional bool is_sharded = 1 [(gogoproto.nullable) = false]; 
+  // Name is the name of the shard column.
+  optional string name = 2 [(gogoproto.nullable) = false];
+
+  // ShardBuckets indicates the number of shards this index is divided into.
+  optional int32 shard_buckets = 3 [(gogoproto.nullable) = false,
+    (gogoproto.customname) = "ShardBuckets"];
+
+  // ColumnNames lists the names of the columns used to compute the shard column's
+  // values.
+  repeated string column_names = 4;
 }
 
 // PartitioningDescriptor represents the partitioning of an index into spans
@@ -315,6 +344,8 @@ message IndexDescriptor {
       (gogoproto.customname) = "ID", (gogoproto.casttype) = "IndexID"];
   optional bool unique = 3 [(gogoproto.nullable) = false];
 
+  optional uint32 version = 18 [(gogoproto.nullable) = false, (gogoproto.casttype) = "IndexDescriptorVersion"];
+
   // An ordered list of column names of which the index is comprised; these
   // columns do not include any additional stored columns (which are in
   // stored_column_names). This list parallels the column_ids list.
@@ -389,6 +420,15 @@ message IndexDescriptor {
   // CreatedExplicitly specifies whether this index was created explicitly
   // (i.e. via 'CREATE INDEX' statement).
   optional bool created_explicitly = 17 [(gogoproto.nullable) = false];
+
+  // EncodingType represents what sort of k/v encoding is used to store this descriptor on disk.
+  // As of now, this includes the existing secondary index encoding, or the primary index encoding.
+  // N.B. This field is only recognized on secondary indexes.
+  optional uint32 encoding_type = 19
+    [(gogoproto.nullable) = false, (gogoproto.casttype) = "IndexDescriptorEncodingType"];
+
+  // Sharded, if it's not the zero value, describes how this index is sharded.
+  optional ShardedDescriptor sharded = 20 [(gogoproto.nullable) = false]; 
 }
 
 // ConstraintToUpdate represents a constraint to be added to the table and
@@ -424,6 +464,21 @@ message ConstraintToUpdate {
   optional uint32 not_null_column = 6 [(gogoproto.nullable) = false, (gogoproto.casttype) = "ColumnID"];
 }
 
+// PrimaryKeySwap is a mutation corresponding to the atomic swap phase
+// during a primary key change where old versions of indexes are exchanged for
+// updated versions, and the table's new primary key is written into the descriptor.
+message PrimaryKeySwap {
+  option (gogoproto.equal) = true;
+  // old_primary_index_id is the ID of the old primary index for the table.
+  optional uint32 old_primary_index_id = 4 [(gogoproto.nullable) = false, (gogoproto.casttype) = "IndexID"];
+  // new_primary_index_id is the ID of the new primary index for the table.
+  optional uint32 new_primary_index_id = 1 [(gogoproto.nullable) = false, (gogoproto.casttype) = "IndexID"];
+  // old_indexes and new_indexes are lists of IndexID's where the i'th index in old_indexes will be
+  // swapped out with the i'th index in new_indexes.
+  repeated uint32 old_indexes = 2 [(gogoproto.casttype) = "IndexID"];
+  repeated uint32 new_indexes = 3 [(gogoproto.casttype) = "IndexID"];
+}
+
 // A DescriptorMutation represents a column or an index that
 // has either been added or dropped and hasn't yet transitioned
 // into a stable state: completely backfilled and visible, or
@@ -438,6 +493,7 @@ message DescriptorMutation {
     ColumnDescriptor column = 1;
     IndexDescriptor index = 2;
     ConstraintToUpdate constraint = 8;
+    PrimaryKeySwap primaryKeySwap = 9;
   }
   // A descriptor within a mutation is unavailable for reads, writes
   // and deletes. It is only available for implicit (internal to
@@ -511,6 +567,13 @@ message TableDescriptor {
   // ID of the parent database.
   optional uint32 parent_id = 4 [(gogoproto.nullable) = false,
       (gogoproto.customname) = "ParentID", (gogoproto.casttype) = "ID"];
+  // ID of the parent schema. For backwards compatibility, 0 means the table is
+  // scoped under the public physical schema (id 29). Because of this backward
+  // compatibility issue, this field should not be accessed directly or through
+  // the generated getter. Instead, use GetParentSchemaID() which is defined in
+  // structured.go.
+  optional uint32 unexposed_parent_schema_id = 40 [(gogoproto.nullable) = false,
+        (gogoproto.customname) = "UnexposedParentSchemaID", (gogoproto.casttype) = "ID"];
   // Monotonically increasing version of the table descriptor.
   //
   // The design maintains two invariants:
@@ -613,6 +676,9 @@ message TableDescriptor {
     repeated uint32 column_ids = 5 [(gogoproto.customname) = "ColumnIDs",
       (gogoproto.casttype) = "ColumnID"];
     optional bool is_non_null_constraint = 6 [(gogoproto.nullable) = false];
+    // Whether the check constraint should show up in the result of a `SHOW CREATE
+    // TABLE..` statement.
+    optional bool hidden = 7 [(gogoproto.nullable) = false];
   }
 
   repeated CheckConstraint checks = 20;
@@ -690,6 +756,10 @@ message TableDescriptor {
     // renamed from one db to another).
     optional uint32 parent_id = 1 [(gogoproto.nullable) = false,
       (gogoproto.customname) = "ParentID", (gogoproto.casttype) = "ID"];
+    // The schemaID of the schema the table belongs to before the rename/drop.
+    // Required to correctly identify which namespace entry to reclaim.
+    optional uint32 parent_schema_id = 3 [(gogoproto.nullable) = false,
+          (gogoproto.customname) = "ParentSchemaID", (gogoproto.casttype) = "ID"];
     optional string name = 2 [(gogoproto.nullable) = false];
   }
 
@@ -867,7 +937,7 @@ message TableDescriptor {
   // the referenced table.
   repeated ForeignKeyConstraint inbound_fks = 37 [(gogoproto.nullable) = false, (gogoproto.customname) = "InboundFKs"];
 
-  // Temporary table support will be added to CRDB starting from 20.1 . The temporary
+  // Temporary table support will be added to CRDB starting from 20.1. The temporary
   // flag is set to true for all temporary tables. All table descriptors created
   // before 20.1 refer to persistent tables, so lack of the flag being set implies
   // the table is persistent.

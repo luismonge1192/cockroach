@@ -427,7 +427,7 @@ func TestIndexSkipTableReader(t *testing.T) {
 			flowCtx := execinfra.FlowCtx{
 				EvalCtx: &evalCtx,
 				Cfg:     &execinfra.ServerConfig{Settings: s.ClusterSettings()},
-				Txn:     client.NewTxn(ctx, s.DB(), s.NodeID(), client.RootTxn),
+				Txn:     client.NewTxn(ctx, s.DB(), s.NodeID()),
 				NodeID:  s.NodeID(),
 			}
 
@@ -444,7 +444,7 @@ func TestIndexSkipTableReader(t *testing.T) {
 			var res sqlbase.EncDatumRows
 			for {
 				row, meta := results.Next()
-				if meta != nil && meta.TxnCoordMeta == nil {
+				if meta != nil && meta.LeafTxnFinalState == nil {
 					t.Fatalf("unexpected metadata: %+v", meta)
 				}
 				if row == nil {
@@ -498,7 +498,7 @@ ALTER TABLE t EXPERIMENTAL_RELOCATE VALUES (ARRAY[2], 1), (ARRAY[1], 2), (ARRAY[
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
 		Cfg:     &execinfra.ServerConfig{Settings: st},
-		Txn:     client.NewTxn(ctx, tc.Server(0).DB(), nodeID, client.RootTxn),
+		Txn:     client.NewTxn(ctx, tc.Server(0).DB(), nodeID),
 		NodeID:  nodeID,
 	}
 	spec := execinfrapb.IndexSkipTableReaderSpec{
@@ -536,7 +536,7 @@ ALTER TABLE t EXPERIMENTAL_RELOCATE VALUES (ARRAY[2], 1), (ARRAY[1], 2), (ARRAY[
 		for _, m := range metas {
 			if len(m.Ranges) > 0 {
 				misplannedRanges = m.Ranges
-			} else if m.TxnCoordMeta == nil {
+			} else if m.LeafTxnFinalState == nil {
 				t.Fatalf("expected only txn coord meta or misplanned ranges, got: %+v", metas)
 			}
 		}
@@ -606,13 +606,14 @@ func BenchmarkIndexScanTableReader(b *testing.B) {
 				count := 0
 				for {
 					row, meta := reader.Next()
-					if meta != nil && meta.TxnCoordMeta == nil && meta.Metrics == nil {
+					if meta != nil && meta.LeafTxnFinalState == nil && meta.Metrics == nil {
 						b.Fatalf("unexpected metadata: %+v", meta)
 					}
-					if row == nil {
+					if row != nil {
+						count++
+					} else if meta == nil {
 						break
 					}
-					count++
 				}
 				if count != expectedCount {
 					b.Fatalf("found %d rows, expected %d", count, expectedCount)
@@ -622,7 +623,7 @@ func BenchmarkIndexScanTableReader(b *testing.B) {
 			flowCtxTableReader := execinfra.FlowCtx{
 				EvalCtx: &evalCtx,
 				Cfg:     &execinfra.ServerConfig{Settings: s.ClusterSettings()},
-				Txn:     client.NewTxn(ctx, s.DB(), s.NodeID(), client.RootTxn),
+				Txn:     client.NewTxn(ctx, s.DB(), s.NodeID()),
 				NodeID:  s.NodeID(),
 			}
 
@@ -648,7 +649,7 @@ func BenchmarkIndexScanTableReader(b *testing.B) {
 					if err != nil {
 						b.Fatal(err)
 					}
-					dist, err := NewDistinct(&flowCtxTableReader, 0, &specDistinct, tr, &postDistinct, nil)
+					dist, err := newDistinct(&flowCtxTableReader, 0, &specDistinct, tr, &postDistinct, nil)
 					if err != nil {
 						b.Fatal(err)
 					}
@@ -659,7 +660,7 @@ func BenchmarkIndexScanTableReader(b *testing.B) {
 			flowCtxIndexSkipTableReader := execinfra.FlowCtx{
 				EvalCtx: &evalCtx,
 				Cfg:     &execinfra.ServerConfig{Settings: s.ClusterSettings()},
-				Txn:     client.NewTxn(ctx, s.DB(), s.NodeID(), client.RootTxn),
+				Txn:     client.NewTxn(ctx, s.DB(), s.NodeID()),
 				NodeID:  s.NodeID(),
 			}
 

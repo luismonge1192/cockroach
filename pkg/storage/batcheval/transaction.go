@@ -54,19 +54,34 @@ func VerifyTransaction(
 }
 
 // WriteAbortSpanOnResolve returns true if the abort span must be written when
-// the transaction with the given status is resolved.
-func WriteAbortSpanOnResolve(status roachpb.TransactionStatus) bool {
-	return status == roachpb.ABORTED
+// the transaction with the given status is resolved. It avoids instructing the
+// caller to write to the abort span if the caller didn't actually remove any
+// intents but intends to poison.
+func WriteAbortSpanOnResolve(status roachpb.TransactionStatus, poison, removedIntents bool) bool {
+	if status != roachpb.ABORTED {
+		// Only update the AbortSpan for aborted transactions.
+		return false
+	}
+	if !poison {
+		// We can remove any entries from the AbortSpan.
+		return true
+	}
+	// We only need to add AbortSpan entries for transactions that we have
+	// invalidated by removing intents. This avoids leaking AbortSpan entries if
+	// a request raced with txn record GC and mistakenly interpreted a committed
+	// txn as aborted only to return to the intent it wanted to push and find it
+	// already resolved. We're only required to write an entry if we do
+	// something that could confuse/invalidate a zombie transaction.
+	return removedIntents
 }
 
-// SetAbortSpan clears any AbortSpan entry if poison is false.
-// Otherwise, if poison is true, creates an entry for this transaction
-// in the AbortSpan to prevent future reads or writes from
-// spuriously succeeding on this range.
-func SetAbortSpan(
+// UpdateAbortSpan clears any AbortSpan entry if poison is false. Otherwise, if
+// poison is true, it creates an entry for this transaction in the AbortSpan to
+// prevent future reads or writes from spuriously succeeding on this range.
+func UpdateAbortSpan(
 	ctx context.Context,
 	rec EvalContext,
-	batch engine.ReadWriter,
+	readWriter engine.ReadWriter,
 	ms *enginepb.MVCCStats,
 	txn enginepb.TxnMeta,
 	poison bool,
@@ -75,7 +90,7 @@ func SetAbortSpan(
 	// no changes are needed. This can help us avoid unnecessary Raft
 	// proposals.
 	var curEntry roachpb.AbortSpanEntry
-	exists, err := rec.AbortSpan().Get(ctx, batch, txn.ID, &curEntry)
+	exists, err := rec.AbortSpan().Get(ctx, readWriter, txn.ID, &curEntry)
 	if err != nil {
 		return err
 	}
@@ -84,7 +99,7 @@ func SetAbortSpan(
 		if !exists {
 			return nil
 		}
-		return rec.AbortSpan().Del(ctx, batch, ms, txn.ID)
+		return rec.AbortSpan().Del(ctx, readWriter, ms, txn.ID)
 	}
 
 	entry := roachpb.AbortSpanEntry{
@@ -98,7 +113,7 @@ func SetAbortSpan(
 	// curEntry already escapes, so assign entry to curEntry and pass
 	// that to Put instead of allowing entry to escape as well.
 	curEntry = entry
-	return rec.AbortSpan().Put(ctx, batch, ms, txn.ID, &curEntry)
+	return rec.AbortSpan().Put(ctx, readWriter, ms, txn.ID, &curEntry)
 }
 
 // CanPushWithPriority returns true if the given pusher can push the pushee
@@ -114,21 +129,7 @@ func CanPushWithPriority(pusher, pushee *roachpb.Transaction) bool {
 func CanCreateTxnRecord(rec EvalContext, txn *roachpb.Transaction) error {
 	// Provide the transaction's minimum timestamp. The transaction could not
 	// have written a transaction record previously with a timestamp below this.
-	//
-	// We use InclusiveTimeBounds to remain backward compatible. However, if we
-	// don't need to worry about compatibility, we require the transaction to
-	// have a minimum timestamp field.
-	// TODO(nvanbenschoten): Replace this with txn.MinTimestamp in v20.1.
-	txnMinTS, _ := txn.InclusiveTimeBounds()
-	if util.RaceEnabled {
-		newTxnMinTS := txn.MinTimestamp
-		if newTxnMinTS.IsEmpty() {
-			return errors.Errorf("no minimum transaction timestamp provided: %v", txn)
-		} else if newTxnMinTS != txnMinTS {
-			return errors.Errorf("minimum transaction timestamp differs from lower time bound: %v", txn)
-		}
-	}
-	ok, minCommitTS, reason := rec.CanCreateTxnRecord(txn.ID, txn.Key, txnMinTS)
+	ok, minCommitTS, reason := rec.CanCreateTxnRecord(txn.ID, txn.Key, txn.MinTimestamp)
 	if !ok {
 		return roachpb.NewTransactionAbortedError(reason)
 	}
@@ -136,13 +137,24 @@ func CanCreateTxnRecord(rec EvalContext, txn *roachpb.Transaction) error {
 	return nil
 }
 
-// SynthesizeTxnFromMeta creates a synthetic transaction object from the
-// provided transaction metadata. The synthetic transaction is not meant to be
-// persisted, but can serve as a representation of the transaction for outside
-// observation. The function also checks whether it is possible for the
-// transaction to ever create a transaction record in the future. If not, the
-// returned transaction will be marked as ABORTED and it is safe to assume that
-// the transaction record will never be written in the future.
+// SynthesizeTxnFromMeta creates a synthetic transaction object from
+// the provided transaction metadata. The synthetic transaction is not
+// meant to be persisted, but can serve as a representation of the
+// transaction for outside observation. The function also checks
+// whether it is possible for the transaction to ever create a
+// transaction record in the future. If not, the returned transaction
+// will be marked as ABORTED and it is safe to assume that the
+// transaction record will never be written in the future.
+//
+// Note that the Transaction object returned by this function is
+// inadequate to perform further KV reads or to perform intent
+// resolution on its behalf, even if its state is PENDING. This is
+// because the original Transaction object may have been partially
+// rolled back and marked some of its intents as "ignored"
+// (txn.IgnoredSeqNums != nil), but this state is not stored in
+// TxnMeta. Proceeding to KV reads or intent resolution without this
+// information would cause a partial rollback, if any, to be reverted
+// and yield inconsistent data.
 func SynthesizeTxnFromMeta(rec EvalContext, txn enginepb.TxnMeta) roachpb.Transaction {
 	// Construct the transaction object.
 	synthTxnRecord := roachpb.TransactionRecord{

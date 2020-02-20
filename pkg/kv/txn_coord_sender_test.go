@@ -77,16 +77,16 @@ func TestTxnCoordSenderBeginTransaction(t *testing.T) {
 	defer s.Stop()
 	ctx := context.Background()
 
-	txn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */, client.RootTxn)
+	txn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */)
 
 	// Put request will create a new transaction.
 	key := roachpb.Key("key")
-	txn.InternalSetPriority(10)
+	txn.TestingSetPriority(10)
 	txn.SetDebugName("test txn")
 	if err := txn.Put(ctx, key, []byte("value")); err != nil {
 		t.Fatal(err)
 	}
-	proto := txn.Serialize()
+	proto := txn.TestingCloneTxn()
 	if proto.Name != "test txn" {
 		t.Errorf("expected txn name to be %q; got %q", "test txn", proto.Name)
 	}
@@ -119,7 +119,7 @@ func TestTxnCoordSenderKeyRanges(t *testing.T) {
 	s := createTestDB(t)
 	defer s.Stop()
 
-	txn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */, client.RootTxn)
+	txn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */)
 	// Disable txn pipelining so that all write spans are immediately
 	// added to the transaction's write footprint.
 	if err := txn.DisablePipelining(); err != nil {
@@ -209,11 +209,11 @@ func TestTxnCoordSenderCondenseIntentSpans(t *testing.T) {
 	) (*roachpb.BatchResponse, error) {
 		resp := args.CreateReply()
 		resp.Txn = args.Txn
-		if req, ok := args.GetArg(roachpb.EndTransaction); ok {
-			if !req.(*roachpb.EndTransactionRequest).Commit {
+		if req, ok := args.GetArg(roachpb.EndTxn); ok {
+			if !req.(*roachpb.EndTxnRequest).Commit {
 				t.Errorf("expected commit to be true")
 			}
-			et := req.(*roachpb.EndTransactionRequest)
+			et := req.(*roachpb.EndTxnRequest)
 			if a, e := et.IntentSpans, expIntents; !reflect.DeepEqual(a, e) {
 				t.Errorf("expected end transaction to have intents %+v; got %+v", e, a)
 			}
@@ -246,7 +246,7 @@ func TestTxnCoordSenderCondenseIntentSpans(t *testing.T) {
 	db := client.NewDB(ambient, tsf, s.Clock)
 	ctx := context.Background()
 
-	txn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */, client.RootTxn)
+	txn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */)
 	// Disable txn pipelining so that all write spans are immediately
 	// added to the transaction's write footprint.
 	if err := txn.DisablePipelining(); err != nil {
@@ -328,7 +328,7 @@ func TestTxnCoordSenderHeartbeat(t *testing.T) {
 	for _, pusherKey := range []roachpb.Key{keyA, keyC} {
 		t.Run(fmt.Sprintf("pusher:%s", pusherKey), func(t *testing.T) {
 			// Make a db with a short heartbeat interval.
-			initialTxn := client.NewTxn(ctx, quickHeartbeatDB, 0 /* gatewayNodeID */, client.RootTxn)
+			initialTxn := client.NewTxn(ctx, quickHeartbeatDB, 0 /* gatewayNodeID */)
 			tc := initialTxn.Sender().(*TxnCoordSender)
 
 			if err := initialTxn.Put(ctx, keyA, []byte("value")); err != nil {
@@ -387,7 +387,7 @@ func TestTxnCoordSenderHeartbeat(t *testing.T) {
 
 // getTxn fetches the requested key and returns the transaction info.
 func getTxn(ctx context.Context, txn *client.Txn) (*roachpb.Transaction, *roachpb.Error) {
-	txnMeta := txn.Serialize().TxnMeta
+	txnMeta := txn.TestingCloneTxn().TxnMeta
 	qt := &roachpb.QueryTxnRequest{
 		RequestHeader: roachpb.RequestHeader{
 			Key: txnMeta.Key,
@@ -441,14 +441,14 @@ func TestTxnCoordSenderEndTxn(t *testing.T) {
 	// 4 cases: no deadline, past deadline, equal deadline, future deadline.
 	for i := 0; i < 4; i++ {
 		key := roachpb.Key("key: " + strconv.Itoa(i))
-		txn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */, client.RootTxn)
+		txn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */)
 		// Initialize the transaction.
 		if pErr := txn.Put(ctx, key, []byte("value")); pErr != nil {
 			t.Fatal(pErr)
 		}
 		// Conflicting transaction that pushes the above transaction.
-		conflictTxn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */, client.RootTxn)
-		conflictTxn.InternalSetPriority(enginepb.MaxTxnPriority)
+		conflictTxn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */)
+		conflictTxn.TestingSetPriority(enginepb.MaxTxnPriority)
 		if _, pErr := conflictTxn.Get(ctx, key); pErr != nil {
 			t.Fatal(pErr)
 		}
@@ -527,7 +527,7 @@ func TestTxnCoordSenderAddIntentOnError(t *testing.T) {
 
 	// Create a transaction with intent at "x".
 	key := roachpb.Key("x")
-	txn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */, client.RootTxn)
+	txn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */)
 	tc := txn.Sender().(*TxnCoordSender)
 
 	// Write so that the coordinator begins tracking this txn.
@@ -553,6 +553,7 @@ func TestTxnCoordSenderAddIntentOnError(t *testing.T) {
 }
 
 func assertTransactionRetryError(t *testing.T, e error) {
+	t.Helper()
 	if retErr, ok := e.(*roachpb.TransactionRetryWithProtoRefreshError); ok {
 		if !testutils.IsError(retErr, "TransactionRetryError") {
 			t.Fatalf("expected the cause to be TransactionRetryError, but got %s",
@@ -584,13 +585,13 @@ func TestTxnCoordSenderCleanupOnAborted(t *testing.T) {
 
 	// Create a transaction with intent at "a".
 	key := roachpb.Key("a")
-	txn1 := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */, client.RootTxn)
+	txn1 := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */)
 	if err := txn1.Put(ctx, key, []byte("value")); err != nil {
 		t.Fatal(err)
 	}
 
 	// Push the transaction (by writing key "a" with higher priority) to abort it.
-	txn2 := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */, client.RootTxn)
+	txn2 := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */)
 	if err := txn2.SetUserPriority(roachpb.MaxUserPriority); err != nil {
 		t.Fatal(err)
 	}
@@ -621,7 +622,7 @@ func TestTxnCoordSenderCleanupOnCommitAfterRestart(t *testing.T) {
 
 	// Create a transaction with intent at "a".
 	key := roachpb.Key("a")
-	txn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */, client.RootTxn)
+	txn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */)
 	if err := txn.Put(ctx, key, []byte("value")); err != nil {
 		t.Fatal(err)
 	}
@@ -660,7 +661,7 @@ func TestTxnCoordSenderGCWithAmbiguousResultErr(t *testing.T) {
 		defer s.Stop()
 
 		ctx := context.Background()
-		txn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */, client.RootTxn)
+		txn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */)
 		tc := txn.Sender().(*TxnCoordSender)
 		if !errOnFirst {
 			otherKey := roachpb.Key("other")
@@ -815,11 +816,12 @@ func TestTxnCoordSenderTxnUpdatedOnError(t *testing.T) {
 			)
 			db := client.NewDB(ambient, tsf, clock)
 			key := roachpb.Key("test-key")
+			now := clock.Now()
 			origTxnProto := roachpb.MakeTransaction(
 				"test txn",
 				key,
 				roachpb.UserPriority(0),
-				clock.Now(),
+				now,
 				clock.MaxOffset().Nanoseconds(),
 			)
 			// TODO(andrei): I've monkeyed with the priorities on this initial
@@ -831,8 +833,8 @@ func TestTxnCoordSenderTxnUpdatedOnError(t *testing.T) {
 			// for assigning exact priorities doesn't work properly when faced with
 			// updates.
 			origTxnProto.Priority = 1
-			txn := client.NewTxnWithProto(ctx, db, 0 /* gatewayNodeID */, client.RootTxn, origTxnProto)
-			txn.InternalSetPriority(1)
+			txn := client.NewTxnFromProto(ctx, db, 0 /* gatewayNodeID */, now, client.RootTxn, &origTxnProto)
+			txn.TestingSetPriority(1)
 
 			err := txn.Put(ctx, key, []byte("value"))
 			stopper.Stop(ctx)
@@ -840,7 +842,7 @@ func TestTxnCoordSenderTxnUpdatedOnError(t *testing.T) {
 			if test.name != "nil" && err == nil {
 				t.Fatalf("expected an error")
 			}
-			proto := txn.Serialize()
+			proto := txn.TestingCloneTxn()
 			txnReset := origTxnProto.ID != proto.ID
 			if txnReset != test.expNewTransaction {
 				t.Fatalf("expected txn reset: %t and got: %t", test.expNewTransaction, txnReset)
@@ -877,8 +879,7 @@ func TestTxnMultipleCoord(t *testing.T) {
 	defer s.Stop()
 
 	ctx := context.Background()
-	txn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */, client.RootTxn)
-	tc := txn.Sender().(*TxnCoordSender)
+	txn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */)
 
 	// Start the transaction.
 	key := roachpb.Key("a")
@@ -887,7 +888,8 @@ func TestTxnMultipleCoord(t *testing.T) {
 	}
 
 	// New create a second, leaf coordinator.
-	txn2 := client.NewTxnWithProto(ctx, s.DB, 0 /* gatewayNodeID */, client.LeafTxn, *txn.Serialize())
+	leafInputState := txn.GetLeafTxnInputState(ctx)
+	txn2 := client.NewLeafTxn(ctx, s.DB, 0 /* gatewayNodeID */, &leafInputState)
 
 	// Start the second transaction.
 	key2 := roachpb.Key("b")
@@ -896,17 +898,21 @@ func TestTxnMultipleCoord(t *testing.T) {
 	}
 
 	// Augment txn with txn2's meta & commit.
-	txn.AugmentTxnCoordMeta(ctx, txn2.GetTxnCoordMeta(ctx))
-	// Verify presence of both intents.
-	meta, err := tc.GetMeta(ctx, client.AnyTxnStatus)
+	tfs, err := txn2.GetLeafTxnFinalState(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a, e := meta.RefreshReads, []roachpb.Span{{Key: key}, {Key: key2}}; !reflect.DeepEqual(a, e) {
-		t.Fatalf("expected read spans %+v; got %+v", e, a)
+	if err := txn.UpdateRootWithLeafFinalState(ctx, &tfs); err != nil {
+		t.Fatal(err)
 	}
+
+	// Verify presence of both intents.
+	tcs := txn.Sender().(*TxnCoordSender)
+	refreshSpans := tcs.interceptorAlloc.txnSpanRefresher.refreshSpans
+	require.Equal(t, []roachpb.Span{{Key: key}, {Key: key2}}, refreshSpans)
+
 	ba := txn.NewBatch()
-	ba.AddRawRequest(&roachpb.EndTransactionRequest{Commit: true})
+	ba.AddRawRequest(&roachpb.EndTxnRequest{Commit: true})
 	if err := txn.Run(ctx, ba); err != nil {
 		t.Fatal(err)
 	}
@@ -927,8 +933,8 @@ func TestTxnCoordSenderNoDuplicateIntents(t *testing.T) {
 		*roachpb.BatchResponse, *roachpb.Error) {
 		br := ba.CreateReply()
 		br.Txn = ba.Txn.Clone()
-		if rArgs, ok := ba.GetArg(roachpb.EndTransaction); ok {
-			et := rArgs.(*roachpb.EndTransactionRequest)
+		if rArgs, ok := ba.GetArg(roachpb.EndTxn); ok {
+			et := rArgs.(*roachpb.EndTxnRequest)
 			if !reflect.DeepEqual(et.IntentSpans, expectedIntents) {
 				t.Errorf("Invalid intents: %+v; expected %+v", et.IntentSpans, expectedIntents)
 			}
@@ -950,7 +956,7 @@ func TestTxnCoordSenderNoDuplicateIntents(t *testing.T) {
 	defer stopper.Stop(ctx)
 
 	db := client.NewDB(ambient, factory, clock)
-	txn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */, client.RootTxn)
+	txn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */)
 
 	// Write to a, b, u-w before the final batch.
 
@@ -1157,7 +1163,7 @@ func TestTxnRestartCount(t *testing.T) {
 	// Start a transaction and read a key that we're going to modify outside the
 	// txn. This ensures that refreshing the txn will not succeed, so a restart
 	// will be necessary.
-	txn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */, client.RootTxn)
+	txn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */)
 	if _, err := txn.Get(ctx, readKey); err != nil {
 		t.Fatal(err)
 	}
@@ -1180,8 +1186,8 @@ func TestTxnRestartCount(t *testing.T) {
 	if err := txn.Put(ctx, writeKey, value); err != nil {
 		t.Fatal(err)
 	}
-	proto := txn.Serialize()
-	if !proto.ReadTimestamp.Less(proto.WriteTimestamp) {
+	proto := txn.TestingCloneTxn()
+	if proto.WriteTimestamp.LessEq(proto.ReadTimestamp) {
 		t.Errorf("expected timestamp to increase: %s", proto)
 	}
 
@@ -1292,8 +1298,8 @@ func TestAbortTransactionOnCommitErrors(t *testing.T) {
 					if ba.Txn != nil && br.Txn == nil {
 						br.Txn.Status = roachpb.PENDING
 					}
-				} else if et, hasET := ba.GetArg(roachpb.EndTransaction); hasET {
-					if et.(*roachpb.EndTransactionRequest).Commit {
+				} else if et, hasET := ba.GetArg(roachpb.EndTxn); hasET {
+					if et.(*roachpb.EndTxnRequest).Commit {
 						commit.Store(true)
 						if test.errFn != nil {
 							return nil, test.errFn(*ba.Txn)
@@ -1318,7 +1324,7 @@ func TestAbortTransactionOnCommitErrors(t *testing.T) {
 			)
 
 			db := client.NewDB(ambient, factory, clock)
-			txn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */, client.RootTxn)
+			txn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */)
 			if pErr := txn.Put(ctx, "a", "b"); pErr != nil {
 				t.Fatalf("put failed: %s", pErr)
 			}
@@ -1399,7 +1405,7 @@ func TestRollbackErrorStopsHeartbeat(t *testing.T) {
 	db := client.NewDB(ambient, factory, clock)
 
 	sender.match(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
-		if _, ok := ba.GetArg(roachpb.EndTransaction); !ok {
+		if _, ok := ba.GetArg(roachpb.EndTxn); !ok {
 			resp := ba.CreateReply()
 			resp.Txn = ba.Txn
 			return resp, nil
@@ -1407,9 +1413,9 @@ func TestRollbackErrorStopsHeartbeat(t *testing.T) {
 		return nil, roachpb.NewErrorf("injected err")
 	})
 
-	txn := client.NewTxn(ctx, db, roachpb.NodeID(1), client.RootTxn)
+	txn := client.NewTxn(ctx, db, roachpb.NodeID(1))
 	txnHeader := roachpb.Header{
-		Txn: txn.Serialize(),
+		Txn: txn.TestingCloneTxn(),
 	}
 	if _, pErr := client.SendWrappedWith(
 		ctx, txn, txnHeader, &roachpb.PutRequest{
@@ -1426,7 +1432,7 @@ func TestRollbackErrorStopsHeartbeat(t *testing.T) {
 
 	if _, pErr := client.SendWrappedWith(
 		ctx, txn, txnHeader,
-		&roachpb.EndTransactionRequest{Commit: false},
+		&roachpb.EndTxnRequest{Commit: false},
 	); !testutils.IsPError(pErr, "injected err") {
 		t.Fatal(pErr)
 	}
@@ -1440,12 +1446,11 @@ func TestRollbackErrorStopsHeartbeat(t *testing.T) {
 }
 
 // Test that intent tracking behaves correctly for transactions that attempt to
-// run a batch containing both a BeginTransaction and an EndTransaction. Since
-// in case of an error it's not easy to determine whether any intents have been
-// laid down (i.e. in case the batch was split by the DistSender and then there
-// was mixed success for the sub-batches, or in case a retriable error is
-// returned), the test verifies that all possible intents are properly tracked
-// and attached to a subsequent EndTransaction.
+// run a batch containing an EndTxn. Since in case of an error it's not easy to
+// determine whether any intents have been laid down (i.e. in case the batch was
+// split by the DistSender and then there was mixed success for the sub-batches,
+// or in case a retriable error is returned), the test verifies that all
+// possible intents are properly tracked and attached to a subsequent EndTxn.
 func TestOnePCErrorTracking(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
@@ -1469,20 +1474,20 @@ func TestOnePCErrorTracking(t *testing.T) {
 
 	// Register a matcher catching the commit attempt.
 	sender.match(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
-		if et, ok := ba.GetArg(roachpb.EndTransaction); !ok {
+		if et, ok := ba.GetArg(roachpb.EndTxn); !ok {
 			return nil, nil
-		} else if !et.(*roachpb.EndTransactionRequest).Commit {
+		} else if !et.(*roachpb.EndTxnRequest).Commit {
 			return nil, nil
 		}
 		return nil, roachpb.NewErrorf("injected err")
 	})
 	// Register a matcher catching the rollback attempt.
 	sender.match(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
-		et, ok := ba.GetArg(roachpb.EndTransaction)
+		et, ok := ba.GetArg(roachpb.EndTxn)
 		if !ok {
 			return nil, nil
 		}
-		etReq := et.(*roachpb.EndTransactionRequest)
+		etReq := et.(*roachpb.EndTxnRequest)
 		if etReq.Commit {
 			return nil, nil
 		}
@@ -1499,9 +1504,9 @@ func TestOnePCErrorTracking(t *testing.T) {
 		return resp, nil
 	})
 
-	txn := client.NewTxn(ctx, db, roachpb.NodeID(1), client.RootTxn)
+	txn := client.NewTxn(ctx, db, roachpb.NodeID(1))
 	txnHeader := roachpb.Header{
-		Txn: txn.Serialize(),
+		Txn: txn.TestingCloneTxn(),
 	}
 	b := txn.NewBatch()
 	b.Put(key, "test value")
@@ -1513,7 +1518,7 @@ func TestOnePCErrorTracking(t *testing.T) {
 	// to it.
 	if _, pErr := client.SendWrappedWith(
 		ctx, txn, txnHeader,
-		&roachpb.EndTransactionRequest{Commit: false},
+		&roachpb.EndTxnRequest{Commit: false},
 	); pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -1528,7 +1533,7 @@ func TestOnePCErrorTracking(t *testing.T) {
 }
 
 // TestCommitReadOnlyTransaction verifies that a read-only does not send an
-// EndTransactionRequest.
+// EndTxnRequest.
 func TestCommitReadOnlyTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
@@ -1601,8 +1606,8 @@ func TestCommitMutatingTransaction(t *testing.T) {
 		if !bytes.Equal(ba.Txn.Key, roachpb.Key("a")) {
 			t.Errorf("expected transaction key to be \"a\"; got %s", ba.Txn.Key)
 		}
-		if et, ok := ba.GetArg(roachpb.EndTransaction); ok {
-			if !et.(*roachpb.EndTransactionRequest).Commit {
+		if et, ok := ba.GetArg(roachpb.EndTxn); ok {
+			if !et.(*roachpb.EndTxnRequest).Commit {
 				t.Errorf("expected commit to be true")
 			}
 			br.Txn.Status = roachpb.COMMITTED
@@ -1669,7 +1674,7 @@ func TestCommitMutatingTransaction(t *testing.T) {
 			if test.pointWrite {
 				expectedCalls = append(expectedCalls, roachpb.QueryIntent)
 			}
-			expectedCalls = append(expectedCalls, roachpb.EndTransaction)
+			expectedCalls = append(expectedCalls, roachpb.EndTxn)
 			if !reflect.DeepEqual(expectedCalls, calls) {
 				t.Fatalf("%d: expected %s, got %s", i, expectedCalls, calls)
 			}
@@ -1678,7 +1683,7 @@ func TestCommitMutatingTransaction(t *testing.T) {
 }
 
 // TestAbortReadOnlyTransaction verifies that aborting a read-only
-// transaction does not prompt an EndTransaction call.
+// transaction does not prompt an EndTxn call.
 func TestAbortReadOnlyTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
@@ -1717,9 +1722,8 @@ func TestAbortReadOnlyTransaction(t *testing.T) {
 
 // TestEndWriteRestartReadOnlyTransaction verifies that if
 // a transaction writes, then restarts and turns read-only,
-// an explicit EndTransaction call is still sent if retry-
-// able didn't, regardless of whether there is an error
-// or not.
+// an explicit EndTxn call is still sent if retry- able
+// didn't, regardless of whether there is an error or not.
 func TestEndWriteRestartReadOnlyTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
@@ -1740,7 +1744,7 @@ func TestEndWriteRestartReadOnlyTransaction(t *testing.T) {
 				roachpb.NewTransactionRetryError(roachpb.RETRY_SERIALIZABLE, "test err"),
 				ba.Txn)
 		}
-		if _, ok := ba.GetArg(roachpb.EndTransaction); ok {
+		if _, ok := ba.GetArg(roachpb.EndTxn); ok {
 			br.Txn.Status = roachpb.COMMITTED
 		}
 		return br, nil
@@ -1761,7 +1765,7 @@ func TestEndWriteRestartReadOnlyTransaction(t *testing.T) {
 		sender,
 	)
 	db := client.NewDB(testutils.MakeAmbientCtx(), factory, clock)
-	expCalls := []roachpb.Method{roachpb.Put, roachpb.EndTransaction}
+	expCalls := []roachpb.Method{roachpb.Put, roachpb.EndTxn}
 
 	testutils.RunTrueAndFalse(t, "success", func(t *testing.T, success bool) {
 		calls = nil
@@ -1805,7 +1809,7 @@ func TestTransactionKeyNotChangedInRestart(t *testing.T) {
 		br.Txn = ba.Txn.Clone()
 
 		// Ignore the final EndTxnRequest.
-		if _, ok := ba.GetArg(roachpb.EndTransaction); ok {
+		if _, ok := ba.GetArg(roachpb.EndTxn); ok {
 			br.Txn.Status = roachpb.COMMITTED
 			return br, nil
 		}
@@ -1893,7 +1897,7 @@ func TestSequenceNumbers(t *testing.T) {
 		sender,
 	)
 	db := client.NewDB(testutils.MakeAmbientCtx(), factory, clock)
-	txn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */, client.RootTxn)
+	txn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */)
 
 	for i := 0; i < 5; i++ {
 		var ba roachpb.BatchRequest
@@ -1926,7 +1930,7 @@ func TestConcurrentTxnRequestsProhibited(t *testing.T) {
 		}
 		br := ba.CreateReply()
 		br.Txn = ba.Txn.Clone()
-		if _, ok := ba.GetArg(roachpb.EndTransaction); ok {
+		if _, ok := ba.GetArg(roachpb.EndTxn); ok {
 			br.Txn.Status = roachpb.COMMITTED
 		}
 		return br, nil
@@ -2025,8 +2029,8 @@ func TestTxnRequestTxnTimestamp(t *testing.T) {
 }
 
 // TestReadOnlyTxnObeysDeadline tests that read-only transactions obey the
-// deadline. Read-only transactions have their EndTransaction elided, so the
-// enforcement of the deadline is done in the client.
+// deadline. Read-only transactions have their EndTxn elided, so the enforcement
+// of the deadline is done in the client.
 func TestReadOnlyTxnObeysDeadline(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
@@ -2059,12 +2063,12 @@ func TestReadOnlyTxnObeysDeadline(t *testing.T) {
 	)
 	db := client.NewDB(testutils.MakeAmbientCtx(), factory, clock)
 
-	// We're going to run two tests: one where the EndTransaction is by itself in
-	// a batch, one where it is not. As of June 2018, the EndTransaction is elided
-	// in different ways in the two cases.
+	// We're going to run two tests: one where the EndTxn is by itself in a
+	// batch, one where it is not. As of June 2018, the EndTxn is elided in
+	// different ways in the two cases.
 
 	t.Run("standalone commit", func(t *testing.T) {
-		txn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */, client.RootTxn)
+		txn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */)
 		// Set a deadline. We'll generate a retriable error with a higher timestamp.
 		txn.UpdateDeadlineMaybe(ctx, clock.Now())
 		if _, err := txn.Get(ctx, "k"); err != nil {
@@ -2078,7 +2082,7 @@ func TestReadOnlyTxnObeysDeadline(t *testing.T) {
 	})
 
 	t.Run("commit in batch", func(t *testing.T) {
-		txn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */, client.RootTxn)
+		txn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */)
 		// Set a deadline. We'll generate a retriable error with a higher timestamp.
 		txn.UpdateDeadlineMaybe(ctx, clock.Now())
 		b := txn.NewBatch()
@@ -2108,9 +2112,9 @@ func TestTxnCoordSenderPipelining(t *testing.T) {
 		ctx context.Context, ba roachpb.BatchRequest,
 	) (*roachpb.BatchResponse, *roachpb.Error) {
 		calls = append(calls, ba.Methods()...)
-		if et, ok := ba.GetArg(roachpb.EndTransaction); ok {
+		if et, ok := ba.GetArg(roachpb.EndTxn); ok {
 			// Ensure that no transactions enter a STAGING state.
-			et.(*roachpb.EndTransactionRequest).InFlightWrites = nil
+			et.(*roachpb.EndTxnRequest).InFlightWrites = nil
 		}
 		return distSender.Send(ctx, ba)
 	}
@@ -2142,8 +2146,8 @@ func TestTxnCoordSenderPipelining(t *testing.T) {
 	}
 
 	require.Equal(t, []roachpb.Method{
-		roachpb.Put, roachpb.QueryIntent, roachpb.EndTransaction,
-		roachpb.Put, roachpb.EndTransaction,
+		roachpb.Put, roachpb.QueryIntent, roachpb.EndTxn,
+		roachpb.Put, roachpb.EndTxn,
 	}, calls)
 
 	for _, action := range []func(ctx context.Context, txn *client.Txn) error{
@@ -2185,7 +2189,7 @@ func TestAnchorKey(t *testing.T) {
 		}
 		br := ba.CreateReply()
 		br.Txn = ba.Txn.Clone()
-		if _, ok := ba.GetArg(roachpb.EndTransaction); ok {
+		if _, ok := ba.GetArg(roachpb.EndTxn); ok {
 			br.Txn.Status = roachpb.COMMITTED
 		}
 		return br, nil
@@ -2225,7 +2229,7 @@ func TestLeafTxnClientRejectError(t *testing.T) {
 	// where the first one gets a TransactionAbortedError.
 	errKey := roachpb.Key("a")
 	knobs := &storage.StoreTestingKnobs{
-		TestingRequestFilter: func(ba roachpb.BatchRequest) *roachpb.Error {
+		TestingRequestFilter: func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
 			if g, ok := ba.GetArg(roachpb.Get); ok && g.(*roachpb.GetRequest).Key.Equal(errKey) {
 				txn := ba.Txn.Clone()
 				txn.Status = roachpb.ABORTED
@@ -2241,11 +2245,11 @@ func TestLeafTxnClientRejectError(t *testing.T) {
 	defer s.Stop()
 
 	ctx := context.Background()
-	rootTxn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */, client.RootTxn)
+	rootTxn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */)
+	leafInputState := rootTxn.GetLeafTxnInputState(ctx)
 
 	// New create a second, leaf coordinator.
-	leafTxn := client.NewTxnWithCoordMeta(
-		ctx, s.DB, 0 /* gatewayNodeID */, client.LeafTxn, rootTxn.GetTxnCoordMeta(ctx))
+	leafTxn := client.NewLeafTxn(ctx, s.DB, 0 /* gatewayNodeID */, &leafInputState)
 
 	if _, err := leafTxn.Get(ctx, errKey); !testutils.IsError(err, "TransactionAbortedError") {
 		t.Fatalf("expected injected err, got: %v", err)
@@ -2264,20 +2268,29 @@ func TestLeafTxnClientRejectError(t *testing.T) {
 
 // Check that ingesting an Aborted txn record is a no-op. The TxnCoordSender is
 // supposed to reject such updates because they risk putting it into an
-// inconsistent state. See comments in TxnCoordSender.AugmentMeta().
-func TestAugmentTxnCoordMetaAbortedTxn(t *testing.T) {
+// inconsistent state. See comments in TxnCoordSender.UpdateRootWithLeafFinalState().
+func TestUpdateRoootWithLeafFinalStateInAbortedTxn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s := createTestDBWithContextAndKnobs(t, client.DefaultDBContext(), nil /* knobs */)
 	defer s.Stop()
 	ctx := context.Background()
 
-	txn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */, client.RootTxn)
-	txnProto := txn.Serialize()
-	txnProto.Status = roachpb.ABORTED
-	txn.AugmentTxnCoordMeta(ctx, roachpb.TxnCoordMeta{Txn: *txnProto})
+	txn := client.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */)
+	leafInputState := txn.GetLeafTxnInputState(ctx)
+	leafTxn := client.NewLeafTxn(ctx, s.DB, 0, &leafInputState)
+
+	finalState, err := leafTxn.GetLeafTxnFinalState(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalState.Txn.Status = roachpb.ABORTED
+	if err := txn.UpdateRootWithLeafFinalState(ctx, &finalState); err != nil {
+		t.Fatal(err)
+	}
+
 	// Check that the transaction was not updated.
-	txnProto = txn.Serialize()
-	if txnProto.Status != roachpb.PENDING {
-		t.Fatalf("expected PENDING txn, got: %s", txnProto.Status)
+	leafInputState2 := txn.GetLeafTxnInputState(ctx)
+	if leafInputState2.Txn.Status != roachpb.PENDING {
+		t.Fatalf("expected PENDING txn, got: %s", leafInputState2.Txn.Status)
 	}
 }

@@ -88,8 +88,10 @@ type mjProberState struct {
 	// Local buffer for the last left and right groups which is used when the
 	// group ends with a batch and the group on each side needs to be saved to
 	// state in order to be able to continue it in the next batch.
-	lBufferedGroup *mjBufferedGroup
-	rBufferedGroup *mjBufferedGroup
+	lBufferedGroup            *bufferedBatch
+	rBufferedGroup            *bufferedBatch
+	lBufferedGroupNeedToReset bool
+	rBufferedGroupNeedToReset bool
 }
 
 // mjState represents the state of the merge joiner.
@@ -176,8 +178,6 @@ func NewMergeJoinOp(
 	joinType sqlbase.JoinType,
 	left Operator,
 	right Operator,
-	leftOutCols []uint32,
-	rightOutCols []uint32,
 	leftTypes []coltypes.T,
 	rightTypes []coltypes.T,
 	leftOrdering []execinfrapb.Ordering_Column,
@@ -185,6 +185,19 @@ func NewMergeJoinOp(
 	filterConstructor func(Operator) (Operator, error),
 	filterOnlyOnLeft bool,
 ) (Operator, error) {
+	// TODO(yuzefovich): get rid off "outCols" entirely and plumb the assumption
+	// of outputting all columns into the merge joiner itself.
+	leftOutCols := make([]uint32, len(leftTypes))
+	for i := range leftOutCols {
+		leftOutCols[i] = uint32(i)
+	}
+	rightOutCols := make([]uint32, len(rightTypes))
+	for i := range rightOutCols {
+		rightOutCols[i] = uint32(i)
+	}
+	if joinType == sqlbase.JoinType_LEFT_SEMI || joinType == sqlbase.JoinType_LEFT_ANTI {
+		rightOutCols = rightOutCols[:0]
+	}
 	base, err := newMergeJoinBase(
 		allocator,
 		left,
@@ -317,6 +330,7 @@ func newMergeJoinBase(
 	if err != nil {
 		return base, err
 	}
+	base.scratch.tempVecByType = make(map[coltypes.T]coldata.Vec)
 	if filterConstructor != nil {
 		base.filter, err = newJoinerFilter(
 			base.allocator,
@@ -350,6 +364,12 @@ type mergeJoinBase struct {
 	state        mjState
 	proberState  mjProberState
 	builderState mjBuilderState
+	scratch      struct {
+		// tempVecByType is a map from the type to a temporary vector that can be
+		// used during a cast operation in the probing phase. These vectors should
+		// *not* be exposed outside of the merge joiner.
+		tempVecByType map[coltypes.T]coldata.Vec
+	}
 
 	filter *joinerFilter
 }
@@ -385,8 +405,8 @@ func (o *mergeJoinBase) initWithOutputBatchSize(outBatchSize uint16) {
 		o.outputBatchSize = 1<<16 - 1
 	}
 
-	o.proberState.lBufferedGroup = newMJBufferedGroup(o.allocator, o.left.sourceTypes)
-	o.proberState.rBufferedGroup = newMJBufferedGroup(o.allocator, o.right.sourceTypes)
+	o.proberState.lBufferedGroup = newBufferedBatch(o.allocator, o.left.sourceTypes, int(coldata.BatchSize()))
+	o.proberState.rBufferedGroup = newBufferedBatch(o.allocator, o.right.sourceTypes, int(coldata.BatchSize()))
 
 	o.builderState.lGroups = make([]group, 1)
 	o.builderState.rGroups = make([]group, 1)
@@ -417,23 +437,22 @@ func (o *mergeJoinBase) appendToBufferedGroup(
 	}
 	destStartIdx := bufferedGroup.length
 	groupEndIdx := groupStartIdx + groupLength
-	for cIdx, cType := range input.sourceTypes {
-		o.allocator.Append(
-			bufferedGroup.ColVec(cIdx),
-			coldata.SliceArgs{
-				ColType:     cType,
-				Src:         batch.ColVec(cIdx),
-				Sel:         sel,
-				DestIdx:     destStartIdx,
-				SrcStartIdx: uint64(groupStartIdx),
-				SrcEndIdx:   uint64(groupEndIdx),
-			},
-		)
-	}
+	o.allocator.PerformOperation(bufferedGroup.colVecs, func() {
+		for cIdx, cType := range input.sourceTypes {
+			bufferedGroup.colVecs[cIdx].Append(
+				coldata.SliceArgs{
+					ColType:     cType,
+					Src:         batch.ColVec(cIdx),
+					Sel:         sel,
+					DestIdx:     destStartIdx,
+					SrcStartIdx: uint64(groupStartIdx),
+					SrcEndIdx:   uint64(groupEndIdx),
+				},
+			)
+		}
+		bufferedGroup.length += uint64(groupLength)
+	})
 
-	// We've added groupLength number of tuples to bufferedGroup, so we need to
-	// adjust its length.
-	bufferedGroup.length += uint64(groupLength)
 	for _, v := range bufferedGroup.colVecs {
 		if v.Type() == coltypes.Bytes {
 			v.Bytes().UpdateOffsetsToBeNonDecreasing(bufferedGroup.length)
@@ -464,11 +483,13 @@ func (o *mergeJoinBase) initProberState(ctx context.Context) {
 		o.proberState.rIdx, o.proberState.rBatch = 0, o.right.source.Next(ctx)
 		o.proberState.rLength = int(o.proberState.rBatch.Length())
 	}
-	if o.proberState.lBufferedGroup.needToReset {
+	if o.proberState.lBufferedGroupNeedToReset {
 		o.proberState.lBufferedGroup.reset()
+		o.proberState.lBufferedGroupNeedToReset = false
 	}
-	if o.proberState.rBufferedGroup.needToReset {
+	if o.proberState.rBufferedGroupNeedToReset {
 		o.proberState.rBufferedGroup.reset()
+		o.proberState.rBufferedGroupNeedToReset = false
 	}
 }
 

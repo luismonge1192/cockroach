@@ -15,11 +15,13 @@ import (
 	"regexp"
 
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/errors"
 )
 
@@ -69,13 +71,23 @@ func (p *planner) CreateUserNode(
 }
 
 func (n *CreateUserNode) startExec(params runParams) error {
+	telemetry.Inc(sqltelemetry.SchemaChangeCreate("user"))
+
 	normalizedUsername, hashedPassword, err := n.userAuthInfo.resolve()
 	if err != nil {
 		return err
 	}
 
 	if len(hashedPassword) > 0 && params.extendedEvalCtx.ExecCfg.RPCContext.Insecure {
-		return errors.New("cluster in insecure mode; user cannot use password authentication")
+		// We disallow setting a non-empty password in insecure mode
+		// because insecure means an observer may have MITM'ed the change
+		// and learned the password.
+		//
+		// It's valid to clear the password (WITH PASSWORD NULL) however
+		// since that forces cert auth when moving back to secure mode,
+		// and certs can't be MITM'ed over the insecure SQL connection.
+		return pgerror.New(pgcode.InvalidPassword,
+			"setting or updating a password is not supported in insecure mode")
 	}
 
 	// Reject the "public" role. It does not have an entry in the users table but is reserved.
@@ -91,10 +103,11 @@ func (n *CreateUserNode) startExec(params runParams) error {
 	}
 
 	// Check if the user/role exists.
-	row, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.QueryRow(
+	row, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.QueryRowEx(
 		params.ctx,
 		opName,
 		params.p.txn,
+		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 		`select "isRole" from system.users where username = $1`,
 		normalizedUsername,
 	)
@@ -190,7 +203,7 @@ var errNoUserNameSpecified = errors.New("no username specified")
 
 type userAuthInfo struct {
 	name     func() (string, error)
-	password func() (string, error)
+	password func() (bool, string, error)
 }
 
 func (p *planner) getUserAuthInfo(nameE, passwordE tree.Expr, ctx string) (userAuthInfo, error) {
@@ -198,9 +211,9 @@ func (p *planner) getUserAuthInfo(nameE, passwordE tree.Expr, ctx string) (userA
 	if err != nil {
 		return userAuthInfo{}, err
 	}
-	var password func() (string, error)
+	var password func() (bool, string, error)
 	if passwordE != nil {
-		password, err = p.TypeAsString(passwordE, ctx)
+		password, err = p.typeAsStringOrNull(passwordE, ctx)
 		if err != nil {
 			return userAuthInfo{}, err
 		}
@@ -208,7 +221,11 @@ func (p *planner) getUserAuthInfo(nameE, passwordE tree.Expr, ctx string) (userA
 	return userAuthInfo{name: name, password: password}, nil
 }
 
-// resolve returns the actual user name and (hashed) password.
+// resolve returns the actual user name and (hashed) password.  The
+// returned hashed password slice is nil iff the user was specified to
+// have no password (e.g. CREATE USER without a PASSWORD clause, or
+// using PASSWORD NULL). If the password was specified but empty
+// (e.g. PASSWORD ''), an error is reported instead.
 func (ua *userAuthInfo) resolve() (string, []byte, error) {
 	name, err := ua.name()
 	if err != nil {
@@ -224,9 +241,12 @@ func (ua *userAuthInfo) resolve() (string, []byte, error) {
 
 	var hashedPassword []byte
 	if ua.password != nil {
-		resolvedPassword, err := ua.password()
+		isNull, resolvedPassword, err := ua.password()
 		if err != nil {
 			return "", nil, err
+		}
+		if isNull {
+			return normalizedUsername, hashedPassword, nil
 		}
 		if resolvedPassword == "" {
 			return "", nil, security.ErrEmptyPassword

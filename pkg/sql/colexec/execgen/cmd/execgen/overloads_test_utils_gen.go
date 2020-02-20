@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 )
 
 {{define "opName"}}perform{{.Name}}{{.LTyp}}{{.RTyp}}{{end}}
@@ -35,6 +36,12 @@ import (
 
 func {{template "opName" .}}(a {{.LTyp.GoTypeName}}, b {{.RTyp.GoTypeName}}) {{.RetTyp.GoTypeName}} {
 	var r {{.RetTyp.GoTypeName}}
+	// In order to inline the templated code of overloads, we need to have a
+	// "decimalScratch" local variable of type "decimalOverloadScratch".
+	var decimalScratch decimalOverloadScratch
+	// However, the scratch is not used in all of the functions, so we add this
+	// to go around "unused" error.
+	_ = decimalScratch
 	{{(.Assign "r" "a" "b")}}
 	return r
 }

@@ -558,10 +558,10 @@ SELECT "hashedPassword" FROM system.users LIMIT 1
 ----
 ·
 
-query ITI
+query IITI
 SELECT * FROM system.namespace LIMIT 1
 ----
-0  defaultdb  50
+0  0 defaultdb  50
 
 # Regression test for issue with fetching from unique indexes with embedded
 # nulls.
@@ -626,6 +626,17 @@ SELECT substring(x, 1, abs(y)) FROM builtin_test
 ----
 Hel
 Th
+
+# Regression test for #44625.
+statement error negative substring length -1 not allowed
+SELECT substring(x, 0, -1) FROM builtin_test
+
+# Regression test for #44881 (non-Int64 argument types).
+query T
+SELECT substring(x, -1::INT2, 3::INT4) FROM builtin_test
+----
+H
+T
 
 query I
 SELECT abs(y) FROM builtin_test
@@ -692,7 +703,10 @@ SET tracing=off
 # Making sure that colBatchScan operator can parallelize scans.
 # This test is similar to that in testplannerlogic/select
 statement ok
-CREATE TABLE tpar (a INT PRIMARY KEY, item STRING, price FLOAT, UNIQUE INDEX item (item), UNIQUE INDEX p (price))
+CREATE TABLE tpar (
+    a INT PRIMARY KEY, item STRING, price FLOAT, FAMILY (a, item, price),
+    UNIQUE INDEX item (item), UNIQUE INDEX p (price)
+)
 
 statement ok
 ALTER TABLE tpar SPLIT AT VALUES(5)
@@ -1006,3 +1020,113 @@ SELECT * FROM t_42816 ORDER BY a OFFSET 1020 LIMIT 10
 1023
 1024
 1025
+
+# Regression tests for #42994
+statement ok
+CREATE TABLE t42994 (a INT PRIMARY KEY, b BIT, INDEX i (a, b));
+INSERT INTO t42994 VALUES (1, 1::BIT);
+
+query I
+SELECT a FROM t42994@i
+----
+1
+
+statement ok
+CREATE TABLE t42994_2 (a BIT PRIMARY KEY, b INT, UNIQUE INDEX i (b));
+INSERT INTO t42994_2 VALUES (1::BIT, NULL);
+
+query I
+SELECT b FROM t42994_2@i
+----
+NULL
+
+# Regression test for zeroing out an aggregate value when NULLs are present.
+statement ok
+SELECT
+	max(s)
+FROM
+	(
+		SELECT
+			s, i
+		FROM
+			(VALUES ('1', 1), (NULL, 2)) AS t (s, i)
+	)
+GROUP BY
+	i
+
+statement ok
+CREATE TABLE t43550(a INT2 PRIMARY KEY); INSERT INTO t43550 VALUES (1)
+
+query I
+SELECT CASE WHEN a = 0 THEN a ELSE 1:::INT8 END FROM t43550
+----
+1
+
+# Regression test for #43855.
+statement ok
+CREATE TABLE t43855(o OID, r REGPROCEDURE)
+
+query i
+SELECT CASE WHEN o = 0 THEN 0:::OID ELSE r END FROM t43855
+----
+
+# Regression test for an aggregate that has output type different from its
+# input type (INT4 is input whereas output is INT). Currently such query is not
+# supported through vectorized engine, but we will get a plan with wrapped
+# rowexec.orderedAggregator.
+query I
+SELECT max(c) FROM a
+----
+2000
+
+# Regression test for starting wrapped processors multiple times.
+statement ok
+CREATE TABLE t44133_0(c0 STRING); CREATE TABLE t44133_1(c0 STRING UNIQUE NOT NULL)
+
+statement ok
+SELECT * FROM t44133_0, t44133_1 WHERE t44133_0.c0 NOT BETWEEN t44133_1.c0 AND '' AND (t44133_1.c0 IS NULL)
+
+# Regression test for CASE operator with unhandled output type.
+statement ok
+CREATE TABLE t44304(c0 INT); INSERT INTO t44304 VALUES (0)
+
+query I
+SELECT * FROM t44304 WHERE CASE WHEN t44304.c0 > 0 THEN NULL END
+----
+
+# Regression test for CASE operator and flat bytes.
+statement ok
+CREATE TABLE t44624(c0 STRING, c1 BOOL); INSERT INTO t44624(rowid, c0, c1) VALUES (0, '', true), (1, '', NULL)
+
+query TB
+SELECT * FROM t44624 ORDER BY CASE WHEN c1 IS NULL THEN c0 WHEN true THEN c0 END
+----
+·  true
+·  NULL
+
+# Regression test for 44726 (unknown WHEN expression type).
+statement ok
+CREATE TABLE t44726(c0 INT); INSERT INTO t44726(c0) VALUES (0)
+
+query I
+SELECT * FROM t44726 WHERE 0 > (CASE WHEN nullif(NULL, ilike_escape('', current_user(), '')) THEN 0 ELSE t44726.c0 END)
+----
+
+# Regression test for wrongly performing bounds check elimination on flat bytes
+# which might lead to a crash.
+statement ok
+CREATE TABLE t44822(c0 BYTES); CREATE VIEW v0(c0) AS SELECT min(t44822.c0) FROM t44822
+
+query T
+SELECT * FROM v0 WHERE v0.c0 NOT BETWEEN v0.c0 AND v0.c0
+----
+
+# Regression test for #44935 (decimals with different number of trailing zeroes
+# hashing to different values).
+statement ok
+CREATE TABLE t44935 (x decimal); INSERT INTO t44935 VALUES (1.0), (1.00)
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT x FROM t44935)
+----
+1

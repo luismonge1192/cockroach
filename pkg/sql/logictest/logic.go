@@ -382,15 +382,16 @@ type testClusterConfig struct {
 	name                string
 	numNodes            int
 	useFakeSpanResolver bool
-	// if non-empty, overrides the default optimizer mode.
+	// if non-empty, overrides the default distsql mode.
 	overrideDistSQLMode string
 	// if non-empty, overrides the default vectorize mode.
 	overrideVectorize string
 	// if non-empty, overrides the default automatic statistics mode.
 	overrideAutoStats string
-	// if set, queries using distSQL processors that can fall back to disk do
-	// so immediately, using only their disk-based implementation.
-	distSQLUseDisk bool
+	// if set, queries using distSQL processors or vectorized operators that can
+	// fall back to disk do so immediately, using only their disk-based
+	// implementation.
+	sqlExecUseDisk bool
 	// if set, enables DistSQL metadata propagation tests.
 	distSQLMetadataTestEnabled bool
 	// if set and the -test.short flag is passed, skip this config.
@@ -449,6 +450,15 @@ var logicTestConfigs = []testClusterConfig{
 		overrideAutoStats:   "false",
 	},
 	{
+		name:                "local-mixed-19.2-20.1",
+		numNodes:            1,
+		overrideDistSQLMode: "off",
+		overrideAutoStats:   "false",
+		bootstrapVersion:    roachpb.Version{Major: 19, Minor: 2},
+		serverVersion:       roachpb.Version{Major: 20, Minor: 1},
+		disableUpgrade:      true,
+	},
+	{
 		name:                "fakedist-vec-off",
 		numNodes:            3,
 		useFakeSpanResolver: true,
@@ -465,6 +475,16 @@ var logicTestConfigs = []testClusterConfig{
 		overrideVectorize:   "experimental_on",
 	},
 	{
+		name:                "fakedist-vec-disk",
+		numNodes:            3,
+		useFakeSpanResolver: true,
+		overrideDistSQLMode: "on",
+		overrideAutoStats:   "false",
+		overrideVectorize:   "experimental_on",
+		sqlExecUseDisk:      true,
+		skipShort:           true,
+	},
+	{
 		name:                       "fakedist-metadata",
 		numNodes:                   3,
 		useFakeSpanResolver:        true,
@@ -479,7 +499,7 @@ var logicTestConfigs = []testClusterConfig{
 		useFakeSpanResolver: true,
 		overrideDistSQLMode: "on",
 		overrideAutoStats:   "false",
-		distSQLUseDisk:      true,
+		sqlExecUseDisk:      true,
 		skipShort:           true,
 	},
 	{
@@ -513,7 +533,7 @@ var logicTestConfigs = []testClusterConfig{
 		name:                "5node-dist-disk",
 		numNodes:            5,
 		overrideDistSQLMode: "on",
-		distSQLUseDisk:      true,
+		sqlExecUseDisk:      true,
 		skipShort:           true,
 		overrideAutoStats:   "false",
 	},
@@ -535,8 +555,10 @@ var (
 	defaultConfigNames = []string{
 		"local",
 		"local-vec-off",
+		"local-vec",
 		"fakedist",
 		"fakedist-vec-off",
+		"fakedist-vec",
 		"fakedist-metadata",
 		"fakedist-disk",
 	}
@@ -1061,8 +1083,8 @@ func (t *logicTest) setup(cfg testClusterConfig) {
 	distSQLKnobs := &execinfra.TestingKnobs{
 		MetadataTestLevel: execinfra.Off, DeterministicStats: true,
 	}
-	if cfg.distSQLUseDisk {
-		distSQLKnobs.MemoryLimitBytes = 1
+	if cfg.sqlExecUseDisk {
+		distSQLKnobs.ForceDiskSpill = true
 	}
 	if cfg.distSQLMetadataTestEnabled {
 		distSQLKnobs.MetadataTestLevel = execinfra.On
@@ -1690,6 +1712,7 @@ func (t *logicTest) processSubtest(
 			if rows.Next() {
 				return errors.Errorf("%s: more than one row returned by query  %s", stmt.pos, stmt.sql)
 			}
+			t.t().Logf("let %s = %s\n", varName, val)
 			t.varMap[varName] = val
 
 		case "halt", "hash-threshold":
@@ -1703,6 +1726,13 @@ func (t *logicTest) processSubtest(
 			}
 			cleanupUserFunc := t.setUser(fields[1])
 			defer cleanupUserFunc()
+
+		case "skip":
+			reason := "skipped"
+			if len(fields) > 1 {
+				reason = fields[1]
+			}
+			t.t().Skip(reason)
 
 		case "skipif":
 			if len(fields) < 2 {
@@ -1763,7 +1793,7 @@ func (t *logicTest) processSubtest(
 				return errors.Errorf("kv-batch-size needs an integer argument; %s", err)
 			}
 			t.outf("Setting kv batch size %d", batchSize)
-			defer row.SetKVBatchSize(int64(batchSize))()
+			defer row.TestingSetKVBatchSize(int64(batchSize))()
 
 		default:
 			return errors.Errorf("%s:%d: unknown command: %s",
@@ -1954,6 +1984,7 @@ func (t *logicTest) execQuery(query logicQuery) error {
 	if err != nil {
 		// An error occurred, but it was expected.
 		t.finishOne("XFAIL")
+		//nolint:returnerrcheck
 		return nil
 	}
 	defer rows.Close()

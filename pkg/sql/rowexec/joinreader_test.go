@@ -385,7 +385,7 @@ func TestJoinReader(t *testing.T) {
 		},
 	}
 	st := cluster.MakeTestingClusterSettings()
-	tempEngine, err := engine.NewTempEngine(engine.DefaultStorageEngine, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+	tempEngine, _, err := engine.NewTempEngine(ctx, engine.DefaultStorageEngine, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -413,7 +413,7 @@ func TestJoinReader(t *testing.T) {
 						TempStorage: tempEngine,
 						DiskMonitor: &diskMonitor,
 					},
-					Txn: client.NewTxn(ctx, s.DB(), s.NodeID(), client.RootTxn),
+					Txn: client.NewTxn(ctx, s.DB(), s.NodeID()),
 				}
 				encRows := make(sqlbase.EncDatumRows, len(c.input))
 				for rowIdx, row := range c.input {
@@ -426,7 +426,7 @@ func TestJoinReader(t *testing.T) {
 				in := distsqlutils.NewRowBuffer(c.inputTypes, encRows, distsqlutils.RowBufferArgs{})
 
 				out := &distsqlutils.RowBuffer{}
-				jr, err := execinfra.NewJoinReader(
+				jr, err := newJoinReader(
 					&flowCtx,
 					0, /* processorID */
 					&execinfrapb.JoinReaderSpec{
@@ -445,7 +445,7 @@ func TestJoinReader(t *testing.T) {
 				}
 
 				// Set a lower batch size to force multiple batches.
-				jr.(*execinfra.JoinReader).SetBatchSize(3 /* batchSize */)
+				jr.(*joinReader).SetBatchSize(3 /* batchSize */)
 
 				jr.Run(ctx)
 
@@ -498,7 +498,7 @@ CREATE TABLE test.t (a INT, s STRING, INDEX (a, s))`); err != nil {
 	td := sqlbase.GetTableDescriptor(kvDB, "test", "t")
 
 	st := cluster.MakeTestingClusterSettings()
-	tempEngine, err := engine.NewTempEngine(engine.DefaultStorageEngine, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+	tempEngine, _, err := engine.NewTempEngine(ctx, engine.DefaultStorageEngine, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -524,7 +524,7 @@ CREATE TABLE test.t (a INT, s STRING, INDEX (a, s))`); err != nil {
 			TempStorage: tempEngine,
 			DiskMonitor: &diskMonitor,
 		},
-		Txn: client.NewTxn(ctx, s.DB(), s.NodeID(), client.RootTxn),
+		Txn: client.NewTxn(ctx, s.DB(), s.NodeID()),
 	}
 	// Set the memory limit to the minimum allocation size so that the row
 	// container can buffer some rows in memory before spilling to disk. This
@@ -538,7 +538,7 @@ CREATE TABLE test.t (a INT, s STRING, INDEX (a, s))`); err != nil {
 	}
 
 	out := &distsqlutils.RowBuffer{}
-	jr, err := execinfra.NewJoinReader(
+	jr, err := newJoinReader(
 		&flowCtx,
 		0, /* processorID */
 		&execinfrapb.JoinReaderSpec{
@@ -571,7 +571,7 @@ CREATE TABLE test.t (a INT, s STRING, INDEX (a, s))`); err != nil {
 		count++
 	}
 	require.Equal(t, numRows, count)
-	require.True(t, jr.(*execinfra.JoinReader).Spilled())
+	require.True(t, jr.(*joinReader).Spilled())
 }
 
 // TestJoinReaderDrain tests various scenarios in which a joinReader's consumer
@@ -593,7 +593,7 @@ func TestJoinReaderDrain(t *testing.T) {
 	td := sqlbase.GetTableDescriptor(kvDB, "test", "t")
 
 	st := s.ClusterSettings()
-	tempEngine, err := engine.NewTempEngine(engine.DefaultStorageEngine, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+	tempEngine, _, err := engine.NewTempEngine(context.Background(), engine.DefaultStorageEngine, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -601,10 +601,7 @@ func TestJoinReaderDrain(t *testing.T) {
 
 	// Run the flow in a snowball trace so that we can test for tracing info.
 	tracer := tracing.NewTracer()
-	ctx, sp, err := tracing.StartSnowballTrace(context.Background(), tracer, "test flow ctx")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ctx, sp := tracing.StartSnowballTrace(context.Background(), tracer, "test flow ctx")
 	defer sp.Finish()
 
 	evalCtx := tree.MakeTestingEvalContext(st)
@@ -620,6 +617,11 @@ func TestJoinReaderDrain(t *testing.T) {
 	)
 	diskMonitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
 	defer diskMonitor.Stop(ctx)
+
+	rootTxn := client.NewTxn(ctx, s.DB(), s.NodeID())
+	leafInputState := rootTxn.GetLeafTxnInputState(ctx)
+	leafTxn := client.NewLeafTxn(ctx, s.DB(), s.NodeID(), &leafInputState)
+
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
 		Cfg: &execinfra.ServerConfig{
@@ -627,7 +629,7 @@ func TestJoinReaderDrain(t *testing.T) {
 			TempStorage: tempEngine,
 			DiskMonitor: &diskMonitor,
 		},
-		Txn: client.NewTxn(ctx, s.DB(), s.NodeID(), client.LeafTxn),
+		Txn: leafTxn,
 	}
 
 	encRow := make(sqlbase.EncDatumRow, 1)
@@ -640,7 +642,7 @@ func TestJoinReaderDrain(t *testing.T) {
 
 		out := &distsqlutils.RowBuffer{}
 		out.ConsumerClosed()
-		jr, err := execinfra.NewJoinReader(
+		jr, err := newJoinReader(
 			&flowCtx, 0 /* processorID */, &execinfrapb.JoinReaderSpec{Table: *td}, in, &execinfrapb.PostProcessSpec{}, out,
 		)
 		if err != nil {
@@ -661,7 +663,7 @@ func TestJoinReaderDrain(t *testing.T) {
 
 		out := &distsqlutils.RowBuffer{}
 		out.ConsumerDone()
-		jr, err := execinfra.NewJoinReader(
+		jr, err := newJoinReader(
 			&flowCtx, 0 /* processorID */, &execinfrapb.JoinReaderSpec{Table: *td}, in, &execinfrapb.PostProcessSpec{}, out,
 		)
 		if err != nil {
@@ -677,7 +679,7 @@ func TestJoinReaderDrain(t *testing.T) {
 		}
 
 		// Check for trailing metadata.
-		var traceSeen, txnCoordMetaSeen bool
+		var traceSeen, txnFinalStateSeen bool
 		for {
 			row, meta = out.Next()
 			if row != nil {
@@ -689,15 +691,15 @@ func TestJoinReaderDrain(t *testing.T) {
 			if meta.TraceData != nil {
 				traceSeen = true
 			}
-			if meta.TxnCoordMeta != nil {
-				txnCoordMetaSeen = true
+			if meta.LeafTxnFinalState != nil {
+				txnFinalStateSeen = true
 			}
 		}
 		if !traceSeen {
 			t.Fatal("missing tracing trailing metadata")
 		}
-		if !txnCoordMetaSeen {
-			t.Fatal("missing txn trailing metadata")
+		if !txnFinalStateSeen {
+			t.Fatal("missing txn final state")
 		}
 	})
 }
@@ -724,7 +726,7 @@ func BenchmarkJoinReader(b *testing.B) {
 			DiskMonitor: diskMonitor,
 			Settings:    st,
 		},
-		Txn: client.NewTxn(ctx, s.DB(), s.NodeID(), client.RootTxn),
+		Txn: client.NewTxn(ctx, s.DB(), s.NodeID()),
 	}
 
 	const numCols = 2
@@ -745,7 +747,7 @@ func BenchmarkJoinReader(b *testing.B) {
 		b.Run(fmt.Sprintf("rows=%d", numRows), func(b *testing.B) {
 			b.SetBytes(int64(numRows * (numCols + numInputCols) * 8))
 			for i := 0; i < b.N; i++ {
-				jr, err := execinfra.NewJoinReader(&flowCtx, 0 /* processorID */, &spec, input, &post, &output)
+				jr, err := newJoinReader(&flowCtx, 0 /* processorID */, &spec, input, &post, &output)
 				if err != nil {
 					b.Fatal(err)
 				}

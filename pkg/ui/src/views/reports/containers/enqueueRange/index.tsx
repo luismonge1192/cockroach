@@ -11,7 +11,7 @@
 import _ from "lodash";
 import React, { Fragment } from "react";
 import Helmet from "react-helmet";
-import { withRouter, WithRouterProps } from "react-router";
+import {RouteComponentProps, withRouter} from "react-router-dom";
 import { connect } from "react-redux";
 
 import { enqueueRange } from "src/util/api";
@@ -47,7 +47,7 @@ interface EnqueueRangeState {
   error: Error;
 }
 
-class EnqueueRange extends React.Component<EnqueueRangeProps & WithRouterProps, EnqueueRangeState> {
+export class EnqueueRange extends React.Component<EnqueueRangeProps & RouteComponentProps, EnqueueRangeState> {
   state: EnqueueRangeState = {
     queue: QUEUES[0],
     rangeID: "",
@@ -86,11 +86,11 @@ class EnqueueRange extends React.Component<EnqueueRangeProps & WithRouterProps, 
       _.parseInt(this.state.nodeID),
       this.state.skipShouldQueue,
     ).then(
-      (response) => {
-        this.setState({ response: response, error: null });
+      response => {
+        this.setState({ response, error: null });
       },
-      (err) => {
-        this.setState({ response: null, error: err });
+      error => {
+        this.setState({ response: null, error });
       },
     );
   }
@@ -136,7 +136,7 @@ class EnqueueRange extends React.Component<EnqueueRangeProps & WithRouterProps, 
 
     return (
       <Fragment>
-        <h2>Enqueue Range Output</h2>
+        <h2 className="base-heading">Enqueue Range Output</h2>
         {response.details.map((details) => (
           <div>
             <h3>Node n{details.node_id}</h3>
@@ -163,13 +163,11 @@ class EnqueueRange extends React.Component<EnqueueRangeProps & WithRouterProps, 
   render() {
     return (
       <Fragment>
-        <Helmet>
-          <title>Enqueue Range</title>
-        </Helmet>
+        <Helmet title="Enqueue Range" />
         <div className="content">
           <section className="section">
             <div className="form-container">
-              <h1 className="heading">Manually enqueue range in a replica queue</h1>
+              <h1 className="base-heading heading">Manually enqueue range in a replica queue</h1>
               <br />
               <form onSubmit={this.handleSubmit} className="form-internal" method="post">
                 <label>
@@ -235,11 +233,9 @@ class EnqueueRange extends React.Component<EnqueueRangeProps & WithRouterProps, 
 }
 
 // tslint:disable-next-line:variable-name
-const EnqueueRangeConnected = connect(
-  () => {
-    return {};
-  },
-  () => ({
+const EnqueueRangeConnected = withRouter(connect(
+  null,
+  {
     handleEnqueueRange: (queue: string, rangeID: number, nodeID: number, skipShouldQueue: boolean) => {
       const req = new EnqueueRangeRequest({
         queue: queue,
@@ -249,7 +245,7 @@ const EnqueueRangeConnected = connect(
       });
       return enqueueRange(req);
     },
-  }),
-)(withRouter(EnqueueRange));
+  },
+)(EnqueueRange));
 
 export default EnqueueRangeConnected;

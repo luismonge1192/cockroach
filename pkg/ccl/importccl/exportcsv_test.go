@@ -18,6 +18,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -52,7 +53,7 @@ func setupExportableBank(t *testing.T, nodes, rows int) (*sqlutils.SQLRunner, st
 		t.Fatal(err)
 	}
 	last := uint32(v.ValueInt())
-	zoneConfig := config.DefaultZoneConfig()
+	zoneConfig := zonepb.DefaultZoneConfig()
 	zoneConfig.RangeMaxBytes = proto.Int64(5000)
 	config.TestingSetZoneConfig(last+1, zoneConfig)
 	db.Exec(t, "ALTER TABLE bank SCATTER")
@@ -216,4 +217,20 @@ func TestExportShow(t *testing.T) {
 	if expected, got := "defaultdb\npostgres\nsystem\n", string(content); expected != got {
 		t.Fatalf("expected %q, got %q", expected, got)
 	}
+}
+
+// TestExportVectorized makes sure that SupportsVectorized check doesn't panic
+// on CSVWriter processor.
+func TestExportVectorized(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	dir, cleanupDir := testutils.TempDir(t)
+	defer cleanupDir()
+
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{ExternalIODir: dir})
+	defer srv.Stopper().Stop(context.Background())
+	sqlDB := sqlutils.MakeSQLRunner(db)
+
+	sqlDB.Exec(t, `CREATE TABLE t(a INT PRIMARY KEY)`)
+	sqlDB.Exec(t, `SET vectorize_row_count_threshold=0`)
+	sqlDB.Exec(t, `EXPORT INTO CSV 'http://0.1:37957/exp_1' FROM TABLE t`)
 }

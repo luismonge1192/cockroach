@@ -72,8 +72,9 @@ type rangefeedTxnPusher struct {
 func (tp *rangefeedTxnPusher) PushTxns(
 	ctx context.Context, txns []enginepb.TxnMeta, ts hlc.Timestamp,
 ) ([]roachpb.Transaction, error) {
-	pushTxnMap := make(map[uuid.UUID]enginepb.TxnMeta, len(txns))
-	for _, txn := range txns {
+	pushTxnMap := make(map[uuid.UUID]*enginepb.TxnMeta, len(txns))
+	for i := range txns {
+		txn := &txns[i]
 		pushTxnMap[txn.ID] = txn
 	}
 
@@ -105,8 +106,9 @@ func (tp *rangefeedTxnPusher) CleanupTxnIntentsAsync(
 	ctx context.Context, txns []roachpb.Transaction,
 ) error {
 	endTxns := make([]result.EndTxnIntents, len(txns))
-	for i, txn := range txns {
-		endTxns[i].Txn = txn
+	for i := range txns {
+		endTxns[i].Txn = &txns[i]
+		endTxns[i].Poison = true
 	}
 	return tp.ir.CleanupTxnIntentsAsync(ctx, tp.r.RangeID, endTxns, true /* allowSyncProcessing */)
 }
@@ -134,13 +136,13 @@ func (r *Replica) RangeFeed(
 	}
 	ctx := r.AnnotateCtx(stream.Context())
 
-	var rspan roachpb.RSpan
+	var rSpan roachpb.RSpan
 	var err error
-	rspan.Key, err = keys.Addr(args.Span.Key)
+	rSpan.Key, err = keys.Addr(args.Span.Key)
 	if err != nil {
 		return roachpb.NewError(err)
 	}
-	rspan.EndKey, err = keys.Addr(args.Span.EndKey)
+	rSpan.EndKey, err = keys.Addr(args.Span.EndKey)
 	if err != nil {
 		return roachpb.NewError(err)
 	}
@@ -192,17 +194,9 @@ func (r *Replica) RangeFeed(
 	// critical-section as the registration is established. This ensures that
 	// the registration doesn't miss any events.
 	r.raftMu.Lock()
-	if err := r.requestCanProceed(rspan, checkTS); err != nil {
+	if err := r.checkExecutionCanProceedForRangeFeed(rSpan, checkTS); err != nil {
 		r.raftMu.Unlock()
 		return roachpb.NewError(err)
-	}
-
-	// Ensure that the range does not require an expiration-based lease. If it
-	// does, it will never get closed timestamp updates and the rangefeed will
-	// never be able to advance its resolved timestamp.
-	if r.requiresExpiringLease() {
-		r.raftMu.Unlock()
-		return roachpb.NewErrorf("expiration-based leases are incompatible with rangefeeds")
 	}
 
 	// Register the stream with a catch-up iterator.
@@ -227,7 +221,7 @@ func (r *Replica) RangeFeed(
 		iterSemRelease = nil
 	}
 	p := r.registerWithRangefeedRaftMuLocked(
-		ctx, rspan, args.Timestamp, catchUpIter, args.WithDiff, lockedStream, errC,
+		ctx, rSpan, args.Timestamp, catchUpIter, args.WithDiff, lockedStream, errC,
 	)
 	r.raftMu.Unlock()
 
@@ -254,11 +248,6 @@ func (r *Replica) setRangefeedProcessor(p *rangefeed.Processor) {
 	r.rangefeedMu.Lock()
 	defer r.rangefeedMu.Unlock()
 	r.rangefeedMu.proc = p
-	if !r.updateRangefeedFilterLocked() {
-		// This can't happen. We just set the processor and haven't released the
-		// exclusive lock, so no other goroutine could have stopped it.
-		panic("rangefeed processor unexpectedly stopped")
-	}
 	r.store.addReplicaWithRangefeed(r.RangeID)
 }
 
@@ -278,12 +267,22 @@ func (r *Replica) unsetRangefeedProcessor(p *rangefeed.Processor) {
 	r.unsetRangefeedProcessorLocked(p)
 }
 
+func (r *Replica) setRangefeedFilterLocked(f *rangefeed.Filter) {
+	if f == nil {
+		panic("filter nil")
+	}
+	r.rangefeedMu.opFilter = f
+}
+
 func (r *Replica) updateRangefeedFilterLocked() bool {
-	r.rangefeedMu.opFilter = r.rangefeedMu.proc.Filter()
+	f := r.rangefeedMu.proc.Filter()
 	// Return whether the update to the filter was successful or not. If
 	// the processor was already stopped then we can't update the filter.
-	stopped := r.rangefeedMu.opFilter == nil
-	return !stopped
+	if f != nil {
+		r.setRangefeedFilterLocked(f)
+		return true
+	}
+	return false
 }
 
 // The size of an event is 112 bytes, so this will result in an allocation on
@@ -314,11 +313,12 @@ func (r *Replica) registerWithRangefeedRaftMuLocked(
 	r.rangefeedMu.Lock()
 	p := r.rangefeedMu.proc
 	if p != nil {
-		reg := p.Register(span, startTS, catchupIter, withDiff, stream, errC)
-		if reg && r.updateRangefeedFilterLocked() {
+		reg, filter := p.Register(span, startTS, catchupIter, withDiff, stream, errC)
+		if reg {
 			// Registered successfully with an existing processor.
 			// Update the rangefeed filter to avoid filtering ops
 			// that this new registration might be interested in.
+			r.setRangefeedFilterLocked(filter)
 			r.rangefeedMu.Unlock()
 			return p
 		}
@@ -338,6 +338,8 @@ func (r *Replica) registerWithRangefeedRaftMuLocked(
 		Clock:            r.Clock(),
 		Span:             desc.RSpan(),
 		TxnPusher:        &tp,
+		PushTxnsInterval: r.store.TestingKnobs().RangeFeedPushTxnsInterval,
+		PushTxnsAge:      r.store.TestingKnobs().RangeFeedPushTxnsAge,
 		EventChanCap:     defaultEventChanCap,
 		EventChanTimeout: 50 * time.Millisecond,
 		Metrics:          r.store.metrics.RangeFeedMetrics,
@@ -362,7 +364,7 @@ func (r *Replica) registerWithRangefeedRaftMuLocked(
 	// any other goroutines are able to stop the processor. In other words,
 	// this ensures that the only time the registration fails is during
 	// server shutdown.
-	reg := p.Register(span, startTS, catchupIter, withDiff, stream, errC)
+	reg, filter := p.Register(span, startTS, catchupIter, withDiff, stream, errC)
 	if !reg {
 		catchupIter.Close() // clean up
 		select {
@@ -374,10 +376,11 @@ func (r *Replica) registerWithRangefeedRaftMuLocked(
 		}
 	}
 
-	// Set the rangefeed reference. We know that no other registration
-	// process could have raced with ours because calling this method
-	// requires raftMu to be exclusively locked.
+	// Set the rangefeed processor and filter reference. We know that no other
+	// registration process could have raced with ours because calling this
+	// method requires raftMu to be exclusively locked.
 	r.setRangefeedProcessor(p)
+	r.setRangefeedFilterLocked(filter)
 
 	// Check for an initial closed timestamp update immediately to help
 	// initialize the rangefeed's resolved timestamp as soon as possible.

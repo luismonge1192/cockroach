@@ -41,58 +41,11 @@ func (*ValuesClause) selectStatement() {}
 
 // Select represents a SelectStatement with an ORDER and/or LIMIT.
 type Select struct {
-	With      *With
-	Select    SelectStatement
-	OrderBy   OrderBy
-	Limit     *Limit
-	ForLocked ForLocked
-}
-
-// ForLocked represents a locking clause, like FOR UPDATE.
-type ForLocked struct {
-	Strength LockingStrength
-	Targets  TableNames
-}
-
-// Format implements the NodeFormatter interface.
-func (f ForLocked) Format(ctx *FmtCtx) {
-	f.Strength.Format(ctx)
-	if len(f.Targets) > 0 {
-		ctx.WriteString(" OF ")
-		f.Targets.Format(ctx)
-	}
-}
-
-// LockingStrength represents the possible row-level lock modes for a SELECT
-// statement.
-type LockingStrength byte
-
-const (
-	// ForNone represents the default - no for statement at all.
-	ForNone LockingStrength = iota
-	// ForUpdate represents FOR UPDATE.
-	ForUpdate
-	// ForNoKeyUpdate represents FOR NO KEY UPDATE.
-	ForNoKeyUpdate
-	// ForShare represents FOR SHARE.
-	ForShare
-	// ForKeyShare represents FOR KEY SHARE.
-	ForKeyShare
-)
-
-// Format implements the NodeFormatter interface.
-func (f LockingStrength) Format(ctx *FmtCtx) {
-	switch f {
-	case ForNone:
-	case ForUpdate:
-		ctx.WriteString(" FOR UPDATE")
-	case ForNoKeyUpdate:
-		ctx.WriteString(" FOR NO KEY UPDATE")
-	case ForShare:
-		ctx.WriteString(" FOR SHARE")
-	case ForKeyShare:
-		ctx.WriteString(" FOR KEY SHARE")
-	}
+	With    *With
+	Select  SelectStatement
+	OrderBy OrderBy
+	Limit   *Limit
+	Locking LockingClause
 }
 
 // Format implements the NodeFormatter interface.
@@ -107,7 +60,7 @@ func (node *Select) Format(ctx *FmtCtx) {
 		ctx.WriteByte(' ')
 		ctx.FormatNode(node.Limit)
 	}
-	ctx.FormatNode(node.ForLocked)
+	ctx.FormatNode(&node.Locking)
 }
 
 // ParenSelect represents a parenthesized SELECT/UNION/VALUES statement.
@@ -626,7 +579,7 @@ func (node *DistinctOn) Format(ctx *FmtCtx) {
 	ctx.WriteByte(')')
 }
 
-// OrderBy represents an ORDER By clause.
+// OrderBy represents an ORDER BY clause.
 type OrderBy []*Order
 
 // Format implements the NodeFormatter interface.
@@ -997,4 +950,127 @@ func (node *WindowFrame) Format(ctx *FmtCtx) {
 		ctx.WriteByte(' ')
 		ctx.FormatNode(node.Exclusion)
 	}
+}
+
+// LockingClause represents a locking clause, like FOR UPDATE.
+type LockingClause []*LockingItem
+
+// Format implements the NodeFormatter interface.
+func (node *LockingClause) Format(ctx *FmtCtx) {
+	for _, n := range *node {
+		ctx.FormatNode(n)
+	}
+}
+
+// LockingItem represents a single locking item in a locking clause.
+//
+// NOTE: if this struct changes, HashLockingItem and IsLockingItemEqual
+// in opt/memo/interner.go will need to be updated accordingly.
+type LockingItem struct {
+	Strength   LockingStrength
+	Targets    TableNames
+	WaitPolicy LockingWaitPolicy
+}
+
+// Format implements the NodeFormatter interface.
+func (f *LockingItem) Format(ctx *FmtCtx) {
+	f.Strength.Format(ctx)
+	if len(f.Targets) > 0 {
+		ctx.WriteString(" OF ")
+		f.Targets.Format(ctx)
+	}
+	f.WaitPolicy.Format(ctx)
+}
+
+// LockingStrength represents the possible row-level lock modes for a SELECT
+// statement.
+type LockingStrength byte
+
+// The ordering of the variants is important, because the highest numerical
+// value takes precedence when row-level locking is specified multiple ways.
+const (
+	// ForNone represents the default - no for statement at all.
+	// LockingItem AST nodes are never created with this strength.
+	ForNone LockingStrength = iota
+	// ForKeyShare represents FOR KEY SHARE.
+	ForKeyShare
+	// ForShare represents FOR SHARE.
+	ForShare
+	// ForNoKeyUpdate represents FOR NO KEY UPDATE.
+	ForNoKeyUpdate
+	// ForUpdate represents FOR UPDATE.
+	ForUpdate
+)
+
+var lockingStrengthName = [...]string{
+	ForNone:        "",
+	ForKeyShare:    "FOR KEY SHARE",
+	ForShare:       "FOR SHARE",
+	ForNoKeyUpdate: "FOR NO KEY UPDATE",
+	ForUpdate:      "FOR UPDATE",
+}
+
+func (s LockingStrength) String() string {
+	return lockingStrengthName[s]
+}
+
+// Format implements the NodeFormatter interface.
+func (s LockingStrength) Format(ctx *FmtCtx) {
+	if s != ForNone {
+		ctx.WriteString(" ")
+		ctx.WriteString(s.String())
+	}
+}
+
+// Max returns the maximum of the two locking strengths.
+func (s LockingStrength) Max(s2 LockingStrength) LockingStrength {
+	return LockingStrength(max(byte(s), byte(s2)))
+}
+
+// LockingWaitPolicy represents the possible policies for dealing with rows
+// being locked by FOR UPDATE/SHARE clauses (i.e., it represents the NOWAIT
+// and SKIP LOCKED options).
+type LockingWaitPolicy byte
+
+// The ordering of the variants is important, because the highest numerical
+// value takes precedence when row-level locking is specified multiple ways.
+const (
+	// LockWaitBlock represents the default - wait for the lock to become
+	// available.
+	LockWaitBlock LockingWaitPolicy = iota
+	// LockWaitSkip represents SKIP LOCKED - skip rows that can't be locked.
+	LockWaitSkip
+	// LockWaitError represents NOWAIT - raise an error if a row cannot be
+	// locked.
+	LockWaitError
+)
+
+var lockingWaitPolicyName = [...]string{
+	LockWaitBlock: "",
+	LockWaitSkip:  "SKIP LOCKED",
+	LockWaitError: "NOWAIT",
+}
+
+func (p LockingWaitPolicy) String() string {
+	return lockingWaitPolicyName[p]
+}
+
+// Format implements the NodeFormatter interface.
+func (p LockingWaitPolicy) Format(ctx *FmtCtx) {
+	if p != LockWaitBlock {
+		ctx.WriteString(" ")
+		ctx.WriteString(p.String())
+	}
+}
+
+// Max returns the maximum of the two locking wait policies.
+func (p LockingWaitPolicy) Max(p2 LockingWaitPolicy) LockingWaitPolicy {
+	return LockingWaitPolicy(max(byte(p), byte(p2)))
+}
+
+func max(a, b byte) byte {
+	if a > b {
+		return a
+	}
+	return b
 }

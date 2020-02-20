@@ -41,7 +41,7 @@ func runImport(
 ) (*roachpb.BulkOpSummary, error) {
 	// Used to send ingested import rows to the KV layer.
 	kvCh := make(chan row.KVBatch, 10)
-	conv, err := makeInputConverter(spec, flowCtx.NewEvalCtx(), kvCh)
+	conv, err := makeInputConverter(ctx, spec, flowCtx.NewEvalCtx(), kvCh)
 	if err != nil {
 		return nil, err
 	}
@@ -61,8 +61,7 @@ func runImport(
 			// Filter out files that were completely processed.
 			inputs = make(map[int32]string)
 			for id, name := range spec.Uri {
-				// TODO(yevgeniy): Support offsets into the file, not just full file skipping.
-				if seek, ok := spec.ResumePos[id]; !ok || seek != math.MaxInt64 {
+				if seek, ok := spec.ResumePos[id]; !ok || seek < math.MaxInt64 {
 					inputs[id] = name
 				}
 			}
@@ -70,7 +69,7 @@ func runImport(
 			inputs = spec.Uri
 		}
 
-		return conv.readFiles(ctx, inputs, nil, spec.Format, flowCtx.Cfg.ExternalStorage)
+		return conv.readFiles(ctx, inputs, spec.ResumePos, spec.Format, flowCtx.Cfg.ExternalStorage)
 	})
 
 	// This group links together the producers (via producerGroup) and the KV ingester.
@@ -98,6 +97,7 @@ func runImport(
 		progCh <- prog
 		return nil
 	})
+
 	if err := group.Wait(); err != nil {
 		return nil, err
 	}
@@ -147,9 +147,7 @@ func readInputFiles(
 		fileSizes[id] = sz
 	}
 
-	currentFile := 0
 	for dataFileIndex, dataFile := range dataFiles {
-		currentFile++
 		select {
 		case <-done:
 			return ctx.Err()
@@ -229,7 +227,7 @@ func readInputFiles(
 				grp.GoCtx(func(ctx context.Context) error {
 					defer close(rejected)
 					if err := fileFunc(ctx, src, dataFileIndex, dataFile, resumePos[dataFileIndex], rejected); err != nil {
-						return errors.Wrap(err, dataFile)
+						return err
 					}
 					return nil
 				})
@@ -335,16 +333,16 @@ func isMultiTableFormat(format roachpb.IOFileFormat_FileFormat) bool {
 	return false
 }
 
-func makeRowErr(file string, row int64, code, format string, args ...interface{}) error {
+func makeRowErr(_ string, row int64, code, format string, args ...interface{}) error {
 	return pgerror.NewWithDepthf(1, code,
-		"%q: row %d: "+format, append([]interface{}{file, row}, args...)...)
+		"row %d: "+format, append([]interface{}{row}, args...)...)
 }
 
-func wrapRowErr(err error, file string, row int64, code, format string, args ...interface{}) error {
+func wrapRowErr(err error, _ string, row int64, code, format string, args ...interface{}) error {
 	if format != "" || len(args) > 0 {
 		err = errors.WrapWithDepthf(1, err, format, args...)
 	}
-	err = errors.WrapWithDepthf(1, err, "%q: row %d", file, row)
+	err = errors.WrapWithDepthf(1, err, "row %d", row)
 	if code != pgcode.Uncategorized {
 		err = pgerror.WithCandidateCode(err, code)
 	}

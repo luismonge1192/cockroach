@@ -14,7 +14,7 @@ Table of contents:
 - [LeafTxns and txn state repatriation](#LeafTxns-and-txn-state-repatriation)
 - [client.Txn, meta and TxnCoordSender](#clientTxn-meta-and-TxnCoordSender)
 - [Interceptors: between TxnCoordSender and DistSender](#Interceptors-between-TxnCoordSender-and-DistSender)
-- [TxnCoordSender state and TxnCoordMeta](#TxnCoordSender-state-and-TxnCoordMeta)
+- [TxnCoordSender state](#TxnCoordSender-state)
 - [Summary of the all-is-well path](#Summary-of-the-all-is-well-path)
 - [Error handling in TxnCoordSender](#Error-handling-in-TxnCoordSender)
 - [Error handling with LeafTxns](#Error-handling-with-LeafTxns)
@@ -129,10 +129,7 @@ This works as follows:
 - the SQL executor instantiates the RootTxn as usual.
 - when a distributed query is about to start, the distsql
   execution code pulls out a struct from the RootTxn
-  called "TxnCoordMeta", then "trims it down"
-  using `TrimRootToLeaf()` to turn it into the necessary
-  and sufficient input to create LeafTxn objects
-  on other nodes. This contains e.g. the txn ID,
+  called "LeafTxnInputState". This contains e.g. the txn ID,
   timestamp and write intents as outlined above.
 - the trimmed meta struct is sent along with the flow
   request to a remote distsql server.
@@ -141,12 +138,12 @@ This works as follows:
 - the distsql processor(s) (e.g a table reader) then uses
   the LeafTxn to run KV batches.
 - when query execution completes, the distsql processor
-  extracts a similar state struct off the LeafTxn,
-  trims it down using `TrimLeafToRoot()` and the
+  extracts a similar state struct off the LeafTxn
+  called `LeafTxnFinalState` and the
   result is repatriated on the gateway when the
   flow is shut down.
 - on the gateway, repatriated LeafTxn state structs
-  are merged into the RootTxn using `AugmentTxnCoordMeta()`.
+  are merged into the RootTxn using `UpdateRootWithLeafFinalState()`.
 - on the gateway, any error produced by a LeafTxn is also "ingested"
   in the RootTxn to perform additional error recovery and clean-up,
   using `UpdateStateOnRemoteRetryableErr()`.
@@ -293,7 +290,7 @@ writing)](https://github.com/cockroachdb/cockroach/blob/a57647381a4714b48f6ec6de
 whereas LeafTxns, which only handle read requests, use [only a
 subset](https://github.com/cockroachdb/cockroach/blob/a57647381a4714b48f6ec6dec0bf766eaa6746dd/pkg/kv/txn_coord_sender.go#L556).
 
-## TxnCoordSender state and TxnCoordMeta
+## TxnCoordSender state
 
 The overall "current state" of a TCS is thus distributed
 between various Go structs:
@@ -310,23 +307,17 @@ This overall state is a native Go struct and not a protobuf. However,
 "current state" of a RootTxn and carry it over to another node to
 build a LeafTxn.
 
-For this purpose, a separate [protobuf message
-TxnCoordMeta](https://github.com/cockroachdb/cockroach/blob/a57647381a4714b48f6ec6dec0bf766eaa6746dd/pkg/roachpb/data.proto#L617)
-is defined. The TCS's `GetMeta()` method initially
-populates it by asking every interceptor in turn to write its portion
-of the state into it.
-
-(side note: arguably, the name "Meta" here is ill-chosen. There's
-nothing meta about it; this struct is really a mere serializable copy
-of the txncoordsender's state, and would not be necessary if the
-TCS state was natively stored in a protobuf-encodable
-struct already.)
+For this purpose, a separate protobuf message `LeafTxnInputState` is
+defined. The TCS's `GetLeafTxnInputState()` method initially populates
+it by asking every interceptor in turn to write its portion of the
+state into it.
 
 Conversely, when the state of a LeafTxn is repatriated and to be
-"merged" into the RootTxn, the `AugmentMeta()` method uses the
-`Update()` method on the `roachpb.Transaction` sub-object (which
-merges the state of the txn object itself) then asks every interceptor,
-in turn, to collect bits of state it may be interested to merge in too.
+"merged" into the RootTxn, the `UpdateRootFromLeafFinalState()` method
+uses the `Update()` method on the `roachpb.Transaction` sub-object
+(which merges the state of the txn object itself) then asks every
+interceptor, in turn, to collect bits of state it may be interested to
+merge in too.
 
 For example, that's where the RootTxn's txnSpanRefresher interceptor
 picks up the spans accumulated in the LeafTxn.
@@ -409,13 +400,15 @@ split into three groups:
   become "trashed" (and unusable), but where the `*client.Txn` can
   continue/restart with a new TCS:
 
-  1. *retryable transaction aborts* (`TransactionAbortedError` with a
-     `TransactionRetryWithProtoRefreshError` payload), which occurs
-     when the KV transaction gets aborted preemptively due to some
-     internal CRDB mechanism, but not due to a logical
-     error. Intuitively, this corresponds to errors due to the
-     distributed nature of CRDB which would not occur in a
-     single-server sequential database.
+  1. *retryable transaction aborts* (`TransactionRetryWithProtoRefreshError`
+  with a `TransactionAbortedError` payload), which occurs when the KV
+  transaction gets aborted by some other transaction. This happens in case of
+  deadlock, or in case the coordinator fails to heartbeat the txn record for a
+  few seconds and another transaction is blocked on one of our intents. Faux
+  `TransactionAbortedErrors` can also happen for transactions that straddle a
+  lease transfer (the new leaseholder is not able to verify that the transaction
+  had not been aborted by someone else before the lease transfer because we lost
+  the information in the old timestamp cache).
 
   For these errors, the TCS becomes unusable but the `*client.Txn`
   immediately replaces the TCS by a fresh one, see
@@ -427,13 +420,13 @@ split into three groups:
 
   This group contains 3 kinds of errors:
 
-  1. *permanent transaction aborts* (`TransactionAbortedError`), which
-     occurs when the transaction encounteres a permanent unrecoverable
+  1. *permanent transaction errors*, which
+     occurs when the transaction encounters a permanent unrecoverable
      error typically due to client logic error (e.g. AOST read under GC).
 
   2. *transient processing errors*, for which it is certain that
      further processing is theoretically still possible after
-	 the error occurs. For example, attempting to read data using
+     the error occurs. For example, attempting to read data using
      a historical timestamp that has already been garbage collected,
     `CPut` condition failure, transient network error on the read path, etc.
 
@@ -610,7 +603,7 @@ SQL) is responsible for generating seqnums.
 The seqnum counter's current value is split between three locations:
 
 - a local variable in one of the interceptors, called `txnSeqNumAllocator` inside the TCS;
-- the `enginepb.TxnMeta` record, inside the `roachpb.Transaction` held inside the `TxnCoordMeta`.
+- the `enginepb.TxnMeta` record, inside the `roachpb.Transaction` held inside the `LeafTxnInputState`.
 - the `enginepb.TxnMeta` record, inside the `roachpb.Transaction` held inside the header of every executed KV batch.
 
 These three values are synchronized as follows:
@@ -627,18 +620,11 @@ These three values are synchronized as follows:
   batch header in certain circumstnaces (most notably by another later
   interceptor, the `txnPipeliner`) for use during txn conflict
   resolution and write reordering.
-- When a TCS is instantiated from a TxnCoordMeta (e.g. forking a
-  RootTxn into a LeafTxn), the counter value from the TxnMeta inside the TxnCoordMeta
+- When a TCS is instantiated from a LeafTxnInputState (e.g. forking a
+  RootTxn into a LeafTxn), the counter value from the TxnMeta inside the LeafTxnInputState
   is copied into the interceptor.
-- When a TxnCoordMeta is constructed from a TCS, the value is copied
-  from the interceptor to the TxnCoordMeta.
-- When a TCS is augmented by a TxnCoordMeta from a leaf, if the
-  sequence number from the incoming TxnCoordMeta is greater it is used
-  to bump the current TCS's counter.
-
-  (Note that this last logic step is currently never executed—i.e. it seems
-  to be over-engineered—since LeafTxns cannot issue writes and will
-  thus never increase the counter.)
+- When a LeafTxnInputState is constructed from a TCS, the value is copied
+  from the interceptor.
 
 Final note: the seqnum is scoped to a current txn epoch. When the
 epoch field is incremented, the seqnum generator resets to 0. The

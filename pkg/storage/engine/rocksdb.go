@@ -14,7 +14,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"math"
 	"os"
@@ -31,9 +30,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine/fs"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -780,36 +781,40 @@ func (r *RocksDB) ExportToSst(
 	startKey, endKey roachpb.Key,
 	startTS, endTS hlc.Timestamp,
 	exportAllRevisions bool,
+	targetSize, maxSize uint64,
 	io IterOptions,
-) ([]byte, roachpb.BulkOpSummary, error) {
+) ([]byte, roachpb.BulkOpSummary, roachpb.Key, error) {
 	start := MVCCKey{Key: startKey, Timestamp: startTS}
 	end := MVCCKey{Key: endKey, Timestamp: endTS}
 
 	var data C.DBString
 	var intentErr C.DBString
 	var bulkopSummary C.DBString
+	var resumeKey C.DBString
 
-	err := statusToError(C.DBExportToSst(goToCKey(start), goToCKey(end), C.bool(exportAllRevisions),
-		goToCIterOptions(io), r.rdb, &data, &intentErr, &bulkopSummary))
+	err := statusToError(C.DBExportToSst(goToCKey(start), goToCKey(end),
+		C.bool(exportAllRevisions),
+		C.uint64_t(targetSize), C.uint64_t(maxSize),
+		goToCIterOptions(io), r.rdb, &data, &intentErr, &bulkopSummary, &resumeKey))
 
 	if err != nil {
 		if err.Error() == "WriteIntentError" {
 			var e roachpb.WriteIntentError
 			if err := protoutil.Unmarshal(cStringToGoBytes(intentErr), &e); err != nil {
-				return nil, roachpb.BulkOpSummary{}, errors.Wrap(err, "failed to decode write intent error")
+				return nil, roachpb.BulkOpSummary{}, nil, errors.Wrap(err, "failed to decode write intent error")
 			}
 
-			return nil, roachpb.BulkOpSummary{}, &e
+			return nil, roachpb.BulkOpSummary{}, nil, &e
 		}
-		return nil, roachpb.BulkOpSummary{}, err
+		return nil, roachpb.BulkOpSummary{}, nil, err
 	}
 
 	var summary roachpb.BulkOpSummary
 	if err := protoutil.Unmarshal(cStringToGoBytes(bulkopSummary), &summary); err != nil {
-		return nil, roachpb.BulkOpSummary{}, errors.Wrap(err, "failed to decode BulkopSummary")
+		return nil, roachpb.BulkOpSummary{}, nil, errors.Wrap(err, "failed to decode BulkopSummary")
 	}
 
-	return cStringToGoBytes(data), summary, nil
+	return cStringToGoBytes(data), summary, roachpb.Key(cStringToGoBytes(resumeKey)), nil
 }
 
 // Attrs returns the list of attributes describing this engine. This
@@ -1003,9 +1008,10 @@ func (r *rocksDBReadOnly) ExportToSst(
 	startKey, endKey roachpb.Key,
 	startTS, endTS hlc.Timestamp,
 	exportAllRevisions bool,
+	targetSize, maxSize uint64,
 	io IterOptions,
-) ([]byte, roachpb.BulkOpSummary, error) {
-	return r.parent.ExportToSst(startKey, endKey, startTS, endTS, exportAllRevisions, io)
+) ([]byte, roachpb.BulkOpSummary, roachpb.Key, error) {
+	return r.parent.ExportToSst(startKey, endKey, startTS, endTS, exportAllRevisions, targetSize, maxSize, io)
 }
 
 func (r *rocksDBReadOnly) Get(key MVCCKey) ([]byte, error) {
@@ -1262,7 +1268,13 @@ func (r *RocksDB) GetTickersAndHistograms() (*enginepb.TickersAndHistograms, err
 // GetCompactionStats returns the internal RocksDB compaction stats. See
 // https://github.com/facebook/rocksdb/wiki/RocksDB-Tuning-Guide#rocksdb-statistics.
 func (r *RocksDB) GetCompactionStats() string {
-	return cStringToGoString(C.DBGetCompactionStats(r.rdb))
+	s := cStringToGoString(C.DBGetCompactionStats(r.rdb)) +
+		"estimated_pending_compaction_bytes: "
+	stats, err := r.GetStats()
+	if err != nil {
+		return s + err.Error()
+	}
+	return s + humanizeutil.IBytes(stats.PendingCompactionBytesEstimate)
 }
 
 // GetEnvStats returns stats for the RocksDB env. This may include encryption stats.
@@ -1317,9 +1329,10 @@ func (r *rocksDBSnapshot) ExportToSst(
 	startKey, endKey roachpb.Key,
 	startTS, endTS hlc.Timestamp,
 	exportAllRevisions bool,
+	targetSize, maxSize uint64,
 	io IterOptions,
-) ([]byte, roachpb.BulkOpSummary, error) {
-	return r.parent.ExportToSst(startKey, endKey, startTS, endTS, exportAllRevisions, io)
+) ([]byte, roachpb.BulkOpSummary, roachpb.Key, error) {
+	return r.parent.ExportToSst(startKey, endKey, startTS, endTS, exportAllRevisions, targetSize, maxSize, io)
 }
 
 // Get returns the value for the given key, nil otherwise using
@@ -1573,7 +1586,7 @@ func (r *batchIterator) MVCCGet(
 
 func (r *batchIterator) MVCCScan(
 	start, end roachpb.Key, max int64, timestamp hlc.Timestamp, opts MVCCScanOptions,
-) (kvData [][]byte, numKVs int64, resumeSpan *roachpb.Span, intents []roachpb.Intent, err error) {
+) (MVCCScanResult, error) {
 	r.batch.flushMutations()
 	return r.iter.MVCCScan(start, end, max, timestamp, opts)
 }
@@ -1726,8 +1739,9 @@ func (r *rocksDBBatch) ExportToSst(
 	startKey, endKey roachpb.Key,
 	startTS, endTS hlc.Timestamp,
 	exportAllRevisions bool,
+	targetSize, maxSize uint64,
 	io IterOptions,
-) ([]byte, roachpb.BulkOpSummary, error) {
+) ([]byte, roachpb.BulkOpSummary, roachpb.Key, error) {
 	panic("unimplemented")
 }
 
@@ -2144,10 +2158,11 @@ type dbIteratorGetter interface {
 
 type rocksDBIterator struct {
 	parent *RocksDB
-	engine Reader
+	reader Reader
 	iter   *C.DBIterator
 	valid  bool
 	reseek bool
+	prefix bool
 	err    error
 	key    C.DBKey
 	value  C.DBSlice
@@ -2166,14 +2181,14 @@ var iterPool = sync.Pool{
 // The caller must call rocksDBIterator.Close() when finished with the
 // iterator to free up resources.
 func newRocksDBIterator(
-	rdb *C.DBEngine, opts IterOptions, engine Reader, parent *RocksDB,
+	rdb *C.DBEngine, opts IterOptions, reader Reader, parent *RocksDB,
 ) MVCCIterator {
 	// In order to prevent content displacement, caching is disabled
 	// when performing scans. Any options set within the shared read
 	// options field that should be carried over needs to be set here
 	// as well.
 	r := iterPool.Get().(*rocksDBIterator)
-	r.init(rdb, opts, engine, parent)
+	r.init(rdb, opts, reader, parent)
 	return r
 }
 
@@ -2181,7 +2196,7 @@ func (r *rocksDBIterator) getIter() *C.DBIterator {
 	return r.iter
 }
 
-func (r *rocksDBIterator) init(rdb *C.DBEngine, opts IterOptions, engine Reader, parent *RocksDB) {
+func (r *rocksDBIterator) init(rdb *C.DBEngine, opts IterOptions, reader Reader, parent *RocksDB) {
 	r.parent = parent
 	if debugIteratorLeak && r.parent != nil {
 		r.parent.iters.Lock()
@@ -2197,7 +2212,8 @@ func (r *rocksDBIterator) init(rdb *C.DBEngine, opts IterOptions, engine Reader,
 	if r.iter == nil {
 		panic("unable to create iterator")
 	}
-	r.engine = engine
+	r.reader = reader
+	r.prefix = opts.Prefix
 }
 
 func (r *rocksDBIterator) setOptions(opts IterOptions) {
@@ -2212,7 +2228,7 @@ func (r *rocksDBIterator) setOptions(opts IterOptions) {
 }
 
 func (r *rocksDBIterator) checkEngineOpen() {
-	if r.engine.Closed() {
+	if r.reader.Closed() {
 		panic("iterator used after backing engine closed")
 	}
 }
@@ -2280,8 +2296,15 @@ func (r *rocksDBIterator) Next() {
 	r.setState(C.DBIterNext(r.iter, C.bool(false) /* skip_current_key_versions */))
 }
 
+var errReversePrefixIteration = fmt.Errorf("unsupported reverse prefix iteration")
+
 func (r *rocksDBIterator) Prev() {
 	r.checkEngineOpen()
+	if r.prefix {
+		r.valid = false
+		r.err = errReversePrefixIteration
+		return
+	}
 	r.setState(C.DBIterPrev(r.iter, C.bool(false) /* skip_current_key_versions */))
 }
 
@@ -2395,10 +2418,13 @@ func (r *rocksDBIterator) MVCCGet(
 	r.clearState()
 	state := C.MVCCGet(
 		r.iter, goToCSlice(key), goToCTimestamp(timestamp), goToCTxn(opts.Txn),
-		C.bool(opts.Inconsistent), C.bool(opts.Tombstones),
+		C.bool(opts.Inconsistent), C.bool(opts.Tombstones), C.bool(opts.FailOnMoreRecent),
 	)
 
 	if err := statusToError(state.status); err != nil {
+		return nil, nil, err
+	}
+	if err := writeTooOldToError(timestamp, state.write_too_old_timestamp); err != nil {
 		return nil, nil, err
 	}
 	if err := uncertaintyToError(timestamp, state.uncertainty_timestamp, opts.Txn); err != nil {
@@ -2446,36 +2472,42 @@ func (r *rocksDBIterator) MVCCGet(
 
 func (r *rocksDBIterator) MVCCScan(
 	start, end roachpb.Key, max int64, timestamp hlc.Timestamp, opts MVCCScanOptions,
-) (kvData [][]byte, numKVs int64, resumeSpan *roachpb.Span, intents []roachpb.Intent, err error) {
+) (MVCCScanResult, error) {
 	if opts.Inconsistent && opts.Txn != nil {
-		return nil, 0, nil, nil, errors.Errorf("cannot allow inconsistent reads within a transaction")
+		return MVCCScanResult{}, errors.Errorf("cannot allow inconsistent reads within a transaction")
 	}
 	if len(end) == 0 {
-		return nil, 0, nil, nil, emptyKeyError()
+		return MVCCScanResult{}, emptyKeyError()
 	}
 	if max == 0 {
-		resumeSpan = &roachpb.Span{Key: start, EndKey: end}
-		return nil, 0, resumeSpan, nil, nil
+		resumeSpan := &roachpb.Span{Key: start, EndKey: end}
+		return MVCCScanResult{ResumeSpan: resumeSpan}, nil
 	}
 
 	r.clearState()
 	state := C.MVCCScan(
-		r.iter, goToCSlice(start), goToCSlice(end),
-		goToCTimestamp(timestamp), C.int64_t(max),
+		r.iter, goToCSlice(start), goToCSlice(end), goToCTimestamp(timestamp),
+		C.int64_t(max), C.int64_t(opts.TargetBytes),
 		goToCTxn(opts.Txn), C.bool(opts.Inconsistent),
 		C.bool(opts.Reverse), C.bool(opts.Tombstones),
+		C.bool(opts.FailOnMoreRecent),
 	)
 
 	if err := statusToError(state.status); err != nil {
-		return nil, 0, nil, nil, err
+		return MVCCScanResult{}, err
+	}
+	if err := writeTooOldToError(timestamp, state.write_too_old_timestamp); err != nil {
+		return MVCCScanResult{}, err
 	}
 	if err := uncertaintyToError(timestamp, state.uncertainty_timestamp, opts.Txn); err != nil {
-		return nil, 0, nil, nil, err
+		return MVCCScanResult{}, err
 	}
 
-	kvData = [][]byte{copyFromSliceVector(state.data.bufs, state.data.len)}
-	numKVs = int64(state.data.count)
+	kvData := [][]byte{copyFromSliceVector(state.data.bufs, state.data.len)}
+	numKVs := int64(state.data.count)
+	numBytes := int64(state.data.bytes)
 
+	var resumeSpan *roachpb.Span
 	if resumeKey := cSliceToGoBytes(state.resume_key); resumeKey != nil {
 		if opts.Reverse {
 			resumeSpan = &roachpb.Span{Key: start, EndKey: roachpb.Key(resumeKey).Next()}
@@ -2484,17 +2516,21 @@ func (r *rocksDBIterator) MVCCScan(
 		}
 	}
 
-	intents, err = buildScanIntents(cSliceToGoBytes(state.intents))
+	intents, err := buildScanIntents(cSliceToGoBytes(state.intents))
 	if err != nil {
-		return nil, 0, nil, nil, err
+		return MVCCScanResult{}, err
 	}
 	if !opts.Inconsistent && len(intents) > 0 {
-		// When encountering intents during a consistent scan we still need to
-		// return the resume key.
-		return nil, 0, resumeSpan, nil, &roachpb.WriteIntentError{Intents: intents}
+		return MVCCScanResult{}, &roachpb.WriteIntentError{Intents: intents}
 	}
 
-	return kvData, numKVs, resumeSpan, intents, nil
+	return MVCCScanResult{
+		KVData:     kvData,
+		NumKeys:    numKVs,
+		NumBytes:   numBytes,
+		ResumeSpan: resumeSpan,
+		Intents:    intents,
+	}, nil
 }
 
 func (r *rocksDBIterator) SetUpperBound(key roachpb.Key) {
@@ -2605,6 +2641,16 @@ func goToCSlice(b []byte) C.DBSlice {
 	}
 }
 
+func goToCIgnoredSeqNums(b []enginepb.IgnoredSeqNumRange) C.DBIgnoredSeqNums {
+	if len(b) == 0 {
+		return C.DBIgnoredSeqNums{ranges: nil, len: 0}
+	}
+	return C.DBIgnoredSeqNums{
+		ranges: (*C.DBIgnoredSeqNumRange)(unsafe.Pointer(&b[0])),
+		len:    C.int(len(b)),
+	}
+}
+
 func goToCKey(key MVCCKey) C.DBKey {
 	return C.DBKey{
 		key:       goToCSlice(key.Key),
@@ -2685,6 +2731,13 @@ func goToCTimestamp(ts hlc.Timestamp) C.DBTimestamp {
 	}
 }
 
+func cToGoTimestamp(ts C.DBTimestamp) hlc.Timestamp {
+	return hlc.Timestamp{
+		WallTime: int64(ts.wall_time),
+		Logical:  int32(ts.logical),
+	}
+}
+
 func goToCTxn(txn *roachpb.Transaction) C.DBTxn {
 	var r C.DBTxn
 	if txn != nil {
@@ -2692,6 +2745,7 @@ func goToCTxn(txn *roachpb.Transaction) C.DBTxn {
 		r.epoch = C.uint32_t(txn.Epoch)
 		r.sequence = C.int32_t(txn.Sequence)
 		r.max_timestamp = goToCTimestamp(txn.MaxTimestamp)
+		r.ignored_seqnums = goToCIgnoredSeqNums(txn.IgnoredSeqNums)
 	}
 	return r
 }
@@ -2714,16 +2768,22 @@ func statusToError(s C.DBStatus) error {
 	return &Error{msg: cStringToGoString(s)}
 }
 
+func writeTooOldToError(readTS hlc.Timestamp, existingCTS C.DBTimestamp) error {
+	existingTS := cToGoTimestamp(existingCTS)
+	if !existingTS.IsEmpty() {
+		// The txn can't write at the existing timestamp, so we provide the
+		// error with the timestamp immediately after it.
+		return roachpb.NewWriteTooOldError(readTS, existingTS.Next())
+	}
+	return nil
+}
+
 func uncertaintyToError(
-	readTS hlc.Timestamp, existingTS C.DBTimestamp, txn *roachpb.Transaction,
+	readTS hlc.Timestamp, existingCTS C.DBTimestamp, txn *roachpb.Transaction,
 ) error {
-	if existingTS.wall_time != 0 || existingTS.logical != 0 {
-		return roachpb.NewReadWithinUncertaintyIntervalError(
-			readTS, hlc.Timestamp{
-				WallTime: int64(existingTS.wall_time),
-				Logical:  int32(existingTS.logical),
-			},
-			txn)
+	existingTS := cToGoTimestamp(existingCTS)
+	if !existingTS.IsEmpty() {
+		return roachpb.NewReadWithinUncertaintyIntervalError(readTS, existingTS, txn)
 	}
 	return nil
 }
@@ -3182,16 +3242,6 @@ func (r *RocksDB) InMem() bool {
 	return r.cfg.Dir == ""
 }
 
-// OpenFile opens a DBFile, which is essentially a rocksdb WritableFile
-// with the given filename, in this RocksDB's env.
-func (r *RocksDB) OpenFile(filename string) (DBFile, error) {
-	var file C.DBWritableFile
-	if err := statusToError(C.DBEnvOpenFile(r.rdb, goToCSlice([]byte(filename)), &file)); err != nil {
-		return nil, notFoundErrOrDefault(err)
-	}
-	return &rocksdbFile{file: file, rdb: r.rdb}, nil
-}
-
 // ReadFile reads the content from a file with the given filename. The file
 // must have been opened through Engine.OpenFile. Otherwise an error will be
 // returned.
@@ -3284,33 +3334,179 @@ func notFoundErrOrDefault(err error) error {
 	return err
 }
 
-// DBFile is an interface for interacting with DBWritableFile in RocksDB.
-type DBFile interface {
-	io.Writer
-	io.Closer
-	// Sync synchronously flushes this DBFile's data to disk.
-	Sync() error
-}
-
-// rocksdbFile implements DBFile interface. It is used to interact with the
+// rocksdbWritableFile implements the File interface. It is used to interact with the
 // DBWritableFile in the corresponding RocksDB env.
-type rocksdbFile struct {
+type rocksdbWritableFile struct {
 	file C.DBWritableFile
 	rdb  *C.DBEngine
 }
 
-// Write implements the DBFile interface.
-func (f *rocksdbFile) Write(data []byte) (int, error) {
+var _ fs.File = &rocksdbWritableFile{}
+
+// Write implements the File interface.
+func (f *rocksdbWritableFile) Write(data []byte) (int, error) {
 	err := statusToError(C.DBEnvAppendFile(f.rdb, f.file, goToCSlice(data)))
 	return len(data), err
 }
 
-// Close implements the DBFile interface.
-func (f *rocksdbFile) Close() error {
+// Close implements the File interface.
+func (f *rocksdbWritableFile) Close() error {
 	return statusToError(C.DBEnvCloseFile(f.rdb, f.file))
 }
 
-// Sync implements the DBFile interface.
-func (f *rocksdbFile) Sync() error {
+// Sync implements the File interface.
+func (f *rocksdbWritableFile) Sync() error {
 	return statusToError(C.DBEnvSyncFile(f.rdb, f.file))
+}
+
+// Read implements the File interface.
+func (f *rocksdbWritableFile) Read(p []byte) (n int, err error) {
+	return 0, fmt.Errorf("cannot read file opened for writing")
+}
+
+// ReadAt implements the File interface.
+func (f *rocksdbWritableFile) ReadAt(p []byte, off int64) (n int, err error) {
+	return 0, fmt.Errorf("cannot read file opened for writing")
+}
+
+// rocksdbReadableFile implements the File interface. It is used to interact with the
+// DBReadableFile in the corresponding RocksDB env.
+type rocksdbReadableFile struct {
+	file   C.DBReadableFile
+	rdb    *C.DBEngine
+	offset int64
+}
+
+var _ fs.File = &rocksdbReadableFile{}
+
+// Write implements the File interface.
+func (f *rocksdbReadableFile) Write(data []byte) (int, error) {
+	return 0, fmt.Errorf("cannot write file opened for reading")
+}
+
+// Close implements the File interface.
+func (f *rocksdbReadableFile) Close() error {
+	return statusToError(C.DBEnvCloseReadableFile(f.rdb, f.file))
+}
+
+// Sync implements the File interface.
+func (f *rocksdbReadableFile) Sync() error {
+	return fmt.Errorf("cannot sync file opened for reading")
+}
+
+// Read implements the File interface.
+func (f *rocksdbReadableFile) Read(p []byte) (n int, err error) {
+	n, err = f.ReadAt(p, f.offset)
+	f.offset += int64(n)
+	return
+}
+
+// ReadAt implements the File interface.
+func (f *rocksdbReadableFile) ReadAt(p []byte, off int64) (int, error) {
+	var n C.int
+	err := statusToError(C.DBEnvReadAtFile(f.rdb, f.file, goToCSlice(p), C.int64_t(off), &n))
+	return int(n), err
+}
+
+type rocksdbDirectory struct {
+	file C.DBDirectory
+	rdb  *C.DBEngine
+}
+
+var _ fs.File = &rocksdbDirectory{}
+
+// Write implements the File interface.
+func (f *rocksdbDirectory) Write(data []byte) (int, error) {
+	return 0, fmt.Errorf("cannot write to directory")
+}
+
+// Close implements the File interface.
+func (f *rocksdbDirectory) Close() error {
+	return statusToError(C.DBEnvCloseDirectory(f.rdb, f.file))
+}
+
+// Sync implements the File interface.
+func (f *rocksdbDirectory) Sync() error {
+	return statusToError(C.DBEnvSyncDirectory(f.rdb, f.file))
+}
+
+// Read implements the File interface.
+func (f *rocksdbDirectory) Read(p []byte) (n int, err error) {
+	return 0, fmt.Errorf("cannot read directory")
+}
+
+// ReadAt implements the File interface.
+func (f *rocksdbDirectory) ReadAt(p []byte, off int64) (n int, err error) {
+	return 0, fmt.Errorf("cannot read directory")
+}
+
+var _ fs.FS = &RocksDB{}
+
+// CreateFile implements the FS interface.
+func (r *RocksDB) CreateFile(name string) (fs.File, error) {
+	return r.CreateFileWithSync(name, 0)
+}
+
+// CreateFileWithSync implements the FS interface.
+func (r *RocksDB) CreateFileWithSync(name string, bytesPerSync int) (fs.File, error) {
+	var file C.DBWritableFile
+	if err := statusToError(C.DBEnvOpenFile(
+		r.rdb, goToCSlice([]byte(name)), C.uint64_t(bytesPerSync), &file)); err != nil {
+		return nil, notFoundErrOrDefault(err)
+	}
+	return &rocksdbWritableFile{file: file, rdb: r.rdb}, nil
+}
+
+// OpenFile implements the FS interface.
+func (r *RocksDB) OpenFile(name string) (fs.File, error) {
+	var file C.DBReadableFile
+	if err := statusToError(C.DBEnvOpenReadableFile(r.rdb, goToCSlice([]byte(name)), &file)); err != nil {
+		return nil, notFoundErrOrDefault(err)
+	}
+	return &rocksdbReadableFile{file: file, rdb: r.rdb}, nil
+}
+
+// OpenDir implements the FS interface.
+func (r *RocksDB) OpenDir(name string) (fs.File, error) {
+	var file C.DBDirectory
+	if err := statusToError(C.DBEnvOpenDirectory(r.rdb, goToCSlice([]byte(name)), &file)); err != nil {
+		return nil, notFoundErrOrDefault(err)
+	}
+	return &rocksdbDirectory{file: file, rdb: r.rdb}, nil
+}
+
+// RenameFile implements the FS interface.
+func (r *RocksDB) RenameFile(oldname, newname string) error {
+	return statusToError(C.DBEnvRenameFile(r.rdb, goToCSlice([]byte(oldname)), goToCSlice([]byte(newname))))
+}
+
+// CreateDir implements the FS interface.
+func (r *RocksDB) CreateDir(name string) error {
+	return statusToError(C.DBEnvCreateDir(r.rdb, goToCSlice([]byte(name))))
+}
+
+// DeleteDir implements the FS interface.
+func (r *RocksDB) DeleteDir(name string) error {
+	return statusToError(C.DBEnvDeleteDir(r.rdb, goToCSlice([]byte(name))))
+}
+
+// ListDir implements the FS interface.
+func (r *RocksDB) ListDir(name string) ([]string, error) {
+	list := C.DBEnvListDir(r.rdb, goToCSlice([]byte(name)))
+	n := list.n
+	names := list.names
+	// We can't index into names because it is a pointer, not a slice. The
+	// hackery below treats the pointer as an array and then constructs
+	// a slice from it.
+	nameSize := unsafe.Sizeof(C.DBString{})
+	nameVal := func(i int) C.DBString {
+		return *(*C.DBString)(unsafe.Pointer(uintptr(unsafe.Pointer(names)) + uintptr(i)*nameSize))
+	}
+	err := statusToError(list.status)
+	result := make([]string, n)
+	for i := range result {
+		result[i] = cStringToGoString(nameVal(i))
+	}
+	C.free(unsafe.Pointer(names))
+	return result, err
 }

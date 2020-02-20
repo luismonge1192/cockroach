@@ -21,13 +21,13 @@ import (
 )
 
 func init() {
-	RegisterCommand(roachpb.RefreshRange, DefaultDeclareKeys, RefreshRange)
+	RegisterReadOnlyCommand(roachpb.RefreshRange, DefaultDeclareKeys, RefreshRange)
 }
 
 // RefreshRange checks whether the key range specified has any values written in
 // the interval [args.RefreshFrom, header.Timestamp].
 func RefreshRange(
-	ctx context.Context, batch engine.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, reader engine.Reader, cArgs CommandArgs, resp roachpb.Response,
 ) (result.Result, error) {
 	args := cArgs.Args.(*roachpb.RefreshRangeRequest)
 	h := cArgs.Header
@@ -53,18 +53,19 @@ func RefreshRange(
 
 	// Iterate over values until we discover any value written at or after the
 	// original timestamp, but before or at the current timestamp. Note that we
-	// iterate inconsistently without using the txn. This reads only committed
-	// values and returns all intents, including those from the txn itself. Note
-	// that we include tombstones, which must be considered as updates on refresh.
+	// iterate inconsistently, meaning that intents - including our own - are
+	// collected separately and the callback is only invoked on the latest
+	// committed version. Note also that we include tombstones, which must be
+	// considered as updates on refresh.
 	log.VEventf(ctx, 2, "refresh %s @[%s-%s]", args.Span(), refreshFrom, refreshTo)
 	intents, err := engine.MVCCIterate(
-		ctx, batch, args.Key, args.EndKey, refreshTo,
+		ctx, reader, args.Key, args.EndKey, refreshTo,
 		engine.MVCCScanOptions{
 			Inconsistent: true,
 			Tombstones:   true,
 		},
 		func(kv roachpb.KeyValue) (bool, error) {
-			if ts := kv.Value.Timestamp; !ts.Less(refreshFrom) {
+			if ts := kv.Value.Timestamp; refreshFrom.LessEq(ts) {
 				return true, errors.Errorf("encountered recently written key %s @%s", kv.Key, ts)
 			}
 			return false, nil

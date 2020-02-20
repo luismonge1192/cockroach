@@ -11,32 +11,22 @@
     $left:*
     $right:*
     $on:*
-    $private:* & (NoJoinHints $private)
+    $private:*
 )
 =>
-((OpName) $right $left $on $private)
+((OpName) $right $left $on (CommuteJoinFlags $private))
 
 # CommuteLeftJoin creates a Join with the left and right inputs swapped.
+# This is symmetric with the CommuteRightJoin normalization rule.
 [CommuteLeftJoin, Explore]
 (LeftJoin
     $left:*
     $right:*
     $on:*
-    $private:* & (NoJoinHints $private)
+    $private:*
 )
 =>
-(RightJoin $right $left $on $private)
-
-# CommuteRightJoin creates a Join with the left and right inputs swapped.
-[CommuteRightJoin, Explore]
-(RightJoin
-    $left:*
-    $right:*
-    $on:*
-    $private:* & (NoJoinHints $private)
-)
-=>
-(LeftJoin $right $left $on $private)
+(RightJoin $right $left $on (CommuteJoinFlags $private))
 
 # CommuteSemiJoin generates an InnerJoin that is equivalent to the SemiJoin.
 # SemiJoins impose a partial order on the joining tables. We can convert a
@@ -125,9 +115,15 @@
 # constant values in the filters. See comments in GenerateZigzagJoin and
 # distsqlrun/zigzagjoiner.go for more details on when a zigzag join can be
 # planned.
+#
+# Zigzag joins are prohibited when the source Scan operator has been configured
+# with a row-level locking mode. This is mostly out of convenience so that these
+# row-level locking modes don't need to added to the ZigzagJoin operator. There
+# doesn't seem to be a strong reason to support this, but if one comes up, it
+# should be possible to lift this restriction.
 [GenerateZigzagJoins, Explore]
 (Select
-    (Scan $scan:*) & (IsCanonicalScan $scan)
+    (Scan $scan:*) & (IsCanonicalScan $scan) & ^(IsLocking $scan)
     $filters:*
 )
 =>
@@ -139,9 +135,15 @@
 # row in the primary index could generate multiple inverted index keys. This
 # property can be exploited by zigzag joining on the same inverted index, fixed
 # at any two of the JSON paths we are querying for.
+#
+# Zigzag joins are prohibited when the source Scan operator has been configured
+# with a row-level locking mode. This is mostly out of convenience so that these
+# row-level locking modes don't need to added to the ZigzagJoin operator. There
+# doesn't seem to be a strong reason to support this, but if one comes up, it
+# should be possible to lift this restriction.
 [GenerateInvertedIndexZigzagJoins, Explore]
 (Select
-    (Scan $scan:*) & (IsCanonicalScan $scan) & (HasInvertedIndexes $scan)
+    (Scan $scan:*) & (IsCanonicalScan $scan) & ^(IsLocking $scan) & (HasInvertedIndexes $scan)
     $filters:*
 )
 =>

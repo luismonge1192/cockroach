@@ -47,7 +47,7 @@ function shouldProxy(reqPath) {
 }
 
 // tslint:disable:object-literal-sort-keys
-module.exports = (env) => {
+module.exports = (env, argv) => {
   let localRoots = [path.resolve(__dirname)];
   if (env.dist === "ccl") {
     // CCL modules shadow OSS modules.
@@ -60,6 +60,8 @@ module.exports = (env) => {
       filename: "bundle.js",
       path: path.resolve(__dirname, `dist${env.dist}`),
     },
+
+    mode: argv.mode || "production",
 
     resolve: {
       // Add resolvable extensions.
@@ -110,8 +112,9 @@ module.exports = (env) => {
           use: ["cache-loader", "babel-loader"],
         },
         {
-          test: /\.tsx?$/,
+          test: /\.(ts|tsx)?$/,
           include: localRoots,
+          exclude: /\/node_modules/,
           use: [
             "cache-loader",
             "babel-loader",
@@ -120,7 +123,13 @@ module.exports = (env) => {
         },
 
         // All output ".js" files will have any sourcemaps re-processed by "source-map-loader".
-        { enforce: "pre", test: /\.js$/, loader: "source-map-loader" },
+        {
+          enforce: "pre",
+          test: /\.js$/,
+          loader: "source-map-loader",
+          include: localRoots,
+          exclude: /\/node_modules/,
+        },
       ],
     },
 
@@ -128,9 +137,11 @@ module.exports = (env) => {
       new RemoveBrokenDependenciesPlugin(),
       // See "DLLs for speedy builds" in the README for details.
       new webpack.DllReferencePlugin({
+        context: path.resolve(__dirname, `dist${env.dist}`),
         manifest: require(`./protos.${env.dist}.manifest.json`),
       }),
       new webpack.DllReferencePlugin({
+        context: path.resolve(__dirname, `dist${env.dist}`),
         manifest: require("./vendor.oss.manifest.json"),
       }),
       new CopyWebpackPlugin([{ from: "favicon.ico", to: "favicon.ico" }]),
@@ -138,30 +149,29 @@ module.exports = (env) => {
       new VisualizerPlugin({ filename: `../dist/stats.${env.dist}.html` }),
     ],
 
-    // https://webpack.js.org/configuration/stats/
-    stats: {
-      colors: true,
-      chunks: false,
-    },
+    stats: "errors-only",
 
     devServer: {
       contentBase: path.join(__dirname, `dist${env.dist}`),
       index: "",
       proxy: {
-        // Note: this shouldn't require a custom bypass function to work;
-        // docs say that setting `index: ''` is sufficient to proxy `/`.
-        // However, that did not work, and may require upgrading to webpack 4.x.
         "/": {
           secure: false,
           target: process.env.TARGET,
-          bypass: (req) => {
-            if (shouldProxy(req.path)) {
-              return false;
-            }
-            return req.path;
-          },
         },
       },
+    },
+
+    watchOptions: {
+      poll: 1000,
+      ignored: /node_modules/,
+    },
+
+    // Max size of is set to 4Mb to disable warning message and control
+    // the growing size of bundle over time.
+    performance: {
+      maxEntrypointSize: 4000000,
+      maxAssetSize: 4000000,
     },
   };
 };

@@ -802,11 +802,11 @@ scalar-group-by
  │    └── scan kv
  │         └── columns: k:1(int!null) v:2(int) w:3(int) s:4(string)
  └── aggregations
-      ├── count [type=int]
-      │    └── agg-distinct [type=int]
+      ├── agg-distinct [type=int]
+      │    └── count [type=int]
       │         └── variable: k [type=int]
-      └── count [type=int]
-           └── agg-distinct [type=int]
+      └── agg-distinct [type=int]
+           └── count [type=int]
                 └── variable: v [type=int]
 
 build
@@ -823,11 +823,11 @@ group-by
  │         └── function: upper [type=string]
  │              └── variable: s [type=string]
  └── aggregations
-      ├── count [type=int]
-      │    └── agg-distinct [type=int]
+      ├── agg-distinct [type=int]
+      │    └── count [type=int]
       │         └── variable: k [type=int]
-      └── count [type=int]
-           └── agg-distinct [type=int]
+      └── agg-distinct [type=int]
+           └── count [type=int]
                 └── variable: v [type=int]
 
 build
@@ -861,8 +861,8 @@ scalar-group-by
  │              ├── variable: k [type=int]
  │              └── variable: v [type=int]
  └── aggregations
-      └── count [type=int]
-           └── agg-distinct [type=tuple{int, int}]
+      └── agg-distinct [type=int]
+           └── count [type=int]
                 └── variable: column5 [type=tuple{int, int}]
 
 build
@@ -879,8 +879,8 @@ scalar-group-by
  │              ├── variable: k [type=int]
  │              └── variable: v [type=int]
  └── aggregations
-      └── count [type=int]
-           └── agg-distinct [type=tuple{int, int}]
+      └── agg-distinct [type=int]
+           └── count [type=int]
                 └── variable: column5 [type=tuple{int, int}]
 
 build
@@ -889,7 +889,7 @@ SELECT count(*) FROM kv a, kv b
 scalar-group-by
  ├── columns: count:9(int)
  ├── project
- │    └── inner-join (hash)
+ │    └── inner-join (cross)
  │         ├── columns: a.k:1(int!null) a.v:2(int) a.w:3(int) a.s:4(string) b.k:5(int!null) b.v:6(int) b.w:7(int) b.s:8(string)
  │         ├── scan a
  │         │    └── columns: a.k:1(int!null) a.v:2(int) a.w:3(int) a.s:4(string)
@@ -1144,7 +1144,7 @@ SELECT avg(k::decimal), avg(v::decimal), sum(k::decimal), sum(v::decimal) FROM k
 scalar-group-by
  ├── columns: avg:6(decimal) avg:8(decimal) sum:9(decimal) sum:10(decimal)
  ├── project
- │    ├── columns: column5:5(decimal) column7:7(decimal)
+ │    ├── columns: column5:5(decimal!null) column7:7(decimal)
  │    ├── scan kv
  │    │    └── columns: k:1(int!null) v:2(int) w:3(int) s:4(string)
  │    └── projections
@@ -1172,17 +1172,17 @@ scalar-group-by
  │    └── scan kv
  │         └── columns: k:1(int!null) v:2(int) w:3(int) s:4(string)
  └── aggregations
-      ├── avg [type=decimal]
-      │    └── agg-distinct [type=int]
+      ├── agg-distinct [type=decimal]
+      │    └── avg [type=decimal]
       │         └── variable: k [type=int]
-      ├── avg [type=decimal]
-      │    └── agg-distinct [type=int]
+      ├── agg-distinct [type=decimal]
+      │    └── avg [type=decimal]
       │         └── variable: v [type=int]
-      ├── sum [type=decimal]
-      │    └── agg-distinct [type=int]
+      ├── agg-distinct [type=decimal]
+      │    └── sum [type=decimal]
       │         └── variable: k [type=int]
-      └── sum [type=decimal]
-           └── agg-distinct [type=int]
+      └── agg-distinct [type=decimal]
+           └── sum [type=decimal]
                 └── variable: v [type=int]
 
 build
@@ -1597,7 +1597,7 @@ project
  ├── scalar-group-by
  │    ├── columns: avg:2(decimal) avg:4(float) avg:6(decimal)
  │    ├── project
- │    │    ├── columns: column1:1(int) column3:3(float) column5:5(decimal)
+ │    │    ├── columns: column1:1(int!null) column3:3(float!null) column5:5(decimal!null)
  │    │    ├── values
  │    │    │    └── tuple [type=tuple]
  │    │    └── projections
@@ -1628,7 +1628,7 @@ SELECT count(2::int), count(3::float), count(4::decimal)
 scalar-group-by
  ├── columns: count:2(int) count:4(int) count:6(int)
  ├── project
- │    ├── columns: column1:1(int) column3:3(float) column5:5(decimal)
+ │    ├── columns: column1:1(int!null) column3:3(float!null) column5:5(decimal!null)
  │    ├── values
  │    │    └── tuple [type=tuple]
  │    └── projections
@@ -1652,7 +1652,7 @@ SELECT sum(1::int), sum(2::float), sum(3::decimal)
 scalar-group-by
  ├── columns: sum:2(decimal) sum:4(float) sum:6(decimal)
  ├── project
- │    ├── columns: column1:1(int) column3:3(float) column5:5(decimal)
+ │    ├── columns: column1:1(int!null) column3:3(float!null) column5:5(decimal!null)
  │    ├── values
  │    │    └── tuple [type=tuple]
  │    └── projections
@@ -1676,7 +1676,7 @@ SELECT variance(1::int), variance(1::float), variance(1::decimal)
 scalar-group-by
  ├── columns: variance:2(decimal) variance:4(float) variance:6(decimal)
  ├── project
- │    ├── columns: column1:1(int) column3:3(float) column5:5(decimal)
+ │    ├── columns: column1:1(int!null) column3:3(float!null) column5:5(decimal!null)
  │    ├── values
  │    │    └── tuple [type=tuple]
  │    └── projections
@@ -1700,7 +1700,7 @@ SELECT stddev(1::int), stddev(1::float), stddev(1::decimal)
 scalar-group-by
  ├── columns: stddev:2(decimal) stddev:4(float) stddev:6(decimal)
  ├── project
- │    ├── columns: column1:1(int) column3:3(float) column5:5(decimal)
+ │    ├── columns: column1:1(int!null) column3:3(float!null) column5:5(decimal!null)
  │    ├── values
  │    │    └── tuple [type=tuple]
  │    └── projections
@@ -1981,7 +1981,7 @@ project
  │    ├── grouping columns: a:1(int!null) b:2(int) x:3(string)
  │    ├── project
  │    │    ├── columns: a:1(int!null) b:2(int) x:3(string) y:4(string)
- │    │    └── inner-join (hash)
+ │    │    └── inner-join (cross)
  │    │         ├── columns: a:1(int!null) b:2(int) x:3(string) y:4(string) rowid:5(int!null)
  │    │         ├── scan ab
  │    │         │    └── columns: a:1(int!null) b:2(int)
@@ -2130,11 +2130,11 @@ project
  │    ├── grouping columns: b2.b:3(bool) column9:9(bool)
  │    └── project
  │         ├── columns: column9:9(bool) b2.b:3(bool)
- │         ├── inner-join (hash)
+ │         ├── inner-join (cross)
  │         │    ├── columns: b1.b:1(bool) b1.rowid:2(int!null) b2.b:3(bool) b2.rowid:4(int!null) a:5(char!null) abc.b:6(float) c:7(bool) d:8(decimal)
  │         │    ├── scan b1
  │         │    │    └── columns: b1.b:1(bool) b1.rowid:2(int!null)
- │         │    ├── inner-join (hash)
+ │         │    ├── inner-join (cross)
  │         │    │    ├── columns: b2.b:3(bool) b2.rowid:4(int!null) a:5(char!null) abc.b:6(float) c:7(bool) d:8(decimal)
  │         │    │    ├── scan b2
  │         │    │    │    └── columns: b2.b:3(bool) b2.rowid:4(int!null)
@@ -2166,11 +2166,11 @@ project
  │    ├── grouping columns: b2.b:3(bool) column9:9(bool)
  │    └── project
  │         ├── columns: column9:9(bool) b2.b:3(bool)
- │         ├── inner-join (hash)
+ │         ├── inner-join (cross)
  │         │    ├── columns: b1.b:1(bool) b1.rowid:2(int!null) b2.b:3(bool) b2.rowid:4(int!null) a:5(char!null) abc.b:6(float) c:7(bool) d:8(decimal)
  │         │    ├── scan b1
  │         │    │    └── columns: b1.b:1(bool) b1.rowid:2(int!null)
- │         │    ├── inner-join (hash)
+ │         │    ├── inner-join (cross)
  │         │    │    ├── columns: b2.b:3(bool) b2.rowid:4(int!null) a:5(char!null) abc.b:6(float) c:7(bool) d:8(decimal)
  │         │    │    ├── scan b2
  │         │    │    │    └── columns: b2.b:3(bool) b2.rowid:4(int!null)
@@ -2223,7 +2223,7 @@ project
  │    ├── grouping columns: a:5(char!null) column9:9(string)
  │    └── project
  │         ├── columns: column9:9(string) a:5(char!null)
- │         ├── inner-join (hash)
+ │         ├── inner-join (cross)
  │         │    ├── columns: k:1(int!null) v:2(int) w:3(int) s:4(string) a:5(char!null) b:6(float) c:7(bool) d:8(decimal)
  │         │    ├── scan kv
  │         │    │    └── columns: k:1(int!null) v:2(int) w:3(int) s:4(string)
@@ -2286,7 +2286,7 @@ project
  │    ├── grouping columns: b.baz:5(jsonb) column7:7(bool)
  │    └── project
  │         ├── columns: column7:7(bool) b.baz:5(jsonb)
- │         ├── inner-join (hash)
+ │         ├── inner-join (cross)
  │         │    ├── columns: a.bar:1(jsonb) a.baz:2(jsonb) a.rowid:3(int!null) b.bar:4(jsonb) b.baz:5(jsonb) b.rowid:6(int!null)
  │         │    ├── scan a
  │         │    │    └── columns: a.bar:1(jsonb) a.baz:2(jsonb) a.rowid:3(int!null)
@@ -2319,7 +2319,7 @@ project
  │    ├── grouping columns: b.baz:5(jsonb) column7:7(bool)
  │    └── project
  │         ├── columns: column7:7(bool) b.baz:5(jsonb)
- │         ├── inner-join (hash)
+ │         ├── inner-join (cross)
  │         │    ├── columns: a.bar:1(jsonb) a.baz:2(jsonb) a.rowid:3(int!null) b.bar:4(jsonb) b.baz:5(jsonb) b.rowid:6(int!null)
  │         │    ├── scan a
  │         │    │    └── columns: a.bar:1(jsonb) a.baz:2(jsonb) a.rowid:3(int!null)
@@ -2352,7 +2352,7 @@ project
  │    ├── grouping columns: column3:3(interval) column4:4(interval)
  │    └── project
  │         ├── columns: column3:3(interval) column4:4(interval)
- │         ├── inner-join (hash)
+ │         ├── inner-join (cross)
  │         │    ├── columns: a.t:1(time!null) b.t:2(time!null)
  │         │    ├── scan a
  │         │    │    └── columns: a.t:1(time!null)
@@ -2476,10 +2476,10 @@ SELECT 1 + min(v*2) AS r FROM kv GROUP BY k+3
 project
  ├── columns: r:8(int)
  ├── group-by
- │    ├── columns: min:6(int) column7:7(int)
- │    ├── grouping columns: column7:7(int)
+ │    ├── columns: min:6(int) column7:7(int!null)
+ │    ├── grouping columns: column7:7(int!null)
  │    ├── project
- │    │    ├── columns: column5:5(int) column7:7(int)
+ │    │    ├── columns: column5:5(int) column7:7(int!null)
  │    │    ├── scan kv
  │    │    │    └── columns: k:1(int!null) v:2(int) w:3(int) s:4(string)
  │    │    └── projections
@@ -2541,7 +2541,7 @@ project
       ├── grouping columns: k:1(int!null) v:2(int) w:3(int) s:4(string)
       ├── project
       │    ├── columns: k:1(int!null) v:2(int) w:3(int) s:4(string) d:8(decimal!null)
-      │    └── inner-join (hash)
+      │    └── inner-join (cross)
       │         ├── columns: k:1(int!null) v:2(int) w:3(int) s:4(string) a:5(char!null) b:6(float) c:7(bool) d:8(decimal!null)
       │         ├── scan kv
       │         │    └── columns: k:1(int!null) v:2(int) w:3(int) s:4(string)
@@ -2565,8 +2565,8 @@ scalar-group-by
  │    └── scan abc
  │         └── columns: a:1(char!null) b:2(float) c:3(bool) d:4(decimal)
  └── aggregations
-      └── sum [type=decimal]
-           └── agg-distinct [type=decimal]
+      └── agg-distinct [type=decimal]
+           └── sum [type=decimal]
                 └── variable: d [type=decimal]
 
 # FILTER.
@@ -2585,11 +2585,10 @@ scalar-group-by
  │              ├── variable: d [type=decimal]
  │              └── const: 0 [type=decimal]
  └── aggregations
-      └── sum [type=decimal]
-           └── agg-filter [type=decimal]
-                ├── variable: d [type=decimal]
-                └── filter
-                     └── variable: column5 [type=bool]
+      └── agg-filter [type=decimal]
+           ├── sum [type=decimal]
+           │    └── variable: d [type=decimal]
+           └── variable: column5 [type=bool]
 
 # Ensure aggregates with FILTER coexist properly with non-FILTER aggregates.
 build
@@ -2610,20 +2609,18 @@ scalar-group-by
  │              ├── variable: y [type=int]
  │              └── const: 0 [type=int]
  └── aggregations
-      ├── sum [type=decimal]
-      │    └── agg-filter [type=int]
-      │         ├── variable: x [type=int]
-      │         └── filter
-      │              └── variable: column4 [type=bool]
-      ├── avg [type=float]
-      │    └── agg-distinct [type=float]
+      ├── agg-filter [type=decimal]
+      │    ├── sum [type=decimal]
+      │    │    └── variable: x [type=int]
+      │    └── variable: column4 [type=bool]
+      ├── agg-distinct [type=float]
+      │    └── avg [type=float]
       │         └── variable: z [type=float]
-      └── avg [type=float]
-           └── agg-filter [type=float]
-                ├── agg-distinct [type=float]
-                │    └── variable: z [type=float]
-                └── filter
-                     └── variable: column4 [type=bool]
+      └── agg-filter [type=float]
+           ├── agg-distinct [type=float]
+           │    └── avg [type=float]
+           │         └── variable: z [type=float]
+           └── variable: column4 [type=bool]
 
 # Ensure aggregates involving FILTER are deduplicated.
 build
@@ -2645,15 +2642,14 @@ scalar-group-by
  │              ├── variable: y [type=int]
  │              └── const: 0 [type=int]
  └── aggregations
-      ├── avg [type=decimal]
-      │    └── agg-distinct [type=int]
+      ├── agg-distinct [type=decimal]
+      │    └── avg [type=decimal]
       │         └── variable: x [type=int]
-      └── avg [type=decimal]
-           └── agg-filter [type=int]
-                ├── agg-distinct [type=int]
-                │    └── variable: x [type=int]
-                └── filter
-                     └── variable: column5 [type=bool]
+      └── agg-filter [type=decimal]
+           ├── agg-distinct [type=decimal]
+           │    └── avg [type=decimal]
+           │         └── variable: x [type=int]
+           └── variable: column5 [type=bool]
 
 build
 SELECT
@@ -2663,7 +2659,7 @@ FROM xyz
 scalar-group-by
  ├── columns: string_agg:7(string)
  ├── project
- │    ├── columns: column4:4(string) column5:5(string!null) column6:6(bool)
+ │    ├── columns: column4:4(string!null) column5:5(string!null) column6:6(bool)
  │    ├── scan xyz
  │    │    └── columns: x:1(int!null) y:2(int) z:3(float)
  │    └── projections
@@ -2674,12 +2670,11 @@ scalar-group-by
  │              ├── variable: y [type=int]
  │              └── const: 0 [type=int]
  └── aggregations
-      └── string-agg [type=string]
-           ├── agg-filter [type=string]
+      └── agg-filter [type=string]
+           ├── string-agg [type=string]
            │    ├── variable: column4 [type=string]
-           │    └── filter
-           │         └── variable: column6 [type=bool]
-           └── const: 'foo' [type=string]
+           │    └── const: 'foo' [type=string]
+           └── variable: column6 [type=bool]
 
 build
 SELECT y, count(*) FILTER (WHERE x > 5) FROM xyz GROUP BY y
@@ -2688,7 +2683,7 @@ group-by
  ├── columns: y:2(int) count:6(int)
  ├── grouping columns: y:2(int)
  ├── project
- │    ├── columns: column4:4(bool!null) column5:5(bool) y:2(int)
+ │    ├── columns: column4:4(bool!null) column5:5(bool!null) y:2(int)
  │    ├── scan xyz
  │    │    └── columns: x:1(int!null) y:2(int) z:3(float)
  │    └── projections
@@ -2697,11 +2692,10 @@ group-by
  │              ├── variable: x [type=int]
  │              └── const: 5 [type=int]
  └── aggregations
-      └── count [type=int]
-           └── agg-filter [type=bool]
-                ├── variable: column4 [type=bool]
-                └── filter
-                     └── variable: column5 [type=bool]
+      └── agg-filter [type=int]
+           ├── count [type=int]
+           │    └── variable: column4 [type=bool]
+           └── variable: column5 [type=bool]
 
 build
 SELECT y, count(*) FILTER (WHERE count(*) > 5) FROM xyz GROUP BY y
@@ -2850,12 +2844,12 @@ build
 SELECT max((k+v)/(k-v)) AS r, (k+v)*(k-v) AS s FROM kv GROUP BY k+v, (k+v)/(k-v), (k+v)*(k-v)
 ----
 project
- ├── columns: r:6(decimal) s:8(int)
+ ├── columns: r:6(decimal) s:9(int)
  └── group-by
-      ├── columns: column5:5(decimal) max:6(decimal) column7:7(int) column8:8(int)
-      ├── grouping columns: column5:5(decimal) column7:7(int) column8:8(int)
+      ├── columns: max:6(decimal) column7:7(int) column8:8(decimal) column9:9(int)
+      ├── grouping columns: column7:7(int) column8:8(decimal) column9:9(int)
       ├── project
-      │    ├── columns: column5:5(decimal) column7:7(int) column8:8(int)
+      │    ├── columns: column5:5(decimal) column7:7(int) column8:8(decimal) column9:9(int)
       │    ├── scan kv
       │    │    └── columns: k:1(int!null) v:2(int) w:3(int) s:4(string)
       │    └── projections
@@ -2869,6 +2863,13 @@ project
       │         ├── plus [type=int]
       │         │    ├── variable: k [type=int]
       │         │    └── variable: v [type=int]
+      │         ├── div [type=decimal]
+      │         │    ├── plus [type=int]
+      │         │    │    ├── variable: k [type=int]
+      │         │    │    └── variable: v [type=int]
+      │         │    └── minus [type=int]
+      │         │         ├── variable: k [type=int]
+      │         │         └── variable: v [type=int]
       │         └── mult [type=int]
       │              ├── plus [type=int]
       │              │    ├── variable: k [type=int]
@@ -2920,10 +2921,10 @@ scalar-group-by
  │    └── projections
  │         └── const: 'separator' [type=string]
  └── aggregations
-      └── string-agg [type=string]
-           ├── agg-distinct [type=string]
-           │    └── variable: s [type=string]
-           └── const: 'separator' [type=string]
+      └── agg-distinct [type=string]
+           └── string-agg [type=string]
+                ├── variable: s [type=string]
+                └── const: 'separator' [type=string]
 
 build
 SELECT max(s), string_agg(s, 'sep1'), string_agg(s, 'sep2'), min(s) FROM kv
@@ -2984,7 +2985,7 @@ scalar-group-by
            └── null [type=unknown]
 
 build
-SELECT string_agg('foo', s) FROM kv
+SELECT string_agg(s, s) FROM kv
 ----
 error (0A000): unimplemented: aggregate functions with multiple non-constant expressions are not supported
 
@@ -3084,7 +3085,7 @@ group-by
  ├── columns: firstcol:1(int!null) secondcol:2(int) thirdcol:2(int)
  ├── grouping columns: t.public.xyz.x:1(int!null) t.public.xyz.y:2(int)
  ├── stats: [rows=991, distinct(1,2)=991, null(1,2)=10]
- ├── cost: 1109.95
+ ├── cost: 1109.96
  ├── key: (1)
  ├── fd: (1)-->(2)
  ├── interesting orderings: (+1,+2)
@@ -3672,7 +3673,7 @@ SELECT abxy.*, ab.* FROM abxy, ab GROUP BY abxy.a, abxy.b, ab.a
 group-by
  ├── columns: a:1(int!null) b:2(int!null) x:3(int) y:4(int) a:5(int!null) b:6(int)
  ├── grouping columns: abxy.a:1(int!null) abxy.b:2(int!null) x:3(int) y:4(int) ab.a:5(int!null) ab.b:6(int)
- └── inner-join (hash)
+ └── inner-join (cross)
       ├── columns: abxy.a:1(int!null) abxy.b:2(int!null) x:3(int) y:4(int) ab.a:5(int!null) ab.b:6(int)
       ├── scan abxy
       │    └── columns: abxy.a:1(int!null) abxy.b:2(int!null) x:3(int) y:4(int)
@@ -3733,6 +3734,12 @@ project
                      └── eq [type=bool]
                           ├── variable: k [type=int]
                           └── variable: a [type=int]
+
+# Verify that we handle tables with no primary index (#44659).
+build
+SELECT table_schema FROM information_schema.columns GROUP BY table_name
+----
+error (42803): column "table_schema" must appear in the GROUP BY clause or be used in an aggregate function
 
 # Tests with aliases (see #28059).
 build

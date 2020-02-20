@@ -14,24 +14,24 @@ ORDER BY y
 LIMIT 10
 ----
 limit
- ├── columns: y:2(int!null) x:3(string!null) c:5(int)
+ ├── columns: y:2(int!null) x:3(string!null) c:5(int!null)
  ├── internal-ordering: +2
  ├── cardinality: [0 - 10]
  ├── fd: (2)-->(5)
  ├── ordering: +2
  ├── sort
- │    ├── columns: y:2(int!null) b.x:3(string!null) c:5(int)
+ │    ├── columns: y:2(int!null) b.x:3(string!null) c:5(int!null)
  │    ├── fd: (2)-->(5)
  │    ├── ordering: +2
  │    ├── limit hint: 10.00
  │    └── project
- │         ├── columns: c:5(int) y:2(int!null) b.x:3(string!null)
+ │         ├── columns: c:5(int!null) y:2(int!null) b.x:3(string!null)
  │         ├── fd: (2)-->(5)
  │         ├── select
  │         │    ├── columns: a.x:1(int!null) y:2(int!null) b.x:3(string!null) z:4(decimal!null)
  │         │    ├── key: (1,3)
  │         │    ├── fd: (1)-->(2), (3)-->(4)
- │         │    ├── inner-join (hash)
+ │         │    ├── inner-join (cross)
  │         │    │    ├── columns: a.x:1(int!null) y:2(int) b.x:3(string!null) z:4(decimal!null)
  │         │    │    ├── key: (1,3)
  │         │    │    ├── fd: (1)-->(2), (3)-->(4)
@@ -67,7 +67,7 @@ ORDER BY y
 LIMIT 10
 ----
 project
- ├── columns: y:2(int!null) x:3(string!null) c:6(int)
+ ├── columns: y:2(int!null) x:3(string!null) c:6(int!null)
  ├── cardinality: [0 - 10]
  ├── fd: (2)-->(6)
  ├── ordering: +2
@@ -89,7 +89,7 @@ project
  │    │         │    ├── columns: b.x:3(string!null)
  │    │         │    └── key: (3)
  │    │         ├── project
- │    │         │    ├── columns: column5:5(string) y:2(int!null)
+ │    │         │    ├── columns: column5:5(string!null) y:2(int!null)
  │    │         │    ├── select
  │    │         │    │    ├── columns: a.x:1(int!null) y:2(int!null)
  │    │         │    │    ├── key: (1)
@@ -122,7 +122,7 @@ WHERE a.y>1 AND a.x::string=b.x
 ORDER BY y
 LIMIT 10
 ----
-memo (optimized, ~17KB, required=[presentation: y:2,x:3,c:6] [ordering: +2])
+memo (optimized, ~18KB, required=[presentation: y:2,x:3,c:6] [ordering: +2])
  ├── G1: (project G2 G3 y x)
  │    ├── [presentation: y:2,x:3,c:6] [ordering: +2]
  │    │    ├── best: (project G2="[ordering: +2]" G3 y x)
@@ -293,7 +293,7 @@ memo (optimized, ~3KB, required=[presentation: array_agg:3])
  ├── G1: (scalar-group-by G2 G3 cols=())
  │    └── [presentation: array_agg:3]
  │         ├── best: (scalar-group-by G2 G3 cols=())
- │         └── cost: 1040.04
+ │         └── cost: 1040.05
  ├── G2: (scan a,cols=(1))
  │    └── []
  │         ├── best: (scan a,cols=(1))
@@ -309,11 +309,11 @@ memo (optimized, ~3KB, required=[presentation: array_agg:3])
  ├── G1: (project G2 G3 array_agg)
  │    └── [presentation: array_agg:3]
  │         ├── best: (project G2 G3 array_agg)
- │         └── cost: 1072.04
+ │         └── cost: 1072.05
  ├── G2: (group-by G4 G5 cols=(2))
  │    └── []
  │         ├── best: (group-by G4 G5 cols=(2))
- │         └── cost: 1071.03
+ │         └── cost: 1071.04
  ├── G3: (projections)
  ├── G4: (scan a)
  │    └── []
@@ -330,7 +330,7 @@ memo (optimized, ~2KB, required=[presentation: array_agg:3])
  ├── G1: (scalar-group-by G2 G3 cols=(),ordering=+2)
  │    └── [presentation: array_agg:3]
  │         ├── best: (scalar-group-by G2="[ordering: +2]" G3 cols=(),ordering=+2)
- │         └── cost: 1269.37
+ │         └── cost: 1269.38
  ├── G2: (scan a)
  │    ├── [ordering: +2]
  │    │    ├── best: (sort G2)
@@ -345,11 +345,11 @@ memo (optimized, ~2KB, required=[presentation: array_agg:3])
 memo
 SELECT DISTINCT field FROM [EXPLAIN SELECT 123 AS k]
 ----
-memo (optimized, ~8KB, required=[presentation: field:6])
+memo (optimized, ~9KB, required=[presentation: field:6])
  ├── G1: (distinct-on G2 G3 cols=(6))
  │    └── [presentation: field:6]
  │         ├── best: (distinct-on G2 G3 cols=(6))
- │         └── cost: 0.46
+ │         └── cost: 0.56
  ├── G2: (project G4 G5)
  │    └── []
  │         ├── best: (project G4 G5)
@@ -377,7 +377,7 @@ memo (optimized, ~6KB, required=[presentation: tag:11])
  ├── G1: (distinct-on G2 G3 cols=(11))
  │    └── [presentation: tag:11]
  │         ├── best: (distinct-on G2 G3 cols=(11))
- │         └── cost: 0.44
+ │         └── cost: 0.54
  ├── G2: (project G4 G5)
  │    └── []
  │         ├── best: (project G4 G5)

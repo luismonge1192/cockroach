@@ -13,22 +13,31 @@ package storage
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/batcheval/result"
+	"github.com/cockroachdb/cockroach/pkg/storage/spanlatch"
 	"github.com/cockroachdb/cockroach/pkg/storage/spanset"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/kr/pretty"
 )
 
-// executeReadOnlyBatch updates the read timestamp cache and waits for any
-// overlapping writes currently processing through Raft ahead of us to
-// clear via the latches.
+// executeReadOnlyBatch is the execution logic for client requests which do not
+// mutate the range's replicated state. The method uses a single RocksDB
+// iterator to evaluate the batch and then updates the timestamp cache to
+// reflect the key spans that it read.
 func (r *Replica) executeReadOnlyBatch(
-	ctx context.Context, ba *roachpb.BatchRequest,
+	ctx context.Context, ba *roachpb.BatchRequest, spans *spanset.SpanSet, lg *spanlatch.Guard,
 ) (br *roachpb.BatchResponse, pErr *roachpb.Error) {
+	// Guarantee we release the provided latches. This is wrapped to delay pErr
+	// evaluation to its value when returning.
+	ec := endCmds{repl: r, lg: lg}
+	defer func() {
+		ec.done(ctx, ba, br, pErr)
+	}()
+
 	// If the read is not inconsistent, the read requires the range lease or
 	// permission to serve via follower reads.
 	var status storagepb.LeaseStatus
@@ -42,67 +51,61 @@ func (r *Replica) executeReadOnlyBatch(
 	}
 	r.limitTxnMaxTimestamp(ctx, ba, status)
 
-	spans, err := r.collectSpans(ba)
-	if err != nil {
-		return nil, roachpb.NewError(err)
-	}
-
-	// Acquire latches to prevent overlapping commands from executing
-	// until this command completes.
-	log.Event(ctx, "acquire latches")
-	ec, err := r.beginCmds(ctx, ba, spans)
-	if err != nil {
-		return nil, roachpb.NewError(err)
-	}
-
 	log.Event(ctx, "waiting for read lock")
 	r.readOnlyCmdMu.RLock()
 	defer r.readOnlyCmdMu.RUnlock()
 
-	// Guarantee we release the latches that we just acquired. It is
-	// important that this is inside the readOnlyCmdMu lock so that the
-	// timestamp cache update is synchronized. This is wrapped to delay
-	// pErr evaluation to its value when returning.
-	defer func() {
-		ec.done(ba, br, pErr)
-	}()
-
-	// TODO(nvanbenschoten): Can this be moved into Replica.requestCanProceed?
-	if _, err := r.IsDestroyed(); err != nil {
+	// Verify that the batch can be executed.
+	if err := r.checkExecutionCanProceed(ba, ec.lg, &status); err != nil {
 		return nil, roachpb.NewError(err)
 	}
 
-	rSpan, err := keys.Range(ba.Requests)
-	if err != nil {
-		return nil, roachpb.NewError(err)
-	}
-
-	if err := r.requestCanProceed(rSpan, ba.Timestamp); err != nil {
-		return nil, roachpb.NewError(err)
-	}
-
-	// Evaluate read-only batch command. It checks for matching key range; note
-	// that holding readOnlyCmdMu throughout is important to avoid reads from the
-	// "wrong" key range being served after the range has been split.
+	// Evaluate read-only batch command.
 	var result result.Result
 	rec := NewReplicaEvalContext(r, spans)
-	readOnly := r.store.Engine().NewReadOnly()
+
+	// TODO(irfansharif): It's unfortunate that in this read-only code path,
+	// we're stuck with a ReadWriter because of the way evaluateBatch is
+	// designed.
+	rw := r.store.Engine().NewReadOnly()
 	if util.RaceEnabled {
-		readOnly = spanset.NewReadWriterAt(readOnly, spans, ba.Timestamp)
+		rw = spanset.NewReadWriterAt(rw, spans, ba.Timestamp)
 	}
-	defer readOnly.Close()
-	br, result, pErr = evaluateBatch(ctx, storagebase.CmdIDKey(""), readOnly, rec, nil, ba, true /* readOnly */)
+	defer rw.Close()
+	br, result, pErr = evaluateBatch(ctx, storagebase.CmdIDKey(""), rw, rec, nil, ba, true /* readOnly */)
+	if err := r.handleReadOnlyLocalEvalResult(ctx, ba, result.Local); err != nil {
+		pErr = roachpb.NewError(err)
+	}
 
-	// A merge is (likely) about to be carried out, and this replica
-	// needs to block all traffic until the merge either commits or
-	// aborts. See docs/tech-notes/range-merges.md.
-	if result.Local.DetachMaybeWatchForMerge() {
+	if pErr != nil {
+		log.VErrEvent(ctx, 3, pErr.String())
+	} else {
+		log.Event(ctx, "read completed")
+	}
+	return br, pErr
+}
+
+func (r *Replica) handleReadOnlyLocalEvalResult(
+	ctx context.Context, ba *roachpb.BatchRequest, lResult result.LocalResult,
+) error {
+	// Fields for which no action is taken in this method are zeroed so that
+	// they don't trigger an assertion at the end of the method (which checks
+	// that all fields were handled).
+	{
+		lResult.Reply = nil
+	}
+
+	if lResult.MaybeWatchForMerge {
+		// A merge is (likely) about to be carried out, and this replica needs
+		// to block all traffic until the merge either commits or aborts. See
+		// docs/tech-notes/range-merges.md.
 		if err := r.maybeWatchForMerge(ctx); err != nil {
-			return nil, roachpb.NewError(err)
+			return err
 		}
+		lResult.MaybeWatchForMerge = false
 	}
 
-	if intents := result.Local.DetachIntents(); len(intents) > 0 {
+	if intents := lResult.DetachEncounteredIntents(); len(intents) > 0 {
 		log.Eventf(ctx, "submitting %d intents to asynchronous processing", len(intents))
 		// We only allow synchronous intent resolution for consistent requests.
 		// Intent resolution is async/best-effort for inconsistent requests.
@@ -117,10 +120,9 @@ func (r *Replica) executeReadOnlyBatch(
 			log.Warning(ctx, err)
 		}
 	}
-	if pErr != nil {
-		log.VErrEvent(ctx, 3, pErr.String())
-	} else {
-		log.Event(ctx, "read completed")
+
+	if !lResult.IsZero() {
+		log.Fatalf(ctx, "unhandled field in LocalEvalResult: %s", pretty.Diff(lResult, result.LocalResult{}))
 	}
-	return br, pErr
+	return nil
 }

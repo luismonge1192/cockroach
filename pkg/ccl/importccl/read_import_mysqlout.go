@@ -32,12 +32,13 @@ type mysqloutfileReader struct {
 var _ inputConverter = &mysqloutfileReader{}
 
 func newMysqloutfileReader(
+	ctx context.Context,
 	kvCh chan row.KVBatch,
 	opts roachpb.MySQLOutfileOptions,
 	tableDesc *sqlbase.TableDescriptor,
 	evalCtx *tree.EvalContext,
 ) (*mysqloutfileReader, error) {
-	conv, err := row.NewDatumRowConverter(tableDesc, nil /* targetColNames */, evalCtx, kvCh)
+	conv, err := row.NewDatumRowConverter(ctx, tableDesc, nil /* targetColNames */, evalCtx, kvCh)
 	if err != nil {
 		return nil, err
 	}
@@ -71,6 +72,9 @@ func (d *mysqloutfileReader) readFile(
 	d.conv.KvBatch.Source = inputIdx
 	d.conv.FractionFn = input.ReadFraction
 	var count int64 = 1
+	d.conv.CompletedRowFn = func() int64 {
+		return count
+	}
 
 	var row []tree.Datum
 	var savedRow []rune
@@ -146,7 +150,11 @@ func (d *mysqloutfileReader) readFile(
 		} else if (!d.opts.HasEscape && field == "NULL") || d.opts.NullEncoding != nil && field == *d.opts.NullEncoding {
 			row = append(row, tree.DNull)
 		} else {
-			datum, err := tree.ParseStringAs(d.conv.VisibleColTypes[len(row)], field, d.conv.EvalCtx)
+			// This uses ParseDatumStringAsWithRawBytes instead of ParseDatumStringAs since mysql emits
+			// raw byte strings that do not use the same escaping as our ParseBytes
+			// function expects, and the difference between ParseStringAs and
+			// ParseDatumStringAs is whether or not it attempts to parse bytes.
+			datum, err := sqlbase.ParseDatumStringAsWithRawBytes(d.conv.VisibleColTypes[len(row)], field, d.conv.EvalCtx)
 			if err != nil {
 				col := d.conv.VisibleCols[len(row)]
 				return wrapRowErr(err, inputName, count, pgcode.Syntax,
@@ -177,6 +185,9 @@ func (d *mysqloutfileReader) readFile(
 			gotOffendingRow = true
 			return makeRowErr(inputName, count, pgcode.Syntax,
 				"unexpected number of columns, expected %d got %d: %#v", len(d.conv.VisibleCols), len(row), row)
+		}
+		if count <= resumePos {
+			return nil
 		}
 		copy(d.conv.Datums, row)
 		if err := d.conv.Row(ctx, inputIdx, count); err != nil {

@@ -10,18 +10,25 @@
 
 @require "~styl/base/palette.styl"
 @require "~styl/base/layout-vars.styl"
+@require '~src/components/core/index.styl'
 
 .page
   padding-top 0
 
   &>.section
-    padding 18px 24px
+    padding 18px 24px 0
 
   &> div > .section
-    padding 18px 24px
+    padding 18px 24px 0
 
 .database-summary-title h2
   padding-top 0
+
+.cluster-page
+  height 100%
+  display flex
+  flex-direction column
+  overflow hidden
 
 .cluster-overview
   .cluster-summary
@@ -31,6 +38,7 @@
     margin-left 24px
     margin-right 24px
     border 1px solid $table-border-color
+    font-family $font-family--base
 
     display grid
     align-items end
@@ -53,7 +61,8 @@
 
     .capacity-usage
       &.cluster-summary__title
-          grid-area cap-t
+        color $colors--title
+        grid-area cap-t
 
       &.cluster-summary__chart
           grid-area cap-c
@@ -84,7 +93,8 @@
 
     .node-liveness
       &.cluster-summary__title
-          grid-area live-t
+        color $colors--title
+        grid-area live-t
 
       &.cluster-summary__metric.live-nodes
           grid-area live-a
@@ -106,7 +116,8 @@
 
     .replication-status
       &.cluster-summary__title
-          grid-area rep-t
+        color $colors--title
+        grid-area rep-t
 
       &.cluster-summary__metric.total-ranges
           grid-area rep-a
@@ -142,7 +153,7 @@
     &__metric
       font-size 30px
       font-weight bold
-      color $link-color
+      color $colors--secondary-text
       white-space nowrap
       padding-right 12px
 
@@ -166,6 +177,7 @@
         color $alert-color
 
       &.storage-used, &.storage-usable
+        color $colors--link
         @media screen and (min-width: 960px) and (max-width: 1400px)
           font-size 14px
           line-height 16px
@@ -237,3 +249,10 @@
 
       &.bar
         fill $link-color
+
+
+.cluster-overview--fixed
+  flex-grow 1
+  position relative
+  margin $spacing-small $spacing-medium
+  overflow hidden

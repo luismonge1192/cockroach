@@ -5,7 +5,7 @@ EXPLAIN (PLAN) SELECT 1 FROM system.jobs WHERE FALSE
 ----
 tree    field        description
 ·       distributed  false
-·       vectorized   false
+·       vectorized   true
 norows  ·            ·
 
 query TTT colnames
@@ -13,7 +13,7 @@ EXPLAIN (PLAN) SELECT 1 FROM system.jobs WHERE NULL
 ----
 tree    field        description
 ·       distributed  false
-·       vectorized   false
+·       vectorized   true
 norows  ·            ·
 
 query TTT colnames
@@ -391,26 +391,26 @@ render                ·            ·            ("?column?")                  
 statement ok
 CREATE TABLE t (
   k INT PRIMARY KEY,
-  v INT
+  v INT,
+  FAMILY "primary" (k, v)
 )
 
 query TTT
 EXPLAIN INSERT INTO t VALUES (1, 2)
 ----
-·                 distributed  false
-·                 vectorized   false
-count             ·            ·
- └── insert       ·            ·
-      │           into         t(k, v)
-      │           strategy     inserter
-      │           auto commit  ·
-      └── values  ·            ·
-·                 size         2 columns, 1 row
+·                      distributed  false
+·                      vectorized   false
+count                  ·            ·
+ └── insert-fast-path  ·            ·
+·                      into         t(k, v)
+·                      strategy     inserter
+·                      auto commit  ·
+·                      size         2 columns, 1 row
 
 query I
 SELECT max(level) FROM [EXPLAIN (VERBOSE) INSERT INTO t VALUES (1, 2)]
 ----
-2
+1
 
 statement ok
 INSERT INTO t VALUES (1, 2)
@@ -546,18 +546,17 @@ sort             ·            ·           (a, b)              +b
 query TTTTT colnames
 EXPLAIN (TYPES) INSERT INTO t VALUES (1, 2)
 ----
-tree              field          description       columns                     ordering
-·                 distributed    false             ·                           ·
-·                 vectorized     false             ·                           ·
-count             ·              ·                 ()                          ·
- └── insert       ·              ·                 ()                          ·
-      │           into           t(k, v)           ·                           ·
-      │           strategy       inserter          ·                           ·
-      │           auto commit    ·                 ·                           ·
-      └── values  ·              ·                 (column1 int, column2 int)  ·
-·                 size           2 columns, 1 row  ·                           ·
-·                 row 0, expr 0  (1)[int]          ·                           ·
-·                 row 0, expr 1  (2)[int]          ·                           ·
+tree                   field          description       columns  ordering
+·                      distributed    false             ·        ·
+·                      vectorized     false             ·        ·
+count                  ·              ·                 ()       ·
+ └── insert-fast-path  ·              ·                 ()       ·
+·                      into           t(k, v)           ·        ·
+·                      strategy       inserter          ·        ·
+·                      auto commit    ·                 ·        ·
+·                      size           2 columns, 1 row  ·        ·
+·                      row 0, expr 0  (1)[int]          ·        ·
+·                      row 0, expr 1  (2)[int]          ·        ·
 
 query TTTTT
 EXPLAIN (TYPES) SELECT 42 AS a
@@ -623,7 +622,7 @@ query TTTTT
 EXPLAIN (TYPES) SELECT 2*count(k) as z, v FROM t WHERE v>123 GROUP BY v HAVING v<2 AND count(k)>1
 ----
 ·            distributed  false     ·               ·
-·            vectorized   false     ·               ·
+·            vectorized   true      ·               ·
 render       ·            ·         (z int, v int)  ·
  │           render 0     (z)[int]  ·               ·
  │           render 1     (v)[int]  ·               ·

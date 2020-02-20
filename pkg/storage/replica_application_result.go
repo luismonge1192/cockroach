@@ -14,6 +14,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/storage/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
@@ -56,9 +57,6 @@ func isTrivial(r *storagepb.ReplicatedEvalResult) bool {
 		if stateWhitelist.Stats != nil && (*stateWhitelist.Stats == enginepb.MVCCStats{}) {
 			stateWhitelist.Stats = nil
 		}
-		if stateWhitelist.DeprecatedTxnSpanGCThreshold != nil {
-			stateWhitelist.DeprecatedTxnSpanGCThreshold = nil
-		}
 		if stateWhitelist != (storagepb.ReplicaState{}) {
 			return false
 		}
@@ -92,10 +90,6 @@ func clearTrivialReplicatedEvalResultFields(r *storagepb.ReplicatedEvalResult) {
 	// replica state for this batch.
 	if haveState := r.State != nil; haveState {
 		r.State.Stats = nil
-
-		// Strip the DeprecatedTxnSpanGCThreshold. We don't care about it.
-		// TODO(nvanbenschoten): Remove in 20.1.
-		r.State.DeprecatedTxnSpanGCThreshold = nil
 		if *r.State == (storagepb.ReplicaState{}) {
 			r.State = nil
 		}
@@ -149,6 +143,7 @@ func (r *Replica) prepareLocalResult(ctx context.Context, cmd *replicatedCmd) {
 			// the proposal would be a user-visible error.
 			pErr = r.tryReproposeWithNewLeaseIndex(ctx, cmd)
 			if pErr != nil {
+				log.Warningf(ctx, "failed to repropose with new lease index: %s", pErr)
 				cmd.response.Err = pErr
 			} else {
 				// Unbind the entry's local proposal because we just succeeded
@@ -165,7 +160,7 @@ func (r *Replica) prepareLocalResult(ctx context.Context, cmd *replicatedCmd) {
 	} else {
 		log.Fatalf(ctx, "proposal must return either a reply or an error: %+v", cmd.proposal)
 	}
-	cmd.response.Intents = cmd.proposal.Local.DetachIntents()
+	cmd.response.EncounteredIntents = cmd.proposal.Local.DetachEncounteredIntents()
 	cmd.response.EndTxns = cmd.proposal.Local.DetachEndTxns(pErr != nil)
 	if pErr == nil {
 		cmd.localResult = cmd.proposal.Local
@@ -207,13 +202,33 @@ func (r *Replica) tryReproposeWithNewLeaseIndex(
 		// succeeding in the Raft log for a given command.
 		return nil
 	}
+
+	minTS, untrack := r.store.cfg.ClosedTimestamp.Tracker.Track(ctx)
+	defer untrack(ctx, 0, 0, 0) // covers all error paths below
+	// NB: p.Request.Timestamp reflects the action of ba.SetActiveTimestamp.
+	if p.Request.Timestamp.Less(minTS) {
+		// The tracker wants us to forward the request timestamp, but we can't
+		// do that without re-evaluating, so give up. The error returned here
+		// will go to back to DistSender, so send something it can digest.
+		lhErr := roachpb.NewError(newNotLeaseHolderError(
+			r.mu.state.Lease,
+			r.store.StoreID(),
+			r.mu.state.Desc,
+		))
+
+		return lhErr
+	}
 	// Some tests check for this log message in the trace.
 	log.VEventf(ctx, 2, "retry: proposalIllegalLeaseIndex")
+
 	maxLeaseIndex, pErr := r.propose(ctx, p)
 	if pErr != nil {
-		log.Warningf(ctx, "failed to repropose with new lease index: %s", pErr)
 		return pErr
 	}
+	// NB: The caller already promises that the lease check succeeded, meaning
+	// the sequence numbers match, implying that the lease epoch hasn't changed
+	// from what it was under the proposal-time lease.
+	untrack(ctx, ctpb.Epoch(r.mu.state.Lease.Epoch), r.RangeID, ctpb.LAI(maxLeaseIndex))
 	log.VEventf(ctx, 2, "reproposed command %x at maxLeaseIndex=%d", cmd.idKey, maxLeaseIndex)
 	return nil
 }
@@ -238,7 +253,7 @@ func (r *Replica) handleMergeResult(ctx context.Context, merge *storagepb.Merge)
 }
 
 func (r *Replica) handleDescResult(ctx context.Context, desc *roachpb.RangeDescriptor) {
-	r.setDesc(ctx, desc)
+	r.setDescRaftMuLocked(ctx, desc)
 }
 
 func (r *Replica) handleLeaseResult(ctx context.Context, lease *roachpb.Lease) {

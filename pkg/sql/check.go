@@ -27,11 +27,16 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+// validateCheckExpr verifies that the given CHECK expression returns true
+// for all the rows in the table.
+//
+// It operates entirely on the current goroutine and is thus able to
+// reuse an existing client.Txn safely.
 func validateCheckExpr(
 	ctx context.Context,
 	exprStr string,
 	tableDesc *sqlbase.TableDescriptor,
-	ie tree.SessionBoundInternalExecutor,
+	ie *InternalExecutor,
 	txn *client.Txn,
 ) error {
 	expr, err := parser.ParseExpr(exprStr)
@@ -41,7 +46,7 @@ func validateCheckExpr(
 	// Construct AST and then convert to a string, to avoid problems with escaping the check expression
 	tblref := tree.TableRef{TableID: int64(tableDesc.ID), As: tree.AliasClause{Alias: "t"}}
 	sel := &tree.SelectClause{
-		Exprs: sqlbase.ColumnsSelectors(tableDesc.Columns, false /* forUpdateOrDelete */),
+		Exprs: sqlbase.ColumnsSelectors(tableDesc.Columns),
 		From:  tree.From{Tables: []tree.TableExpr{&tblref}},
 		Where: &tree.Where{Type: tree.AstWhere, Expr: &tree.NotExpr{Expr: expr}},
 	}
@@ -50,7 +55,9 @@ func validateCheckExpr(
 	queryStr := tree.AsStringWithFlags(stmt, tree.FmtParsable)
 	log.Infof(ctx, "Validating check constraint %q with query %q", expr.String(), queryStr)
 
-	rows, err := ie.QueryRow(ctx, "validate check constraint", txn, queryStr)
+	rows, err := ie.QueryRowEx(ctx, "validate check constraint", txn,
+		sqlbase.InternalExecutorSessionDataOverride{},
+		queryStr)
 	if err != nil {
 		return err
 	}
@@ -219,11 +226,16 @@ func nonMatchingRowQuery(
 	), originColNames, nil
 }
 
+// validateForeignKey verifies that all the rows in the srcTable
+// have a matching row in their referenced table.
+//
+// It operates entirely on the current goroutine and is thus able to
+// reuse an existing client.Txn safely.
 func validateForeignKey(
 	ctx context.Context,
 	srcTable *sqlbase.TableDescriptor,
 	fk *sqlbase.ForeignKeyConstraint,
-	ie tree.SessionBoundInternalExecutor,
+	ie *InternalExecutor,
 	txn *client.Txn,
 ) error {
 	targetTable, err := sqlbase.GetTableDescFromID(ctx, txn, fk.ReferencedTableID)
@@ -256,7 +268,9 @@ func validateForeignKey(
 			query,
 		)
 
-		values, err := ie.QueryRow(ctx, "validate foreign key constraint", txn, query)
+		values, err := ie.QueryRowEx(ctx, "validate foreign key constraint", txn,
+			sqlbase.InternalExecutorSessionDataOverride{},
+			query)
 		if err != nil {
 			return err
 		}
@@ -281,7 +295,9 @@ func validateForeignKey(
 		query,
 	)
 
-	values, err := ie.QueryRow(ctx, "validate fk constraint", txn, query)
+	values, err := ie.QueryRowEx(ctx, "validate fk constraint", txn,
+		sqlbase.InternalExecutorSessionDataOverride{},
+		query)
 	if err != nil {
 		return err
 	}

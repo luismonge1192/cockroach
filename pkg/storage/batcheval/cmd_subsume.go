@@ -24,23 +24,22 @@ import (
 )
 
 func init() {
-	RegisterCommand(roachpb.Subsume, declareKeysSubsume, Subsume)
+	RegisterReadWriteCommand(roachpb.Subsume, declareKeysSubsume, Subsume)
 }
 
 func declareKeysSubsume(
-	desc *roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
+	_ *roachpb.RangeDescriptor, header roachpb.Header, req roachpb.Request, spans *spanset.SpanSet,
 ) {
 	// Subsume must not run concurrently with any other command. It declares a
 	// non-MVCC write over every addressable key in the range; this guarantees
 	// that it conflicts with any other command because every command must declare
 	// at least one addressable key. It does not, in fact, write any keys.
 	//
-	// TODO(nvanbenschoten): Remove this nil check when SubsumeRequest.RightDesc
-	// has completed its migration.
+	// We use the key bounds from the range descriptor in the request instead
+	// of the current range descriptor. Either would be fine because we verify
+	// that these match during the evaluation of the Subsume request.
 	args := req.(*roachpb.SubsumeRequest)
-	if args.RightDesc != nil {
-		desc = args.RightDesc
-	}
+	desc := args.RightDesc
 	spans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{
 		Key:    desc.StartKey.AsRawKey(),
 		EndKey: desc.EndKey.AsRawKey(),
@@ -85,7 +84,7 @@ func declareKeysSubsume(
 // The period of time after intents have been placed but before the merge
 // transaction is complete is called the merge's "critical phase".
 func Subsume(
-	ctx context.Context, batch engine.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, readWriter engine.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
 ) (result.Result, error) {
 	args := cArgs.Args.(*roachpb.SubsumeRequest)
 	reply := resp.(*roachpb.SubsumeResponse)
@@ -93,14 +92,10 @@ func Subsume(
 	// Verify that the Subsume request was sent to the correct range and that
 	// the range's bounds have not changed during the merge transaction.
 	desc := cArgs.EvalCtx.Desc()
-	// TODO(nvanbenschoten): Remove this nil check when SubsumeRequest.RightDesc
-	// has completed its migration.
-	if args.RightDesc != nil {
-		if !bytes.Equal(desc.StartKey, args.RightDesc.StartKey) ||
-			!bytes.Equal(desc.EndKey, args.RightDesc.EndKey) {
-			return result.Result{}, errors.Errorf("RHS range bounds do not match: %s != %s",
-				args.RightDesc, desc)
-		}
+	if !bytes.Equal(desc.StartKey, args.RightDesc.StartKey) ||
+		!bytes.Equal(desc.EndKey, args.RightDesc.EndKey) {
+		return result.Result{}, errors.Errorf("RHS range bounds do not match: %s != %s",
+			args.RightDesc, desc)
 	}
 
 	// Sanity check that the requesting range is our left neighbor. The ordering
@@ -114,14 +109,14 @@ func Subsume(
 	// Sanity check the caller has initiated a merge transaction by checking for
 	// a deletion intent on the local range descriptor.
 	descKey := keys.RangeDescriptorKey(desc.StartKey)
-	_, intent, err := engine.MVCCGet(ctx, batch, descKey, cArgs.Header.Timestamp,
+	_, intent, err := engine.MVCCGet(ctx, readWriter, descKey, cArgs.Header.Timestamp,
 		engine.MVCCGetOptions{Inconsistent: true})
 	if err != nil {
 		return result.Result{}, fmt.Errorf("fetching local range descriptor: %s", err)
 	} else if intent == nil {
 		return result.Result{}, errors.New("range missing intent on its local descriptor")
 	}
-	val, _, err := engine.MVCCGetAsTxn(ctx, batch, descKey, cArgs.Header.Timestamp, intent.Txn)
+	val, _, err := engine.MVCCGetAsTxn(ctx, readWriter, descKey, cArgs.Header.Timestamp, intent.Txn)
 	if err != nil {
 		return result.Result{}, fmt.Errorf("fetching local range descriptor as txn: %s", err)
 	} else if val != nil {

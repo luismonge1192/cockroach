@@ -141,18 +141,12 @@ func runDecommission(t *test, c *cluster, nodes int, duration time.Duration) {
 
 	var m *errgroup.Group // see comment in version.go
 	m, ctx = errgroup.WithContext(ctx)
-	for i, cmd := range workloads {
+	for _, cmd := range workloads {
 		cmd := cmd // copy is important for goroutine
-		i := i     // ditto
 
 		cmd = fmt.Sprintf(cmd, nodes)
 		m.Go(func() error {
-			quietL, err := t.l.ChildLogger("kv-"+strconv.Itoa(i), quietStdout)
-			if err != nil {
-				return err
-			}
-			defer quietL.close()
-			return c.RunL(ctx, quietL, c.Node(nodes), cmd)
+			return c.RunE(ctx, c.Node(nodes), cmd)
 		})
 	}
 
@@ -162,7 +156,7 @@ func runDecommission(t *test, c *cluster, nodes int, duration time.Duration) {
 			defer dbNode.Close()
 			var nodeID string
 			if err := dbNode.QueryRow(`SELECT node_id FROM crdb_internal.node_runtime_info LIMIT 1`).Scan(&nodeID); err != nil {
-				return "", nil
+				return "", err
 			}
 			return nodeID, nil
 		}
@@ -182,7 +176,6 @@ func runDecommission(t *test, c *cluster, nodes int, duration time.Duration) {
 		for tBegin, whileDown, node := timeutil.Now(), true, 1; timeutil.Since(tBegin) <= duration; whileDown, node = !whileDown, (node%numDecom)+1 {
 			t.Status(fmt.Sprintf("decommissioning %d (down=%t)", node, whileDown))
 			id, err := nodeID(node)
-
 			if err != nil {
 				return err
 			}
@@ -240,6 +233,7 @@ func registerDecommission(r *testRegistry) {
 
 	r.Add(testSpec{
 		Name:    fmt.Sprintf("decommission/nodes=%d/duration=%s", numNodes, duration),
+		Owner:   OwnerKV,
 		Cluster: makeClusterSpec(numNodes),
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			if local {
@@ -529,7 +523,14 @@ func runDecommissionAcceptance(ctx context.Context, t *test, c *cluster) {
 		if err != nil {
 			t.Fatalf("decommission failed: %v", err)
 		}
-		if strings.Split(o, "\n")[1] != waitLiveDeprecated {
+		hasDeprecation := false
+		for _, s := range strings.Split(o, "\n") {
+			if s == waitLiveDeprecated {
+				hasDeprecation = true
+				break
+			}
+		}
+		if !hasDeprecation {
 			t.Fatal("missing deprecate message for --wait=live")
 		}
 		c.Start(ctx, t, c.Node(1), args)
@@ -593,7 +594,14 @@ func runDecommissionAcceptance(ctx context.Context, t *test, c *cluster) {
 		if err := matchCSV(o, exp); err != nil {
 			t.Fatal(err)
 		}
-		if strings.Split(o, "\n")[1] != waitLiveDeprecated {
+		hasDeprecation := false
+		for _, s := range strings.Split(o, "\n") {
+			if s == waitLiveDeprecated {
+				hasDeprecation = true
+				break
+			}
+		}
+		if !hasDeprecation {
 			t.Fatal("missing deprecate message for --wait=live")
 		}
 	}

@@ -34,10 +34,6 @@ const (
 	_ VersionKey = iota - 1 // want first named one to start at zero
 	Version19_1
 	VersionStart19_2
-	VersionQueryTxnTimestamp
-	VersionStickyBit
-	VersionParallelCommits
-	VersionGenerationComparable
 	VersionLearnerReplicas
 	VersionTopLevelForeignKeys
 	VersionAtomicChangeReplicasTrigger
@@ -48,9 +44,17 @@ const (
 	VersionStart20_1
 	VersionContainsEstimatesCounter
 	VersionChangeReplicasDemotion
+	VersionSecondaryIndexColumnFamilies
+	VersionNamespaceTableWithSchemas
+	VersionProtectedTimestamps
+	VersionPrimaryKeyChanges
+	VersionAuthLocalAndTrustRejectMethods
+	VersionPrimaryKeyColumnsOutOfFamilyZero
+	VersionRootPassword
+	VersionNoExplicitForeignKeyIndexIDs
+	VersionHashShardedIndexes
 
 	// Add new versions here (step one of two).
-
 )
 
 // versionsSingleton lists all historical versions here in chronological order,
@@ -175,26 +179,30 @@ var versionsSingleton = keyedVersions([]keyedVersion{
 		Key:     VersionStart19_2,
 		Version: roachpb.Version{Major: 19, Minor: 1, Unstable: 1},
 	},
-	{
-		// VersionQueryTxnTimestamp is https://github.com/cockroachdb/cockroach/pull/36307.
-		Key:     VersionQueryTxnTimestamp,
-		Version: roachpb.Version{Major: 19, Minor: 1, Unstable: 2},
-	},
-	{
-		// VersionStickyBit is https://github.com/cockroachdb/cockroach/pull/37506.
-		Key:     VersionStickyBit,
-		Version: roachpb.Version{Major: 19, Minor: 1, Unstable: 3},
-	},
-	{
-		// VersionParallelCommits is https://github.com/cockroachdb/cockroach/pull/37777.
-		Key:     VersionParallelCommits,
-		Version: roachpb.Version{Major: 19, Minor: 1, Unstable: 4},
-	},
-	{
-		// VersionGenerationComparable is https://github.com/cockroachdb/cockroach/pull/38334.
-		Key:     VersionGenerationComparable,
-		Version: roachpb.Version{Major: 19, Minor: 1, Unstable: 5},
-	},
+	// Removed.
+	// {
+	// 	// VersionQueryTxnTimestamp is https://github.com/cockroachdb/cockroach/pull/36307.
+	// 	Key:     VersionQueryTxnTimestamp,
+	// 	Version: roachpb.Version{Major: 19, Minor: 1, Unstable: 2},
+	// },
+	// Removed.
+	// {
+	// 	// VersionStickyBit is https://github.com/cockroachdb/cockroach/pull/37506.
+	// 	Key:     VersionStickyBit,
+	// 	Version: roachpb.Version{Major: 19, Minor: 1, Unstable: 3},
+	// },
+	// Removed.
+	// {
+	// 	// VersionParallelCommits is https://github.com/cockroachdb/cockroach/pull/37777.
+	// 	Key:     VersionParallelCommits,
+	// 	Version: roachpb.Version{Major: 19, Minor: 1, Unstable: 4},
+	// },
+	// Removed.
+	// {
+	// 	// VersionGenerationComparable is https://github.com/cockroachdb/cockroach/pull/38334.
+	// 	Key:     VersionGenerationComparable,
+	// 	Version: roachpb.Version{Major: 19, Minor: 1, Unstable: 5},
+	// },
 	{
 		// VersionLearnerReplicas is https://github.com/cockroachdb/cockroach/pull/38149.
 		Key:     VersionLearnerReplicas,
@@ -320,6 +328,87 @@ var versionsSingleton = keyedVersions([]keyedVersion{
 		Key:     VersionChangeReplicasDemotion,
 		Version: roachpb.Version{Major: 19, Minor: 2, Unstable: 3},
 	},
+	{
+		// VersionSecondaryIndexColumnFamilies is https://github.com/cockroachdb/cockroach/pull/42073.
+		//
+		// It allows secondary indexes to respect table level column family definitions.
+		Key:     VersionSecondaryIndexColumnFamilies,
+		Version: roachpb.Version{Major: 19, Minor: 2, Unstable: 4},
+	},
+	{
+		// VersionNamespaceTableWithSchemas is https://github.com/cockroachdb/cockroach/pull/41977
+		//
+		// It represents the migration to a new system.namespace table that has an
+		// added parentSchemaID column. In addition to the new column, the table is
+		// no longer in the system config range -- implying it is no longer gossiped.
+		Key:     VersionNamespaceTableWithSchemas,
+		Version: roachpb.Version{Major: 19, Minor: 2, Unstable: 5},
+	},
+	{
+		// VersionProtectedTimestamps introduces the system tables for the protected
+		// timestamps subsystem.
+		//
+		// In this version and later the system.protected_ts_meta and
+		// system.protected_ts_records tables are part of the system bootstap
+		// schema.
+		Key:     VersionProtectedTimestamps,
+		Version: roachpb.Version{Major: 19, Minor: 2, Unstable: 6},
+	},
+	{
+		// VersionPrimaryKeyChanges is https://github.com/cockroachdb/cockroach/pull/42462
+		//
+		// It allows online primary key changes of tables.
+		Key:     VersionPrimaryKeyChanges,
+		Version: roachpb.Version{Major: 19, Minor: 2, Unstable: 7},
+	},
+	{
+		// VersionAuthLocalAndTrustRejectMethods introduces the HBA rule
+		// prefix 'local' and auth methods 'trust' and 'reject', for use
+		// in server.host_based_authentication.configuration.
+		//
+		// A separate cluster version ensures the new syntax is not
+		// introduced while previous-version nodes are still running, as
+		// this would block any new SQL client.
+		Key:     VersionAuthLocalAndTrustRejectMethods,
+		Version: roachpb.Version{Major: 19, Minor: 2, Unstable: 8},
+	},
+	{
+		// VersionPrimaryKeyColumnsOutOfFamilyZero allows for primary key columns
+		// to exist in column families other than 0, in order to prepare for
+		// primary key changes that move primary key columns to different families.
+		Key:     VersionPrimaryKeyColumnsOutOfFamilyZero,
+		Version: roachpb.Version{Major: 19, Minor: 2, Unstable: 9},
+	},
+	{
+		// VersionRootPassword enables setting a password for the `root`
+		// user from SQL. Even though introducing a password for the root
+		// user in 20.1 does not prevent 19.2 nodes from using the root
+		// account, we need a cluster setting: the 19.2 nodes do not even
+		// *check* the password, so setting a pw in a hybrid 20.1/19.2
+		// cluster would yield different client auth successes in
+		// different nodes (which is poor UX).
+		Key:     VersionRootPassword,
+		Version: roachpb.Version{Major: 19, Minor: 2, Unstable: 10},
+	},
+	{
+		// VersionNoExplicitForeignKeyIndexIDs is https://github.com/cockroachdb/cockroach/pull/43332.
+		//
+		// It represents the migration away from using explicit index IDs in foreign
+		// key constraints, and instead allows all places that need these IDs to select
+		// an appropriate index to uphold the foreign key relationship.
+		Key:     VersionNoExplicitForeignKeyIndexIDs,
+		Version: roachpb.Version{Major: 19, Minor: 2, Unstable: 11},
+	},
+	{
+		// VersionHashShardedIndexes is https://github.com/cockroachdb/cockroach/pull/42922
+		//
+		// It allows the creation of "hash sharded indexes", which construct a hidden
+		// shard column, computed from the set of index columns, and prefix the index's
+		// ranges with said shard column.
+		Key:     VersionHashShardedIndexes,
+		Version: roachpb.Version{Major: 19, Minor: 2, Unstable: 12},
+	},
+
 	// Add new versions here (step two of two).
 
 })

@@ -9,21 +9,24 @@
 // licenses/APL.txt.
 
 import { assert } from "chai";
-import fetchMock from "src/util/fetch-mock";
 import { Store } from "redux";
 import moment from "moment";
+import sinon from "sinon";
+import { createHashHistory } from "history";
 
 import * as protos from "src/js/protos";
 import { API_PREFIX } from "src/util/api";
+import fetchMock from "src/util/fetch-mock";
+
 import { AdminUIState, createAdminUIStore } from "./state";
 import {
   AlertLevel,
   alertDataSync,
-  versionsSelector,
   staggeredVersionWarningSelector, staggeredVersionDismissedSetting,
   newVersionNotificationSelector, newVersionDismissedLocalSetting,
   disconnectedAlertSelector, disconnectedDismissedLocalSetting,
 } from "./alerts";
+import { versionsSelector } from "src/redux/nodes";
 import {
   VERSION_DISMISSED_KEY, INSTRUCTIONS_BOX_COLLAPSED_KEY,
   setUIDataKey, isInFlight,
@@ -32,18 +35,24 @@ import {
   livenessReducerObj, versionReducerObj, nodesReducerObj, clusterReducerObj, healthReducerObj,
 } from "./apiReducers";
 
+const sandbox = sinon.createSandbox();
+
 describe("alerts", function() {
   let store: Store<AdminUIState>;
   let dispatch: typeof store.dispatch;
   let state: typeof store.getState;
 
   beforeEach(function () {
-    store = createAdminUIStore();
+    store = createAdminUIStore(createHashHistory());
     dispatch = store.dispatch;
     state = store.getState;
+    // localSettings persist values in sessionStorage and
+    // this stub disables caching values between tests.
+    sandbox.stub(sessionStorage, "getItem").returns(null);
   });
 
   afterEach(function() {
+    sandbox.restore();
     fetchMock.restore();
   });
 

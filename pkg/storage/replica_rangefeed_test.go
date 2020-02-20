@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -114,6 +115,7 @@ func TestReplicaRangefeed(t *testing.T) {
 	replNum := 3
 	streams := make([]*testStream, replNum)
 	streamErrC := make(chan *roachpb.Error, replNum)
+	rangefeedSpan := roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("z")}
 	for i := 0; i < replNum; i++ {
 		stream := newTestStream()
 		streams[i] = stream
@@ -123,7 +125,7 @@ func TestReplicaRangefeed(t *testing.T) {
 					Timestamp: initTime,
 					RangeID:   rangeID,
 				},
-				Span:     roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("z")},
+				Span:     rangefeedSpan,
 				WithDiff: true,
 			}
 
@@ -167,7 +169,7 @@ func TestReplicaRangefeed(t *testing.T) {
 			Key: roachpb.Key("b"), Value: expVal1,
 		}},
 		{Checkpoint: &roachpb.RangeFeedCheckpoint{
-			Span:       roachpb.Span{Key: startKey, EndKey: roachpb.KeyMax},
+			Span:       rangefeedSpan,
 			ResolvedTS: hlc.Timestamp{},
 		}},
 	}
@@ -405,12 +407,6 @@ func TestReplicaRangefeedRetryErrors(t *testing.T) {
 			subT.Fatalf("incorrect events on stream, found %v, want %v", events, expEvents)
 		}
 	}
-	waitForInitialCheckpoint := func(
-		subT *testing.T, stream *testStream, streamErrC <-chan *roachpb.Error,
-	) {
-		span := roachpb.Span{Key: startKey, EndKey: roachpb.KeyMax}
-		waitForInitialCheckpointAcrossSpan(subT, stream, streamErrC, span)
-	}
 
 	assertRangefeedRetryErr := func(
 		subT *testing.T, pErr *roachpb.Error, expReason roachpb.RangeFeedRetryError_Reason,
@@ -438,12 +434,13 @@ func TestReplicaRangefeedRetryErrors(t *testing.T) {
 		// Establish a rangefeed on the replica we plan to remove.
 		stream := newTestStream()
 		streamErrC := make(chan *roachpb.Error, 1)
+		rangefeedSpan := roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("z")}
 		go func() {
 			req := roachpb.RangeFeedRequest{
 				Header: roachpb.Header{
 					RangeID: rangeID,
 				},
-				Span: roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("z")},
+				Span: rangefeedSpan,
 			}
 
 			pErr := mtc.Store(removeStore).RangeFeed(&req, stream)
@@ -451,7 +448,7 @@ func TestReplicaRangefeedRetryErrors(t *testing.T) {
 		}()
 
 		// Wait for the first checkpoint event.
-		waitForInitialCheckpoint(t, stream, streamErrC)
+		waitForInitialCheckpointAcrossSpan(t, stream, streamErrC, rangefeedSpan)
 
 		// Remove the replica from the range.
 		mtc.unreplicateRange(rangeID, removeStore)
@@ -467,12 +464,13 @@ func TestReplicaRangefeedRetryErrors(t *testing.T) {
 		// Establish a rangefeed on the replica we plan to split.
 		stream := newTestStream()
 		streamErrC := make(chan *roachpb.Error, 1)
+		rangefeedSpan := roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("z")}
 		go func() {
 			req := roachpb.RangeFeedRequest{
 				Header: roachpb.Header{
 					RangeID: rangeID,
 				},
-				Span: roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("z")},
+				Span: rangefeedSpan,
 			}
 
 			pErr := mtc.Store(0).RangeFeed(&req, stream)
@@ -480,7 +478,7 @@ func TestReplicaRangefeedRetryErrors(t *testing.T) {
 		}()
 
 		// Wait for the first checkpoint event.
-		waitForInitialCheckpoint(t, stream, streamErrC)
+		waitForInitialCheckpointAcrossSpan(t, stream, streamErrC, rangefeedSpan)
 
 		// Split the range.
 		args := adminSplitArgs([]byte("m"))
@@ -515,12 +513,13 @@ func TestReplicaRangefeedRetryErrors(t *testing.T) {
 		// Establish a rangefeed on the left replica.
 		streamLeft := newTestStream()
 		streamLeftErrC := make(chan *roachpb.Error, 1)
+		rangefeedLeftSpan := roachpb.Span{Key: roachpb.Key("a"), EndKey: splitKey}
 		go func() {
 			req := roachpb.RangeFeedRequest{
 				Header: roachpb.Header{
 					RangeID: rangeID,
 				},
-				Span: roachpb.Span{Key: roachpb.Key("a"), EndKey: splitKey},
+				Span: rangefeedLeftSpan,
 			}
 
 			pErr := mtc.Store(0).RangeFeed(&req, streamLeft)
@@ -530,12 +529,13 @@ func TestReplicaRangefeedRetryErrors(t *testing.T) {
 		// Establish a rangefeed on the right replica.
 		streamRight := newTestStream()
 		streamRightErrC := make(chan *roachpb.Error, 1)
+		rangefeedRightSpan := roachpb.Span{Key: splitKey, EndKey: roachpb.Key("z")}
 		go func() {
 			req := roachpb.RangeFeedRequest{
 				Header: roachpb.Header{
 					RangeID: rightRangeID,
 				},
-				Span: roachpb.Span{Key: splitKey, EndKey: roachpb.Key("z")},
+				Span: rangefeedRightSpan,
 			}
 
 			pErr := mtc.Store(0).RangeFeed(&req, streamRight)
@@ -543,12 +543,8 @@ func TestReplicaRangefeedRetryErrors(t *testing.T) {
 		}()
 
 		// Wait for the first checkpoint event on each stream.
-		waitForInitialCheckpointAcrossSpan(t, streamLeft, streamLeftErrC, roachpb.Span{
-			Key: startKey, EndKey: splitKey,
-		})
-		waitForInitialCheckpointAcrossSpan(t, streamRight, streamRightErrC, roachpb.Span{
-			Key: splitKey, EndKey: roachpb.KeyMax,
-		})
+		waitForInitialCheckpointAcrossSpan(t, streamLeft, streamLeftErrC, rangefeedLeftSpan)
+		waitForInitialCheckpointAcrossSpan(t, streamRight, streamRightErrC, rangefeedRightSpan)
 
 		// Merge the ranges back together
 		mergeArgs := adminMergeArgs(startKey)
@@ -573,12 +569,13 @@ func TestReplicaRangefeedRetryErrors(t *testing.T) {
 		// Establish a rangefeed on the replica we plan to partition.
 		stream := newTestStream()
 		streamErrC := make(chan *roachpb.Error, 1)
+		rangefeedSpan := roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("z")}
 		go func() {
 			req := roachpb.RangeFeedRequest{
 				Header: roachpb.Header{
 					RangeID: rangeID,
 				},
-				Span: roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("z")},
+				Span: rangefeedSpan,
 			}
 
 			timer := time.AfterFunc(10*time.Second, stream.Cancel)
@@ -589,7 +586,7 @@ func TestReplicaRangefeedRetryErrors(t *testing.T) {
 		}()
 
 		// Wait for the first checkpoint event.
-		waitForInitialCheckpoint(t, stream, streamErrC)
+		waitForInitialCheckpointAcrossSpan(t, stream, streamErrC, rangefeedSpan)
 
 		// Force the leader off the replica on partitionedStore. If it's the
 		// leader, this test will fall over when it cuts the replica off from
@@ -667,12 +664,13 @@ func TestReplicaRangefeedRetryErrors(t *testing.T) {
 		// Establish a rangefeed.
 		stream := newTestStream()
 		streamErrC := make(chan *roachpb.Error, 1)
+		rangefeedSpan := roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("z")}
 		go func() {
 			req := roachpb.RangeFeedRequest{
 				Header: roachpb.Header{
 					RangeID: rangeID,
 				},
-				Span: roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("z")},
+				Span: rangefeedSpan,
 			}
 
 			pErr := mtc.Store(0).RangeFeed(&req, stream)
@@ -680,7 +678,7 @@ func TestReplicaRangefeedRetryErrors(t *testing.T) {
 		}()
 
 		// Wait for the first checkpoint event.
-		waitForInitialCheckpoint(t, stream, streamErrC)
+		waitForInitialCheckpointAcrossSpan(t, stream, streamErrC, rangefeedSpan)
 
 		// Disable rangefeeds, which stops logical op logs from being provided
 		// with Raft commands.
@@ -696,6 +694,117 @@ func TestReplicaRangefeedRetryErrors(t *testing.T) {
 		pErr := <-streamErrC
 		assertRangefeedRetryErr(t, pErr, roachpb.RangeFeedRetryError_REASON_LOGICAL_OPS_MISSING)
 	})
+}
+
+// TestReplicaRangefeedPushesTransactions tests that rangefeed detects intents
+// that are holding up its resolved timestamp and periodically pushes them to
+// ensure that its resolved timestamp continues to advance.
+func TestReplicaRangefeedPushesTransactions(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	tc, db, _, repls := setupTestClusterForClosedTimestampTesting(ctx, t, testingTargetDuration)
+	defer tc.Stopper().Stop(ctx)
+
+	sqlDB := sqlutils.MakeSQLRunner(db)
+	sqlDB.Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled = true`)
+	// While we're here, drop the target duration. This was set to
+	// testingTargetDuration above, but this is higher then it needs to be now
+	// that cluster and schema setup is complete.
+	sqlDB.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.target_duration = '10ms'`)
+
+	// Make sure all the nodes have gotten the rangefeed enabled setting from
+	// gossip, so that they will immediately be able to accept RangeFeeds. The
+	// target_duration one is just to speed up the test, we don't care if it has
+	// propagated everywhere yet.
+	testutils.SucceedsSoon(t, func() error {
+		for i := 0; i < tc.NumServers(); i++ {
+			var enabled bool
+			if err := tc.ServerConn(i).QueryRow(
+				`SHOW CLUSTER SETTING kv.rangefeed.enabled`,
+			).Scan(&enabled); err != nil {
+				return err
+			}
+			if !enabled {
+				return errors.Errorf(`waiting for rangefeed to be enabled on node %d`, i)
+			}
+		}
+		return nil
+	})
+
+	ts1 := tc.Server(0).Clock().Now()
+	rangeFeedCtx, rangeFeedCancel := context.WithCancel(ctx)
+	defer rangeFeedCancel()
+	rangeFeedChs := make([]chan *roachpb.RangeFeedEvent, len(repls))
+	rangeFeedErrC := make(chan error, len(repls))
+	for i := range repls {
+		desc := repls[i].Desc()
+		ds := tc.Server(i).DistSenderI().(*kv.DistSender)
+		rangeFeedCh := make(chan *roachpb.RangeFeedEvent)
+		rangeFeedChs[i] = rangeFeedCh
+		go func() {
+			span := roachpb.Span{
+				Key: desc.StartKey.AsRawKey(), EndKey: desc.EndKey.AsRawKey(),
+			}
+			rangeFeedErrC <- ds.RangeFeed(rangeFeedCtx, span, ts1, false /* withDiff */, rangeFeedCh)
+		}()
+	}
+
+	// Wait for a RangeFeed checkpoint on each RangeFeed after the RangeFeed
+	// initial scan time (which is the timestamp passed in the request) to make
+	// sure everything is set up. We intentionally don't care about the spans in
+	// the checkpoints, just verifying that something has made it past the
+	// initial scan and is running.
+	waitForCheckpoint := func(ts hlc.Timestamp) {
+		t.Helper()
+		for _, rangeFeedCh := range rangeFeedChs {
+			checkpointed := false
+			for !checkpointed {
+				select {
+				case event := <-rangeFeedCh:
+					if c := event.Checkpoint; c != nil && ts.Less(c.ResolvedTS) {
+						checkpointed = true
+					}
+				case err := <-rangeFeedErrC:
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+	waitForCheckpoint(ts1)
+
+	// Start a transaction and write an intent on the range. This intent would
+	// prevent from the rangefeed's resolved timestamp from advancing. To get
+	// around this, the rangefeed periodically pushes all intents on its range
+	// to higher timestamps.
+	tx1, err := db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	_, err = tx1.ExecContext(ctx, "INSERT INTO cttest.kv VALUES (1, 'test')")
+	require.NoError(t, err)
+
+	// Read the current transaction timestamp. This prevents the txn from committing
+	// if it ever gets pushed.
+	var ts2Str string
+	require.NoError(t, tx1.QueryRowContext(ctx, "SELECT cluster_logical_timestamp()").Scan(&ts2Str))
+	ts2, err := sql.ParseHLC(ts2Str)
+	require.NoError(t, err)
+
+	// Wait for the RangeFeed checkpoint on each RangeFeed to exceed this timestamp.
+	// For this to be possible, it must push the transaction's timestamp forward.
+	waitForCheckpoint(ts2)
+
+	// The txn should not be able to commit since its commit timestamp was pushed
+	// and it has observed its timestamp.
+	require.Regexp(t, "TransactionRetryError: retry txn", tx1.Commit())
+
+	// Make sure the RangeFeed hasn't errored yet.
+	select {
+	case err := <-rangeFeedErrC:
+		t.Fatal(err)
+	default:
+	}
+	// Now cancel it and wait for it to shut down.
+	rangeFeedCancel()
 }
 
 // TestReplicaRangefeedNudgeSlowClosedTimestamp tests that rangefeed detects

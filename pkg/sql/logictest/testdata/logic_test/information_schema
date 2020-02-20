@@ -273,6 +273,7 @@ pg_catalog          pg_am
 pg_catalog          pg_attrdef
 pg_catalog          pg_attribute
 pg_catalog          pg_auth_members
+pg_catalog          pg_authid
 pg_catalog          pg_available_extensions
 pg_catalog          pg_cast
 pg_catalog          pg_class
@@ -411,6 +412,7 @@ views
 pg_am
 pg_attrdef
 pg_attribute
+pg_authid
 pg_auth_members
 pg_available_extensions
 pg_cast
@@ -558,6 +560,7 @@ system         pg_catalog          pg_am                              SYSTEM VIE
 system         pg_catalog          pg_attrdef                         SYSTEM VIEW  NO                  1
 system         pg_catalog          pg_attribute                       SYSTEM VIEW  NO                  1
 system         pg_catalog          pg_auth_members                    SYSTEM VIEW  NO                  1
+system         pg_catalog          pg_authid                          SYSTEM VIEW  NO                  1
 system         pg_catalog          pg_available_extensions            SYSTEM VIEW  NO                  1
 system         pg_catalog          pg_cast                            SYSTEM VIEW  NO                  1
 system         pg_catalog          pg_class                           SYSTEM VIEW  NO                  1
@@ -602,7 +605,7 @@ system         pg_catalog          pg_type                            SYSTEM VIE
 system         pg_catalog          pg_user                            SYSTEM VIEW  NO                  1
 system         pg_catalog          pg_user_mapping                    SYSTEM VIEW  NO                  1
 system         pg_catalog          pg_views                           SYSTEM VIEW  NO                  1
-system         public              namespace                          BASE TABLE   YES                 1
+system         public              namespace_deprecated               BASE TABLE   YES                 1
 system         public              descriptor                         BASE TABLE   YES                 1
 system         public              users                              BASE TABLE   YES                 1
 system         public              zones                              BASE TABLE   YES                 1
@@ -621,6 +624,9 @@ system         public              replication_constraint_stats       BASE TABLE
 system         public              replication_critical_localities    BASE TABLE   YES                 1
 system         public              replication_stats                  BASE TABLE   YES                 1
 system         public              reports_meta                       BASE TABLE   YES                 1
+system         public              namespace                          BASE TABLE   YES                 1
+system         public              protected_ts_meta                  BASE TABLE   YES                 1
+system         public              protected_ts_records               BASE TABLE   YES                 1
 
 statement ok
 ALTER TABLE other_db.xyz ADD COLUMN j INT
@@ -674,26 +680,117 @@ SELECT *
 FROM system.information_schema.table_constraints
 ORDER BY TABLE_NAME, CONSTRAINT_TYPE, CONSTRAINT_NAME
 ----
-constraint_catalog  constraint_schema  constraint_name  table_catalog  table_schema  table_name                       constraint_type  is_deferrable  initially_deferred
-system              public             primary          system         public        comments                         PRIMARY KEY      NO             NO
-system              public             primary          system         public        descriptor                       PRIMARY KEY      NO             NO
-system              public             primary          system         public        eventlog                         PRIMARY KEY      NO             NO
-system              public             primary          system         public        jobs                             PRIMARY KEY      NO             NO
-system              public             primary          system         public        lease                            PRIMARY KEY      NO             NO
-system              public             primary          system         public        locations                        PRIMARY KEY      NO             NO
-system              public             primary          system         public        namespace                        PRIMARY KEY      NO             NO
-system              public             primary          system         public        rangelog                         PRIMARY KEY      NO             NO
-system              public             primary          system         public        replication_constraint_stats     PRIMARY KEY      NO             NO
-system              public             primary          system         public        replication_critical_localities  PRIMARY KEY      NO             NO
-system              public             primary          system         public        replication_stats                PRIMARY KEY      NO             NO
-system              public             primary          system         public        reports_meta                     PRIMARY KEY      NO             NO
-system              public             primary          system         public        role_members                     PRIMARY KEY      NO             NO
-system              public             primary          system         public        settings                         PRIMARY KEY      NO             NO
-system              public             primary          system         public        table_statistics                 PRIMARY KEY      NO             NO
-system              public             primary          system         public        ui                               PRIMARY KEY      NO             NO
-system              public             primary          system         public        users                            PRIMARY KEY      NO             NO
-system              public             primary          system         public        web_sessions                     PRIMARY KEY      NO             NO
-system              public             primary          system         public        zones                            PRIMARY KEY      NO             NO
+constraint_catalog  constraint_schema  constraint_name          table_catalog  table_schema  table_name                       constraint_type  is_deferrable  initially_deferred
+system              public             630200280_24_1_not_null  system         public        comments                         CHECK            NO             NO
+system              public             630200280_24_2_not_null  system         public        comments                         CHECK            NO             NO
+system              public             630200280_24_3_not_null  system         public        comments                         CHECK            NO             NO
+system              public             630200280_24_4_not_null  system         public        comments                         CHECK            NO             NO
+system              public             primary                  system         public        comments                         PRIMARY KEY      NO             NO
+system              public             630200280_3_1_not_null   system         public        descriptor                       CHECK            NO             NO
+system              public             primary                  system         public        descriptor                       PRIMARY KEY      NO             NO
+system              public             630200280_12_1_not_null  system         public        eventlog                         CHECK            NO             NO
+system              public             630200280_12_2_not_null  system         public        eventlog                         CHECK            NO             NO
+system              public             630200280_12_3_not_null  system         public        eventlog                         CHECK            NO             NO
+system              public             630200280_12_4_not_null  system         public        eventlog                         CHECK            NO             NO
+system              public             630200280_12_6_not_null  system         public        eventlog                         CHECK            NO             NO
+system              public             primary                  system         public        eventlog                         PRIMARY KEY      NO             NO
+system              public             630200280_15_1_not_null  system         public        jobs                             CHECK            NO             NO
+system              public             630200280_15_2_not_null  system         public        jobs                             CHECK            NO             NO
+system              public             630200280_15_3_not_null  system         public        jobs                             CHECK            NO             NO
+system              public             630200280_15_4_not_null  system         public        jobs                             CHECK            NO             NO
+system              public             primary                  system         public        jobs                             PRIMARY KEY      NO             NO
+system              public             630200280_11_1_not_null  system         public        lease                            CHECK            NO             NO
+system              public             630200280_11_2_not_null  system         public        lease                            CHECK            NO             NO
+system              public             630200280_11_3_not_null  system         public        lease                            CHECK            NO             NO
+system              public             630200280_11_4_not_null  system         public        lease                            CHECK            NO             NO
+system              public             primary                  system         public        lease                            PRIMARY KEY      NO             NO
+system              public             630200280_21_1_not_null  system         public        locations                        CHECK            NO             NO
+system              public             630200280_21_2_not_null  system         public        locations                        CHECK            NO             NO
+system              public             630200280_21_3_not_null  system         public        locations                        CHECK            NO             NO
+system              public             630200280_21_4_not_null  system         public        locations                        CHECK            NO             NO
+system              public             primary                  system         public        locations                        PRIMARY KEY      NO             NO
+system              public             630200280_30_1_not_null  system         public        namespace                        CHECK            NO             NO
+system              public             630200280_30_2_not_null  system         public        namespace                        CHECK            NO             NO
+system              public             630200280_30_3_not_null  system         public        namespace                        CHECK            NO             NO
+system              public             primary                  system         public        namespace                        PRIMARY KEY      NO             NO
+system              public             630200280_2_1_not_null   system         public        namespace_deprecated             CHECK            NO             NO
+system              public             630200280_2_2_not_null   system         public        namespace_deprecated             CHECK            NO             NO
+system              public             primary                  system         public        namespace_deprecated             PRIMARY KEY      NO             NO
+system              public             630200280_31_1_not_null  system         public        protected_ts_meta                CHECK            NO             NO
+system              public             630200280_31_2_not_null  system         public        protected_ts_meta                CHECK            NO             NO
+system              public             630200280_31_3_not_null  system         public        protected_ts_meta                CHECK            NO             NO
+system              public             630200280_31_4_not_null  system         public        protected_ts_meta                CHECK            NO             NO
+system              public             630200280_31_5_not_null  system         public        protected_ts_meta                CHECK            NO             NO
+system              public             check_singleton          system         public        protected_ts_meta                CHECK            NO             NO
+system              public             primary                  system         public        protected_ts_meta                PRIMARY KEY      NO             NO
+system              public             630200280_32_1_not_null  system         public        protected_ts_records             CHECK            NO             NO
+system              public             630200280_32_2_not_null  system         public        protected_ts_records             CHECK            NO             NO
+system              public             630200280_32_3_not_null  system         public        protected_ts_records             CHECK            NO             NO
+system              public             630200280_32_5_not_null  system         public        protected_ts_records             CHECK            NO             NO
+system              public             630200280_32_6_not_null  system         public        protected_ts_records             CHECK            NO             NO
+system              public             630200280_32_7_not_null  system         public        protected_ts_records             CHECK            NO             NO
+system              public             primary                  system         public        protected_ts_records             PRIMARY KEY      NO             NO
+system              public             630200280_13_1_not_null  system         public        rangelog                         CHECK            NO             NO
+system              public             630200280_13_2_not_null  system         public        rangelog                         CHECK            NO             NO
+system              public             630200280_13_3_not_null  system         public        rangelog                         CHECK            NO             NO
+system              public             630200280_13_4_not_null  system         public        rangelog                         CHECK            NO             NO
+system              public             630200280_13_7_not_null  system         public        rangelog                         CHECK            NO             NO
+system              public             primary                  system         public        rangelog                         PRIMARY KEY      NO             NO
+system              public             630200280_25_1_not_null  system         public        replication_constraint_stats     CHECK            NO             NO
+system              public             630200280_25_2_not_null  system         public        replication_constraint_stats     CHECK            NO             NO
+system              public             630200280_25_3_not_null  system         public        replication_constraint_stats     CHECK            NO             NO
+system              public             630200280_25_4_not_null  system         public        replication_constraint_stats     CHECK            NO             NO
+system              public             630200280_25_5_not_null  system         public        replication_constraint_stats     CHECK            NO             NO
+system              public             630200280_25_7_not_null  system         public        replication_constraint_stats     CHECK            NO             NO
+system              public             primary                  system         public        replication_constraint_stats     PRIMARY KEY      NO             NO
+system              public             630200280_26_1_not_null  system         public        replication_critical_localities  CHECK            NO             NO
+system              public             630200280_26_2_not_null  system         public        replication_critical_localities  CHECK            NO             NO
+system              public             630200280_26_3_not_null  system         public        replication_critical_localities  CHECK            NO             NO
+system              public             630200280_26_4_not_null  system         public        replication_critical_localities  CHECK            NO             NO
+system              public             630200280_26_5_not_null  system         public        replication_critical_localities  CHECK            NO             NO
+system              public             primary                  system         public        replication_critical_localities  PRIMARY KEY      NO             NO
+system              public             630200280_27_1_not_null  system         public        replication_stats                CHECK            NO             NO
+system              public             630200280_27_2_not_null  system         public        replication_stats                CHECK            NO             NO
+system              public             630200280_27_3_not_null  system         public        replication_stats                CHECK            NO             NO
+system              public             630200280_27_4_not_null  system         public        replication_stats                CHECK            NO             NO
+system              public             630200280_27_5_not_null  system         public        replication_stats                CHECK            NO             NO
+system              public             630200280_27_6_not_null  system         public        replication_stats                CHECK            NO             NO
+system              public             630200280_27_7_not_null  system         public        replication_stats                CHECK            NO             NO
+system              public             primary                  system         public        replication_stats                PRIMARY KEY      NO             NO
+system              public             630200280_28_1_not_null  system         public        reports_meta                     CHECK            NO             NO
+system              public             630200280_28_2_not_null  system         public        reports_meta                     CHECK            NO             NO
+system              public             primary                  system         public        reports_meta                     PRIMARY KEY      NO             NO
+system              public             630200280_23_1_not_null  system         public        role_members                     CHECK            NO             NO
+system              public             630200280_23_2_not_null  system         public        role_members                     CHECK            NO             NO
+system              public             630200280_23_3_not_null  system         public        role_members                     CHECK            NO             NO
+system              public             primary                  system         public        role_members                     PRIMARY KEY      NO             NO
+system              public             630200280_6_1_not_null   system         public        settings                         CHECK            NO             NO
+system              public             630200280_6_2_not_null   system         public        settings                         CHECK            NO             NO
+system              public             630200280_6_3_not_null   system         public        settings                         CHECK            NO             NO
+system              public             primary                  system         public        settings                         PRIMARY KEY      NO             NO
+system              public             630200280_20_1_not_null  system         public        table_statistics                 CHECK            NO             NO
+system              public             630200280_20_2_not_null  system         public        table_statistics                 CHECK            NO             NO
+system              public             630200280_20_4_not_null  system         public        table_statistics                 CHECK            NO             NO
+system              public             630200280_20_5_not_null  system         public        table_statistics                 CHECK            NO             NO
+system              public             630200280_20_6_not_null  system         public        table_statistics                 CHECK            NO             NO
+system              public             630200280_20_7_not_null  system         public        table_statistics                 CHECK            NO             NO
+system              public             630200280_20_8_not_null  system         public        table_statistics                 CHECK            NO             NO
+system              public             primary                  system         public        table_statistics                 PRIMARY KEY      NO             NO
+system              public             630200280_14_1_not_null  system         public        ui                               CHECK            NO             NO
+system              public             630200280_14_3_not_null  system         public        ui                               CHECK            NO             NO
+system              public             primary                  system         public        ui                               PRIMARY KEY      NO             NO
+system              public             630200280_4_1_not_null   system         public        users                            CHECK            NO             NO
+system              public             630200280_4_3_not_null   system         public        users                            CHECK            NO             NO
+system              public             primary                  system         public        users                            PRIMARY KEY      NO             NO
+system              public             630200280_19_1_not_null  system         public        web_sessions                     CHECK            NO             NO
+system              public             630200280_19_2_not_null  system         public        web_sessions                     CHECK            NO             NO
+system              public             630200280_19_3_not_null  system         public        web_sessions                     CHECK            NO             NO
+system              public             630200280_19_4_not_null  system         public        web_sessions                     CHECK            NO             NO
+system              public             630200280_19_5_not_null  system         public        web_sessions                     CHECK            NO             NO
+system              public             630200280_19_7_not_null  system         public        web_sessions                     CHECK            NO             NO
+system              public             primary                  system         public        web_sessions                     PRIMARY KEY      NO             NO
+system              public             630200280_5_1_not_null   system         public        zones                            CHECK            NO             NO
+system              public             primary                  system         public        zones                            PRIMARY KEY      NO             NO
 
 query TTTT colnames
 SELECT *
@@ -767,6 +864,20 @@ system              public             630200280_28_1_not_null  id IS NOT NULL
 system              public             630200280_28_2_not_null  generated IS NOT NULL
 system              public             630200280_2_1_not_null   parentID IS NOT NULL
 system              public             630200280_2_2_not_null   name IS NOT NULL
+system              public             630200280_30_1_not_null  parentID IS NOT NULL
+system              public             630200280_30_2_not_null  parentSchemaID IS NOT NULL
+system              public             630200280_30_3_not_null  name IS NOT NULL
+system              public             630200280_31_1_not_null  singleton IS NOT NULL
+system              public             630200280_31_2_not_null  version IS NOT NULL
+system              public             630200280_31_3_not_null  num_records IS NOT NULL
+system              public             630200280_31_4_not_null  num_spans IS NOT NULL
+system              public             630200280_31_5_not_null  total_bytes IS NOT NULL
+system              public             630200280_32_1_not_null  id IS NOT NULL
+system              public             630200280_32_2_not_null  ts IS NOT NULL
+system              public             630200280_32_3_not_null  meta_type IS NOT NULL
+system              public             630200280_32_5_not_null  num_spans IS NOT NULL
+system              public             630200280_32_6_not_null  spans IS NOT NULL
+system              public             630200280_32_7_not_null  verified IS NOT NULL
 system              public             630200280_3_1_not_null   id IS NOT NULL
 system              public             630200280_4_1_not_null   username IS NOT NULL
 system              public             630200280_4_3_not_null   isRole IS NOT NULL
@@ -774,49 +885,56 @@ system              public             630200280_5_1_not_null   id IS NOT NULL
 system              public             630200280_6_1_not_null   name IS NOT NULL
 system              public             630200280_6_2_not_null   value IS NOT NULL
 system              public             630200280_6_3_not_null   lastUpdated IS NOT NULL
+system              public             check_singleton          ((singleton))
 
 query TTTTTTT colnames
 SELECT *
 FROM system.information_schema.constraint_column_usage
 ORDER BY TABLE_NAME, COLUMN_NAME, CONSTRAINT_NAME
 ----
-table_catalog  table_schema  table_name                       column_name    constraint_catalog  constraint_schema  constraint_name
-system         public        comments                         object_id      system              public             primary
-system         public        comments                         sub_id         system              public             primary
-system         public        comments                         type           system              public             primary
-system         public        descriptor                       id             system              public             primary
-system         public        eventlog                         timestamp      system              public             primary
-system         public        eventlog                         uniqueID       system              public             primary
-system         public        jobs                             id             system              public             primary
-system         public        lease                            descID         system              public             primary
-system         public        lease                            expiration     system              public             primary
-system         public        lease                            nodeID         system              public             primary
-system         public        lease                            version        system              public             primary
-system         public        locations                        localityKey    system              public             primary
-system         public        locations                        localityValue  system              public             primary
-system         public        namespace                        name           system              public             primary
-system         public        namespace                        parentID       system              public             primary
-system         public        rangelog                         timestamp      system              public             primary
-system         public        rangelog                         uniqueID       system              public             primary
-system         public        replication_constraint_stats     config         system              public             primary
-system         public        replication_constraint_stats     subzone_id     system              public             primary
-system         public        replication_constraint_stats     type           system              public             primary
-system         public        replication_constraint_stats     zone_id        system              public             primary
-system         public        replication_critical_localities  locality       system              public             primary
-system         public        replication_critical_localities  subzone_id     system              public             primary
-system         public        replication_critical_localities  zone_id        system              public             primary
-system         public        replication_stats                subzone_id     system              public             primary
-system         public        replication_stats                zone_id        system              public             primary
-system         public        reports_meta                     id             system              public             primary
-system         public        role_members                     member         system              public             primary
-system         public        role_members                     role           system              public             primary
-system         public        settings                         name           system              public             primary
-system         public        table_statistics                 statisticID    system              public             primary
-system         public        table_statistics                 tableID        system              public             primary
-system         public        ui                               key            system              public             primary
-system         public        users                            username       system              public             primary
-system         public        web_sessions                     id             system              public             primary
-system         public        zones                            id             system              public             primary
+table_catalog  table_schema  table_name                       column_name     constraint_catalog  constraint_schema  constraint_name
+system         public        comments                         object_id       system              public             primary
+system         public        comments                         sub_id          system              public             primary
+system         public        comments                         type            system              public             primary
+system         public        descriptor                       id              system              public             primary
+system         public        eventlog                         timestamp       system              public             primary
+system         public        eventlog                         uniqueID        system              public             primary
+system         public        jobs                             id              system              public             primary
+system         public        lease                            descID          system              public             primary
+system         public        lease                            expiration      system              public             primary
+system         public        lease                            nodeID          system              public             primary
+system         public        lease                            version         system              public             primary
+system         public        locations                        localityKey     system              public             primary
+system         public        locations                        localityValue   system              public             primary
+system         public        namespace                        name            system              public             primary
+system         public        namespace                        parentID        system              public             primary
+system         public        namespace                        parentSchemaID  system              public             primary
+system         public        namespace_deprecated             name            system              public             primary
+system         public        namespace_deprecated             parentID        system              public             primary
+system         public        protected_ts_meta                singleton       system              public             check_singleton
+system         public        protected_ts_meta                singleton       system              public             primary
+system         public        protected_ts_records             id              system              public             primary
+system         public        rangelog                         timestamp       system              public             primary
+system         public        rangelog                         uniqueID        system              public             primary
+system         public        replication_constraint_stats     config          system              public             primary
+system         public        replication_constraint_stats     subzone_id      system              public             primary
+system         public        replication_constraint_stats     type            system              public             primary
+system         public        replication_constraint_stats     zone_id         system              public             primary
+system         public        replication_critical_localities  locality        system              public             primary
+system         public        replication_critical_localities  subzone_id      system              public             primary
+system         public        replication_critical_localities  zone_id         system              public             primary
+system         public        replication_stats                subzone_id      system              public             primary
+system         public        replication_stats                zone_id         system              public             primary
+system         public        reports_meta                     id              system              public             primary
+system         public        role_members                     member          system              public             primary
+system         public        role_members                     role            system              public             primary
+system         public        settings                         name            system              public             primary
+system         public        table_statistics                 statisticID     system              public             primary
+system         public        table_statistics                 tableID         system              public             primary
+system         public        ui                               key             system              public             primary
+system         public        users                            username        system              public             primary
+system         public        web_sessions                     id              system              public             primary
+system         public        zones                            id              system              public             primary
 
 statement ok
 CREATE DATABASE constraint_db
@@ -843,12 +961,14 @@ SELECT *
 FROM information_schema.table_constraints
 ORDER BY TABLE_NAME, CONSTRAINT_TYPE, CONSTRAINT_NAME
 ----
-constraint_catalog  constraint_schema  constraint_name  table_catalog  table_schema  table_name  constraint_type  is_deferrable  initially_deferred
-constraint_db       public             c2               constraint_db  public        t1          CHECK            NO             NO
-constraint_db       public             check_a          constraint_db  public        t1          CHECK            NO             NO
-constraint_db       public             primary          constraint_db  public        t1          PRIMARY KEY      NO             NO
-constraint_db       public             t1_a_key         constraint_db  public        t1          UNIQUE           NO             NO
-constraint_db       public             fk               constraint_db  public        t2          FOREIGN KEY      NO             NO
+constraint_catalog  constraint_schema  constraint_name          table_catalog  table_schema  table_name  constraint_type  is_deferrable  initially_deferred
+constraint_db       public             541687103_59_1_not_null  constraint_db  public        t1          CHECK            NO             NO
+constraint_db       public             c2                       constraint_db  public        t1          CHECK            NO             NO
+constraint_db       public             check_a                  constraint_db  public        t1          CHECK            NO             NO
+constraint_db       public             primary                  constraint_db  public        t1          PRIMARY KEY      NO             NO
+constraint_db       public             t1_a_key                 constraint_db  public        t1          UNIQUE           NO             NO
+constraint_db       public             541687103_60_2_not_null  constraint_db  public        t2          CHECK            NO             NO
+constraint_db       public             fk                       constraint_db  public        t2          FOREIGN KEY      NO             NO
 
 query TTTT colnames
 SELECT *
@@ -882,9 +1002,10 @@ USING (constraint_catalog, constraint_schema, constraint_name)
 WHERE tc.table_schema in ('public')
 ORDER BY tc.table_schema, tc.table_name, cc.constraint_name
 ----
-table_schema  table_name  constraint_name  check_clause
-public        t1          c2               ((a < 99))
-public        t1          check_a          ((a > 4))
+table_schema  table_name  constraint_name          check_clause
+public        t1          541687103_59_1_not_null  p IS NOT NULL
+public        t1          c2                       ((a < 99))
+public        t1          check_a                  ((a > 4))
 
 statement ok
 DROP DATABASE constraint_db CASCADE
@@ -923,9 +1044,25 @@ system         public        locations                        latitude          
 system         public        locations                        localityKey              1
 system         public        locations                        localityValue            2
 system         public        locations                        longitude                4
-system         public        namespace                        id                       3
-system         public        namespace                        name                     2
+system         public        namespace                        id                       4
+system         public        namespace                        name                     3
 system         public        namespace                        parentID                 1
+system         public        namespace                        parentSchemaID           2
+system         public        namespace_deprecated             id                       3
+system         public        namespace_deprecated             name                     2
+system         public        namespace_deprecated             parentID                 1
+system         public        protected_ts_meta                num_records              3
+system         public        protected_ts_meta                num_spans                4
+system         public        protected_ts_meta                singleton                1
+system         public        protected_ts_meta                total_bytes              5
+system         public        protected_ts_meta                version                  2
+system         public        protected_ts_records             id                       1
+system         public        protected_ts_records             meta                     4
+system         public        protected_ts_records             meta_type                3
+system         public        protected_ts_records             num_spans                5
+system         public        protected_ts_records             spans                    6
+system         public        protected_ts_records             ts                       2
+system         public        protected_ts_records             verified                 7
 system         public        rangelog                         eventType                4
 system         public        rangelog                         info                     6
 system         public        rangelog                         otherRangeID             5
@@ -1360,6 +1497,7 @@ NULL     public   system         pg_catalog          pg_am                      
 NULL     public   system         pg_catalog          pg_attrdef                         SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_attribute                       SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_auth_members                    SELECT          NULL          YES
+NULL     public   system         pg_catalog          pg_authid                          SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_available_extensions            SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_cast                            SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_class                           SELECT          NULL          YES
@@ -1467,6 +1605,18 @@ NULL     admin    system         public              namespace                  
 NULL     admin    system         public              namespace                          SELECT          NULL          YES
 NULL     root     system         public              namespace                          GRANT           NULL          NO
 NULL     root     system         public              namespace                          SELECT          NULL          YES
+NULL     admin    system         public              namespace_deprecated               GRANT           NULL          NO
+NULL     admin    system         public              namespace_deprecated               SELECT          NULL          YES
+NULL     root     system         public              namespace_deprecated               GRANT           NULL          NO
+NULL     root     system         public              namespace_deprecated               SELECT          NULL          YES
+NULL     admin    system         public              protected_ts_meta                  GRANT           NULL          NO
+NULL     admin    system         public              protected_ts_meta                  SELECT          NULL          YES
+NULL     root     system         public              protected_ts_meta                  GRANT           NULL          NO
+NULL     root     system         public              protected_ts_meta                  SELECT          NULL          YES
+NULL     admin    system         public              protected_ts_records               GRANT           NULL          NO
+NULL     admin    system         public              protected_ts_records               SELECT          NULL          YES
+NULL     root     system         public              protected_ts_records               GRANT           NULL          NO
+NULL     root     system         public              protected_ts_records               SELECT          NULL          YES
 NULL     admin    system         public              rangelog                           DELETE          NULL          NO
 NULL     admin    system         public              rangelog                           GRANT           NULL          NO
 NULL     admin    system         public              rangelog                           INSERT          NULL          NO
@@ -1652,6 +1802,7 @@ NULL     public   system         pg_catalog          pg_am                      
 NULL     public   system         pg_catalog          pg_attrdef                         SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_attribute                       SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_auth_members                    SELECT          NULL          YES
+NULL     public   system         pg_catalog          pg_authid                          SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_available_extensions            SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_cast                            SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_class                           SELECT          NULL          YES
@@ -1696,10 +1847,10 @@ NULL     public   system         pg_catalog          pg_type                    
 NULL     public   system         pg_catalog          pg_user                            SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_user_mapping                    SELECT          NULL          YES
 NULL     public   system         pg_catalog          pg_views                           SELECT          NULL          YES
-NULL     admin    system         public              namespace                          GRANT           NULL          NO
-NULL     admin    system         public              namespace                          SELECT          NULL          YES
-NULL     root     system         public              namespace                          GRANT           NULL          NO
-NULL     root     system         public              namespace                          SELECT          NULL          YES
+NULL     admin    system         public              namespace_deprecated               GRANT           NULL          NO
+NULL     admin    system         public              namespace_deprecated               SELECT          NULL          YES
+NULL     root     system         public              namespace_deprecated               GRANT           NULL          NO
+NULL     root     system         public              namespace_deprecated               SELECT          NULL          YES
 NULL     admin    system         public              descriptor                         GRANT           NULL          NO
 NULL     admin    system         public              descriptor                         SELECT          NULL          YES
 NULL     root     system         public              descriptor                         GRANT           NULL          NO
@@ -1879,6 +2030,18 @@ NULL     root     system         public              reports_meta               
 NULL     root     system         public              reports_meta                       INSERT          NULL          NO
 NULL     root     system         public              reports_meta                       SELECT          NULL          YES
 NULL     root     system         public              reports_meta                       UPDATE          NULL          NO
+NULL     admin    system         public              namespace                          GRANT           NULL          NO
+NULL     admin    system         public              namespace                          SELECT          NULL          YES
+NULL     root     system         public              namespace                          GRANT           NULL          NO
+NULL     root     system         public              namespace                          SELECT          NULL          YES
+NULL     admin    system         public              protected_ts_meta                  GRANT           NULL          NO
+NULL     admin    system         public              protected_ts_meta                  SELECT          NULL          YES
+NULL     root     system         public              protected_ts_meta                  GRANT           NULL          NO
+NULL     root     system         public              protected_ts_meta                  SELECT          NULL          YES
+NULL     admin    system         public              protected_ts_records               GRANT           NULL          NO
+NULL     admin    system         public              protected_ts_records               SELECT          NULL          YES
+NULL     root     system         public              protected_ts_records               GRANT           NULL          NO
+NULL     root     system         public              protected_ts_records               SELECT          NULL          YES
 
 statement ok
 CREATE TABLE other_db.xyz (i INT)
@@ -2026,6 +2189,7 @@ admin    test           GRANT           NULL
 admin    test           INSERT          NULL
 admin    test           SELECT          NULL
 admin    test           UPDATE          NULL
+admin    test           ZONECONFIG      NULL
 root     test           ALL             NULL
 root     test           CREATE          NULL
 root     test           DELETE          NULL
@@ -2034,6 +2198,7 @@ root     test           GRANT           NULL
 root     test           INSERT          NULL
 root     test           SELECT          NULL
 root     test           UPDATE          NULL
+root     test           ZONECONFIG      NULL
 
 # information_schema.sequences
 

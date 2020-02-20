@@ -222,6 +222,7 @@ const (
 	InvalidSchemaDefinition            = "42P15"
 	InvalidTableDefinition             = "42P16"
 	InvalidObjectDefinition            = "42P17"
+	FileAlreadyExists                  = "42C01"
 	// Class 44 - WITH CHECK OPTION Violation
 	WithCheckOptionViolation = "44000"
 	// Class 53 - Insufficient Resources
@@ -328,11 +329,18 @@ const (
 	//       must use 'error pgcode XXA00 ...'
 	TransactionCommittedWithSchemaChangeFailure = "XXA00"
 
+	// Class 22C - Semantic errors in the structure of a SQL statement.
+
+	// ScalarOperationCannotRunWithoutFullSessionContext signals that an
+	// operator or built-in function was used that requires a full
+	// session contextand thus cannot be run in a background job or away
+	// from the SQL gateway.
+	ScalarOperationCannotRunWithoutFullSessionContext = "22C01"
+
 	// Class 58C - System errors related to CockroachDB node problems.
 
 	// RangeUnavailable signals that some data from the cluster cannot be
 	// accessed (e.g. because all replicas awol).
-	// We're using the postgres "Internal Error" error class "XX".
 	RangeUnavailable = "58C00"
 	// DeprecatedRangeUnavailable is code that we used for RangeUnavailable until 19.2.
 	// 20.1 needs to recognize it coming from 19.2 nodes.
@@ -346,5 +354,5 @@ const (
 	// InternalConnectionFailure until 19.2.
 	// 20.1 needs to recognize it coming from 19.2 nodes.
 	// TODO(andrei): remove in 20.2.
-	DeprecatedInternalConnectionFailure = "XXC03"
+	DeprecatedInternalConnectionFailure = ConnectionFailure
 )

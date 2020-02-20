@@ -12,6 +12,9 @@ package distsql
 
 import (
 	"context"
+	"fmt"
+	"math"
+	"strconv"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -26,21 +29,35 @@ import (
 	"github.com/pkg/errors"
 )
 
+type verifyColOperatorArgs struct {
+	// anyOrder determines whether the results should be matched in order (when
+	// anyOrder is false) or as sets (when anyOrder is true).
+	anyOrder bool
+	// colsForEqCheck (when non-nil) specifies the column indices that should be
+	// used for equality check. If it is nil, then the whole rows are compared.
+	colsForEqCheck []uint32
+	inputTypes     [][]types.T
+	inputs         []sqlbase.EncDatumRows
+	outputTypes    []types.T
+	pspec          *execinfrapb.ProcessorSpec
+	// forceDiskSpill, if set, will force the operator to spill to disk.
+	forceDiskSpill bool
+}
+
 // verifyColOperator passes inputs through both the processor defined by pspec
 // and the corresponding columnar operator and verifies that the results match.
-//
-// anyOrder determines whether the results should be matched in order (when
-// anyOrder is false) or as sets (when anyOrder is true).
-func verifyColOperator(
-	anyOrder bool,
-	inputTypes [][]types.T,
-	inputs []sqlbase.EncDatumRows,
-	outputTypes []types.T,
-	pspec *execinfrapb.ProcessorSpec,
-) error {
+func verifyColOperator(args verifyColOperatorArgs) error {
+	const floatPrecision = 0.0000001
+	if args.colsForEqCheck == nil {
+		args.colsForEqCheck = make([]uint32, len(args.outputTypes))
+		for i := range args.colsForEqCheck {
+			args.colsForEqCheck[i] = uint32(i)
+		}
+	}
+
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	tempEngine, err := engine.NewTempEngine(engine.DefaultStorageEngine, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+	tempEngine, _, err := engine.NewTempEngine(ctx, engine.DefaultStorageEngine, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
 	if err != nil {
 		return err
 	}
@@ -58,15 +75,19 @@ func verifyColOperator(
 			DiskMonitor: diskMonitor,
 		},
 	}
+	flowCtx.Cfg.TestingKnobs.ForceDiskSpill = args.forceDiskSpill
 
-	inputsProc := make([]execinfra.RowSource, len(inputs))
-	inputsColOp := make([]execinfra.RowSource, len(inputs))
-	for i, input := range inputs {
-		inputsProc[i] = execinfra.NewRepeatableRowSource(inputTypes[i], input)
-		inputsColOp[i] = execinfra.NewRepeatableRowSource(inputTypes[i], input)
+	inputsProc := make([]execinfra.RowSource, len(args.inputs))
+	inputsColOp := make([]execinfra.RowSource, len(args.inputs))
+	for i, input := range args.inputs {
+		inputsProc[i] = execinfra.NewRepeatableRowSource(args.inputTypes[i], input)
+		inputsColOp[i] = execinfra.NewRepeatableRowSource(args.inputTypes[i], input)
 	}
 
-	proc, err := rowexec.NewProcessor(ctx, flowCtx, 0, &pspec.Core, &pspec.Post, inputsProc, []execinfra.RowReceiver{nil}, nil)
+	proc, err := rowexec.NewProcessor(
+		ctx, flowCtx, 0, &args.pspec.Core, &args.pspec.Post,
+		inputsProc, []execinfra.RowReceiver{nil}, nil,
+	)
 	if err != nil {
 		return err
 	}
@@ -78,7 +99,7 @@ func verifyColOperator(
 	acc := evalCtx.Mon.MakeBoundAccount()
 	defer acc.Close(ctx)
 	testAllocator := colexec.NewAllocator(ctx, &acc)
-	columnarizers := make([]colexec.Operator, len(inputs))
+	columnarizers := make([]colexec.Operator, len(args.inputs))
 	for i, input := range inputsColOp {
 		c, err := colexec.NewColumnarizer(ctx, testAllocator, flowCtx, int32(i)+1, input)
 		if err != nil {
@@ -87,26 +108,37 @@ func verifyColOperator(
 		columnarizers[i] = c
 	}
 
-	result, err := colexec.NewColOperator(
-		ctx, flowCtx, pspec, columnarizers, &acc,
-		true, /* useStreamingMemAccountForBuffering */
-	)
+	constructorArgs := colexec.NewColOperatorArgs{
+		Spec:                 args.pspec,
+		Inputs:               columnarizers,
+		StreamingMemAccount:  &acc,
+		ProcessorConstructor: rowexec.NewProcessor,
+	}
+	var spilled bool
+	if args.forceDiskSpill {
+		constructorArgs.TestingKnobs.SpillingCallbackFn = func() { spilled = true }
+	}
+	result, err := colexec.NewColOperator(ctx, flowCtx, constructorArgs)
 	if err != nil {
 		return err
 	}
-	if result.BufferingOpMemMonitor != nil {
-		defer result.BufferingOpMemMonitor.Stop(ctx)
-		defer result.BufferingOpMemAccount.Close(ctx)
-	}
+	defer func() {
+		for _, memAccount := range result.BufferingOpMemAccounts {
+			memAccount.Close(ctx)
+		}
+		for _, memMonitor := range result.BufferingOpMemMonitors {
+			memMonitor.Stop(ctx)
+		}
+	}()
 
 	outColOp, err := colexec.NewMaterializer(
 		flowCtx,
-		int32(len(inputs))+2,
+		int32(len(args.inputs))+2,
 		result.Op,
-		outputTypes,
+		args.outputTypes,
 		&execinfrapb.PostProcessSpec{},
 		nil, /* output */
-		nil, /* metadataSourcesQueue */
+		result.MetadataSources,
 		nil, /* outputStatsToTrace */
 		nil, /* cancelFlow */
 	)
@@ -119,53 +151,146 @@ func verifyColOperator(
 	defer outProc.ConsumerClosed()
 	defer outColOp.ConsumerClosed()
 
-	var procRows, colOpRows []string
-	rowCount := 0
-	for {
-		rowProc, meta := outProc.Next()
-		if meta != nil {
-			return errors.Errorf("unexpected meta %+v from processor", meta)
+	printRowForChecking := func(r sqlbase.EncDatumRow) []string {
+		res := make([]string, len(args.colsForEqCheck))
+		for i, col := range args.colsForEqCheck {
+			res[i] = r[col].String(&args.outputTypes[col])
 		}
-		rowColOp, meta := outColOp.Next()
-		if meta != nil {
-			return errors.Errorf("unexpected meta %+v from columnar operator", meta)
+		return res
+	}
+	var procRows, colOpRows [][]string
+	var procMetas, colOpMetas []execinfrapb.ProducerMetadata
+	for {
+		rowProc, metaProc := outProc.Next()
+		if rowProc != nil {
+			row := printRowForChecking(rowProc)
+			if len(row) != len(args.colsForEqCheck) {
+				return errors.Errorf("unexpectedly processor returned a row of"+
+					"different length\n%s", row)
+			}
+			procRows = append(procRows, row)
+		}
+		if metaProc != nil {
+			if metaProc.Err == nil {
+				return errors.Errorf("unexpectedly processor returned non-error "+
+					"meta\n%+v", metaProc)
+			}
+			procMetas = append(procMetas, *metaProc)
+		}
+		rowColOp, metaColOp := outColOp.Next()
+		if rowColOp != nil {
+			row := printRowForChecking(rowColOp)
+			if len(row) != len(args.colsForEqCheck) {
+				return errors.Errorf("unexpectedly columnar operator returned a row of "+
+					"different length\n%s", row)
+			}
+			colOpRows = append(colOpRows, printRowForChecking(rowColOp))
+		}
+		if metaColOp != nil {
+			if metaColOp.Err == nil {
+				return errors.Errorf("unexpectedly columnar operator returned "+
+					"non-error meta\n%+v", metaColOp)
+			}
+			colOpMetas = append(colOpMetas, *metaColOp)
 		}
 
-		if rowProc != nil && rowColOp == nil {
-			return errors.Errorf("different results: processor produced a row %s while columnar operator is done", rowProc.String(outputTypes))
-		}
-		if rowColOp != nil && rowProc == nil {
-			return errors.Errorf("different results: columnar operator produced a row %s while processor is done", rowColOp.String(outputTypes))
-		}
-		if rowProc == nil && rowColOp == nil {
+		if rowProc == nil && metaProc == nil &&
+			rowColOp == nil && metaColOp == nil {
 			break
 		}
-
-		expStr := rowProc.String(outputTypes)
-		retStr := rowColOp.String(outputTypes)
-		if anyOrder {
-			// We accumulate all the rows to be matched using set comparison when
-			// both "producers" are done.
-			procRows = append(procRows, expStr)
-			colOpRows = append(colOpRows, retStr)
-		} else {
-			// anyOrder is false, so the result rows must match in the same order.
-			if expStr != retStr {
-				return errors.Errorf("different results on row %d;\nexpected:\n   %s\ngot:\n   %s", rowCount, expStr, retStr)
-			}
-		}
-		rowCount++
 	}
 
-	if anyOrder {
+	if len(procMetas) != len(colOpMetas) {
+		return errors.Errorf("different number of metas returned:\n"+
+			"processor returned\n%+v\n\ncolumnar operator returned\n%+v",
+			procMetas, colOpMetas)
+	}
+	// It is possible that a query will hit an error (for example, integer out of
+	// range). We then expect that both the processor and the operator returned
+	// such error.
+	if len(procMetas) > 1 {
+		return errors.Errorf("unexpectedly multiple metas returned:\n"+
+			"processor returned\n%+v\n\ncolumnar operator returned\n%+v",
+			procMetas, colOpMetas)
+	} else if len(procMetas) == 1 {
+		procErr := procMetas[0].Err.Error()
+		colOpErr := colOpMetas[0].Err.Error()
+		if procErr != colOpErr {
+			return errors.Errorf("different errors returned:\n"+
+				"processor return\n%+v\ncolumnar operator returned\n%+v",
+				procMetas[0].Err, colOpMetas[0].Err)
+		}
+		// The errors are the same, so the rows that were returned do not matter.
+		return nil
+	}
+
+	if len(procRows) != len(colOpRows) {
+		return errors.Errorf("different number of rows returned:\n"+
+			"processor returned\n%+v\n\ncolumnar operator returned\n%+v\n"+
+			"processor metas\n%+v\ncolumnar operator metas\n%+v\n",
+			procRows, colOpRows, procMetas, colOpMetas)
+	}
+
+	printRowsOutput := func(rows [][]string) string {
+		res := ""
+		for i, row := range rows {
+			res = fmt.Sprintf("%s\n%d: %v", res, i, row)
+		}
+		return res
+	}
+
+	datumsMatch := func(expected, actual string, typ *types.T) (bool, error) {
+		switch typ.Family() {
+		case types.FloatFamily:
+			// Some operations on floats (for example, aggregation) can produce
+			// slightly different results in the row-by-row and vectorized engines.
+			// That's why we handle them separately.
+
+			// We first try direct string matching. If that succeeds, then great!
+			if expected == actual {
+				return true, nil
+			}
+			// If only one of the values is NULL, then the datums do not match.
+			if expected == `NULL` || actual == `NULL` {
+				return false, nil
+			}
+			// Now we will try parsing both strings as floats and check whether they
+			// are within allowed precision from each other.
+			expFloat, err := strconv.ParseFloat(expected, 64)
+			if err != nil {
+				return false, err
+			}
+			actualFloat, err := strconv.ParseFloat(actual, 64)
+			if err != nil {
+				return false, err
+			}
+			return math.Abs(expFloat-actualFloat) < floatPrecision, nil
+		default:
+			return expected == actual, nil
+		}
+	}
+
+	if args.anyOrder {
 		used := make([]bool, len(colOpRows))
-		for i, expStr := range procRows {
+		for i, expStrRow := range procRows {
 			rowMatched := false
-			for j, retStr := range colOpRows {
+			for j, retStrRow := range colOpRows {
 				if used[j] {
 					continue
 				}
-				if expStr == retStr {
+				foundDifference := false
+				for k, col := range args.colsForEqCheck {
+					match, err := datumsMatch(expStrRow[k], retStrRow[k], &args.outputTypes[col])
+					if err != nil {
+						return errors.Errorf("error while parsing datum in rows\n%v\n%v\n%s",
+							expStrRow, retStrRow, err.Error())
+					}
+					if !match {
+						foundDifference = true
+						break
+					}
+				}
+				if !foundDifference {
 					rowMatched = true
 					used[j] = true
 					break
@@ -173,13 +298,35 @@ func verifyColOperator(
 			}
 			if !rowMatched {
 				return errors.Errorf("different results: no match found for row %d of processor output\n"+
-					"processor output:\n		%v\ncolumnar operator output:\n		%v", i, procRows, colOpRows)
+					"processor output:%s\n\ncolumnar operator output:%s",
+					i, printRowsOutput(procRows), printRowsOutput(colOpRows))
 			}
 		}
-		// Note: we do not check whether used is all true here because procRows and
-		// colOpRows, at this point, must have equal number of rows - if it weren't
-		// true, an error would have been returned that either of the "producers"
-		// outputted a row while the other one didn't.
+	} else {
+		for i, expStrRow := range procRows {
+			retStrRow := colOpRows[i]
+			// anyOrder is false, so the result rows must match in the same order.
+			for k, col := range args.colsForEqCheck {
+				match, err := datumsMatch(expStrRow[k], retStrRow[k], &args.outputTypes[col])
+				if err != nil {
+					return errors.Errorf("error while parsing datum in rows\n%v\n%v\n%s",
+						expStrRow, retStrRow, err.Error())
+				}
+				if !match {
+					return errors.Errorf(
+						"different results on row %d;\nexpected:\n%s\ngot:\n%s",
+						i, expStrRow, retStrRow,
+					)
+				}
+			}
+		}
+	}
+
+	if args.forceDiskSpill {
+		// Check that the spilling did occur.
+		if !spilled {
+			return errors.Errorf("expected spilling to disk but it did *not* occur")
+		}
 	}
 	return nil
 }

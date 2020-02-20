@@ -12,13 +12,16 @@ package memo
 
 import (
 	"fmt"
+	"math/bits"
 	"sort"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -95,14 +98,13 @@ type RelExpr interface {
 }
 
 // ScalarPropsExpr is implemented by scalar expressions which cache scalar
-// properties, like FiltersExpr and ProjectionsExpr. The scalar properties are
-// lazily populated only when requested by walking the expression subtree.
+// properties, like FiltersExpr and ProjectionsExpr. These expressions are also
+// tagged with the ScalarProps tag.
 type ScalarPropsExpr interface {
 	opt.ScalarExpr
 
 	// ScalarProps returns the scalar properties associated with the expression.
-	// These can be lazily calculated using the given memo as context.
-	ScalarProps(mem *Memo) *props.Scalar
+	ScalarProps() *props.Scalar
 }
 
 // TrueSingleton is a global instance of TrueExpr, to avoid allocations.
@@ -142,13 +144,6 @@ var CountRowsSingleton = &CountRowsExpr{}
 //   SELECT * FROM a INNER JOIN b ON True
 //
 var TrueFilter = FiltersExpr{}
-
-// FalseFilter is a global instance of a FiltersExpr that contains a single
-// False expression, used in contradiction situations:
-//
-//   SELECT * FROM a WHERE 1=0
-//
-var FalseFilter = FiltersExpr{{Condition: FalseSingleton}}
 
 // EmptyTuple is a global instance of a TupleExpr that contains no elements.
 // While this cannot be created in SQL, it can be the created by normalizations.
@@ -200,7 +195,7 @@ func (n FiltersExpr) IsFalse() bool {
 func (n FiltersExpr) OuterCols(mem *Memo) opt.ColSet {
 	var colSet opt.ColSet
 	for i := range n {
-		colSet.UnionWith(n[i].ScalarProps(mem).OuterCols)
+		colSet.UnionWith(n[i].ScalarProps().OuterCols)
 	}
 	return colSet
 }
@@ -234,21 +229,6 @@ func (n *FiltersExpr) Deduplicate() {
 	*n = dedup
 }
 
-// RetainCommonFilters retains only the filters found in n and other.
-func (n *FiltersExpr) RetainCommonFilters(other FiltersExpr) {
-	// TODO(ridwanmsharif): Faster intersection using a map
-	common := (*n)[:0]
-	for _, filter := range *n {
-		for _, otherFilter := range other {
-			if filter.Condition == otherFilter.Condition {
-				common = append(common, filter)
-				break
-			}
-		}
-	}
-	*n = common
-}
-
 // RemoveCommonFilters removes the filters found in other from n.
 func (n *FiltersExpr) RemoveCommonFilters(other FiltersExpr) {
 	// TODO(ridwanmsharif): Faster intersection using a map
@@ -280,10 +260,10 @@ func (n AggregationsExpr) OutputCols() opt.ColSet {
 
 // OuterCols returns the set of outer columns needed by any of the zip
 // expressions.
-func (n ZipExpr) OuterCols(mem *Memo) opt.ColSet {
+func (n ZipExpr) OuterCols() opt.ColSet {
 	var colSet opt.ColSet
 	for i := range n {
-		colSet.UnionWith(n[i].ScalarProps(mem).OuterCols)
+		colSet.UnionWith(n[i].ScalarProps().OuterCols)
 	}
 	return colSet
 }
@@ -363,38 +343,90 @@ func (sf *ScanFlags) Empty() bool {
 
 // JoinFlags stores restrictions on the join execution method, derived from
 // hints for a join specified in the query (see tree.JoinTableExpr).
-type JoinFlags struct {
-	DisallowLookupJoin bool
-	DisallowMergeJoin  bool
-	DisallowHashJoin   bool
+// It is a bitfield where a bit is 1 if a certain type of join is allowed. The
+// value 0 is special and indicates that any join is allowed.
+type JoinFlags uint8
+
+// Each flag indicates if a certain type of join is allowed. The JoinFlags are
+// an OR of these flags, with the special case that the value 0 means anything
+// is allowed.
+const (
+	// AllowHashJoinStoreLeft corresponds to a hash join where the left side is
+	// stored into the hashtable. Note that execution can override the stored side
+	// if it finds that the other side is smaller (up to a certain size).
+	AllowHashJoinStoreLeft JoinFlags = (1 << iota)
+
+	// AllowHashJoinStoreRight corresponds to a hash join where the right side is
+	// stored into the hashtable. Note that execution can override the stored side
+	// if it finds that the other side is smaller (up to a certain size).
+	AllowHashJoinStoreRight
+
+	// AllowMergeJoin corresponds to a merge join.
+	AllowMergeJoin
+
+	// AllowLookupJoinIntoLeft corresponds to a lookup join where the lookup
+	// table is on the left side.
+	AllowLookupJoinIntoLeft
+
+	// AllowLookupJoinIntoRight corresponds to a lookup join where the lookup
+	// table is on the right side.
+	AllowLookupJoinIntoRight
+)
+
+var joinFlagStr = map[JoinFlags]string{
+	AllowHashJoinStoreLeft:   "hash join (store left side)",
+	AllowHashJoinStoreRight:  "hash join (store right side)",
+	AllowMergeJoin:           "merge join",
+	AllowLookupJoinIntoLeft:  "lookup join (into left side)",
+	AllowLookupJoinIntoRight: "lookup join (into right side)",
 }
 
-// Empty returns true if there are no flags set.
+// Empty returns true if this is the default value (where all join types are
+// allowed).
 func (jf JoinFlags) Empty() bool {
-	return !jf.DisallowLookupJoin && !jf.DisallowMergeJoin && !jf.DisallowHashJoin
+	return jf == 0
+}
+
+// Has returns true if the given flag is set.
+func (jf JoinFlags) Has(flag JoinFlags) bool {
+	return jf.Empty() || jf&flag != 0
 }
 
 func (jf JoinFlags) String() string {
 	if jf.Empty() {
 		return "no flags"
 	}
+
+	// Special cases for prettier results.
+	switch jf {
+	case AllowHashJoinStoreLeft | AllowHashJoinStoreRight:
+		return "force hash join"
+	case AllowLookupJoinIntoLeft | AllowLookupJoinIntoRight:
+		return "force lookup join"
+	}
+
 	var b strings.Builder
-	if jf.DisallowLookupJoin {
-		b.WriteString("no-lookup-join")
-	}
-	if jf.DisallowMergeJoin {
-		if b.Len() > 0 {
-			b.WriteByte(';')
+	b.WriteString("force ")
+	first := true
+	for jf != 0 {
+		flag := JoinFlags(1 << uint8(bits.TrailingZeros8(uint8(jf))))
+		if !first {
+			b.WriteString(" or ")
 		}
-		b.WriteString("no-merge-join")
-	}
-	if jf.DisallowHashJoin {
-		if b.Len() > 0 {
-			b.WriteByte(';')
-		}
-		b.WriteString("no-hash-join")
+		first = false
+		b.WriteString(joinFlagStr[flag])
+		jf ^= flag
 	}
 	return b.String()
+}
+
+func (lj *LookupJoinExpr) initUnexportedFields(mem *Memo) {
+	// lookupProps are initialized as necessary by the logical props builder.
+}
+
+func (zj *ZigzagJoinExpr) initUnexportedFields(mem *Memo) {
+	// leftProps and rightProps are initialized as necessary by the logical props
+	// builder.
 }
 
 // WindowFrame denotes the definition of a window frame for an individual
@@ -404,6 +436,22 @@ type WindowFrame struct {
 	StartBoundType tree.WindowFrameBoundType
 	EndBoundType   tree.WindowFrameBoundType
 	FrameExclusion tree.WindowFrameExclusion
+}
+
+// IsCanonical returns true if the ScanPrivate indicates an original unaltered
+// primary index Scan operator (i.e. unconstrained and not limited).
+func (s *ScanPrivate) IsCanonical() bool {
+	return s.Index == cat.PrimaryIndex &&
+		s.Constraint == nil &&
+		s.HardLimit == 0
+}
+
+// IsLocking returns true if the ScanPrivate is configured to use a row-level
+// locking mode. This can be the case either because the Scan is in the scope of
+// a SELECT .. FOR [KEY] UPDATE/SHARE clause or because the Scan was configured
+// as part of the row retrieval of a DELETE or UPDATE statement.
+func (s *ScanPrivate) IsLocking() bool {
+	return s.Locking != nil
 }
 
 // NeedResults returns true if the mutation operator can return the rows that
@@ -455,6 +503,66 @@ func (m *MutationPrivate) AddEquivTableCols(md *opt.Metadata, fdset *props.FuncD
 			fdset.AddEquivalency(t, id)
 		}
 	}
+}
+
+// initUnexportedFields is called when a project expression is created.
+func (prj *ProjectExpr) initUnexportedFields(mem *Memo) {
+	inputProps := prj.Input.Relational()
+	// Determine the not-null columns.
+	prj.notNullCols = inputProps.NotNullCols.Copy()
+	for i := range prj.Projections {
+		item := &prj.Projections[i]
+		if ExprIsNeverNull(item.Element, inputProps.NotNullCols) {
+			prj.notNullCols.Add(item.Col)
+		}
+	}
+
+	// Determine the "internal" functional dependencies (for the union of input
+	// columns and synthesized columns).
+	prj.internalFuncDeps.CopyFrom(&inputProps.FuncDeps)
+	for i := range prj.Projections {
+		item := &prj.Projections[i]
+		if v, ok := item.Element.(*VariableExpr); ok && inputProps.OutputCols.Contains(v.Col) {
+			// Handle any column that is a direct reference to an input column. The
+			// optimizer sometimes constructs these in order to generate different
+			// column IDs; they can also show up after constant-folding e.g. an ORDER
+			// BY expression.
+			prj.internalFuncDeps.AddEquivalency(v.Col, item.Col)
+			continue
+		}
+
+		if !item.scalar.CanHaveSideEffects {
+			from := item.scalar.OuterCols.Intersection(inputProps.OutputCols)
+
+			// We want to set up the FD: from --> colID.
+			// This does not necessarily hold for "composite" types like decimals or
+			// collated strings. For example if d is a decimal, d::TEXT can have
+			// different values for equal values of d, like 1 and 1.0.
+			//
+			// We only add the FD if composite types are not involved.
+			//
+			// TODO(radu): add a whitelist of expressions/operators that are ok, like
+			// arithmetic.
+			composite := false
+			for i, ok := from.Next(0); ok; i, ok = from.Next(i + 1) {
+				typ := mem.Metadata().ColumnMeta(i).Type
+				if sqlbase.DatumTypeHasCompositeKeyEncoding(typ) {
+					composite = true
+					break
+				}
+			}
+			if !composite {
+				prj.internalFuncDeps.AddSynthesizedCol(from, item.Col)
+			}
+		}
+	}
+	prj.internalFuncDeps.MakeNotNull(prj.notNullCols)
+}
+
+// InternalFDs returns the functional dependencies for the set of all input
+// columns plus the synthesized columns.
+func (prj *ProjectExpr) InternalFDs() *props.FuncDepSet {
+	return &prj.internalFuncDeps
 }
 
 // ExprIsNeverNull makes a best-effort attempt to prove that the provided

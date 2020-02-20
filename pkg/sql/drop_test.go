@@ -19,7 +19,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -45,7 +45,7 @@ import (
 // Returns an error if a zone config for the specified table or
 // database ID doesn't match the expected parameter. If expected
 // is nil, then we verify no zone config exists.
-func zoneExists(sqlDB *gosql.DB, expected *config.ZoneConfig, id sqlbase.ID) error {
+func zoneExists(sqlDB *gosql.DB, expected *zonepb.ZoneConfig, id sqlbase.ID) error {
 	rows, err := sqlDB.Query(`SELECT * FROM system.zones WHERE id = $1`, id)
 	if err != nil {
 		return err
@@ -64,7 +64,7 @@ func zoneExists(sqlDB *gosql.DB, expected *config.ZoneConfig, id sqlbase.ID) err
 		if storedID != id {
 			return errors.Errorf("e = %d, v = %d", id, storedID)
 		}
-		var cfg config.ZoneConfig
+		var cfg zonepb.ZoneConfig
 		if err := protoutil.Unmarshal(val, &cfg); err != nil {
 			return err
 		}
@@ -88,8 +88,8 @@ func descExists(sqlDB *gosql.DB, exists bool, id sqlbase.ID) error {
 	return nil
 }
 
-func addImmediateGCZoneConfig(sqlDB *gosql.DB, id sqlbase.ID) (config.ZoneConfig, error) {
-	cfg := config.DefaultZoneConfig()
+func addImmediateGCZoneConfig(sqlDB *gosql.DB, id sqlbase.ID) (zonepb.ZoneConfig, error) {
+	cfg := zonepb.DefaultZoneConfig()
 	cfg.GC.TTLSeconds = 0
 	buf, err := protoutil.Marshal(&cfg)
 	if err != nil {
@@ -99,8 +99,8 @@ func addImmediateGCZoneConfig(sqlDB *gosql.DB, id sqlbase.ID) (config.ZoneConfig
 	return cfg, err
 }
 
-func addDefaultZoneConfig(sqlDB *gosql.DB, id sqlbase.ID) (config.ZoneConfig, error) {
-	cfg := config.DefaultZoneConfig()
+func addDefaultZoneConfig(sqlDB *gosql.DB, id sqlbase.ID) (zonepb.ZoneConfig, error) {
+	cfg := zonepb.DefaultZoneConfig()
 	buf, err := protoutil.Marshal(&cfg)
 	if err != nil {
 		return cfg, err
@@ -148,7 +148,7 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 	}
 	dbDesc := desc.GetDatabase()
 
-	tbNameKey := sqlbase.NewTableKey(dbDesc.ID, "kv").Key()
+	tbNameKey := sqlbase.NewPublicTableKey(dbDesc.ID, "kv").Key()
 	gr, err := kvDB.Get(ctx, tbNameKey)
 	if err != nil {
 		t.Fatal(err)
@@ -164,7 +164,7 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 	tbDesc := desc.Table(ts)
 
 	// Add a zone config for both the table and database.
-	cfg := config.DefaultZoneConfig()
+	cfg := zonepb.DefaultZoneConfig()
 	buf, err := protoutil.Marshal(&cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -322,7 +322,7 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 	}
 	dbDesc := desc.GetDatabase()
 
-	tKey := sqlbase.NewTableKey(dbDesc.ID, "kv")
+	tKey := sqlbase.NewPublicTableKey(dbDesc.ID, "kv")
 	gr, err := kvDB.Get(ctx, tKey.Key())
 	if err != nil {
 		t.Fatal(err)
@@ -337,7 +337,7 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 	}
 	tbDesc := desc.Table(ts)
 
-	t2Key := sqlbase.NewTableKey(dbDesc.ID, "kv2")
+	t2Key := sqlbase.NewPublicTableKey(dbDesc.ID, "kv2")
 	gr2, err := kvDB.Get(ctx, t2Key.Key())
 	if err != nil {
 		t.Fatal(err)
@@ -402,7 +402,7 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 	tests.CheckKeyCount(t, kvDB, tableSpan, 0)
 	tests.CheckKeyCount(t, kvDB, table2Span, 6)
 
-	def := config.DefaultZoneConfig()
+	def := zonepb.DefaultZoneConfig()
 	if err := zoneExists(sqlDB, &def, dbDesc.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -622,8 +622,8 @@ func TestDropIndexWithZoneConfigOSS(t *testing.T) {
 	// binary to do this properly.) Dropping the index will thus require
 	// regenerating the zone config's SubzoneSpans, which will fail with a "CCL
 	// required" error.
-	zoneConfig := config.ZoneConfig{
-		Subzones: []config.Subzone{
+	zoneConfig := zonepb.ZoneConfig{
+		Subzones: []zonepb.Subzone{
 			{IndexID: uint32(tableDesc.PrimaryIndex.ID), Config: s.(*server.TestServer).Cfg.DefaultZoneConfig},
 			{IndexID: uint32(indexDesc.ID), Config: s.(*server.TestServer).Cfg.DefaultZoneConfig},
 		},
@@ -703,7 +703,7 @@ func TestDropTable(t *testing.T) {
 	}
 
 	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "kv")
-	nameKey := sqlbase.NewTableKey(keys.MinNonPredefinedUserDescID, "kv").Key()
+	nameKey := sqlbase.NewPublicTableKey(keys.MinNonPredefinedUserDescID, "kv").Key()
 	gr, err := kvDB.Get(ctx, nameKey)
 
 	if err != nil {
@@ -800,7 +800,7 @@ func TestDropTableDeleteData(t *testing.T) {
 
 		descs = append(descs, sqlbase.GetTableDescriptor(kvDB, "t", tableName))
 
-		nameKey := sqlbase.NewTableKey(keys.MinNonPredefinedUserDescID, tableName).Key()
+		nameKey := sqlbase.NewPublicTableKey(keys.MinNonPredefinedUserDescID, tableName).Key()
 		gr, err := kvDB.Get(ctx, nameKey)
 		if err != nil {
 			t.Fatal(err)

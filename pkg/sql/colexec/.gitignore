@@ -1,10 +1,14 @@
 and_or_projection.eg.go
 any_not_null_agg.eg.go
 avg_agg.eg.go
+bool_and_or_agg.eg.go
 cast.eg.go
 const.eg.go
+count_agg.eg.go
 distinct.eg.go
 hashjoiner.eg.go
+hashtable.eg.go
+hash_utils.eg.go
 like_ops.eg.go
 mergejoinbase.eg.go
 mergejoiner_fullouter.eg.go
@@ -14,6 +18,7 @@ mergejoiner_leftouter.eg.go
 mergejoiner_leftsemi.eg.go
 mergejoiner_rightouter.eg.go
 min_max_agg.eg.go
+orderedsynchronizer.eg.go
 overloads_test_utils.eg.go
 proj_const_left_ops.eg.go
 proj_const_right_ops.eg.go
@@ -25,7 +30,7 @@ rowstovec.eg.go
 selection_ops.eg.go
 select_in.eg.go
 sort.eg.go
+substring.eg.go
 sum_agg.eg.go
 tuples_differ.eg.go
 vec_comparators.eg.go
-zerocolumns.eg.go

@@ -47,6 +47,7 @@ const (
 // current database.
 func ShowCreateTable(
 	ctx context.Context,
+	p PlanHookState,
 	tn *tree.Name,
 	dbPrefix string,
 	desc *sqlbase.TableDescriptor,
@@ -56,7 +57,11 @@ func ShowCreateTable(
 	a := &sqlbase.DatumAlloc{}
 
 	f := tree.NewFmtCtx(tree.FmtSimple)
-	f.WriteString("CREATE TABLE ")
+	f.WriteString("CREATE ")
+	if desc.Temporary {
+		f.WriteString("TEMP ")
+	}
+	f.WriteString("TABLE ")
 	f.FormatNode(tn)
 	f.WriteString(" (")
 	primaryKeyIsOnVisibleColumn := false
@@ -74,7 +79,8 @@ func ShowCreateTable(
 			primaryKeyIsOnVisibleColumn = true
 		}
 	}
-	if primaryKeyIsOnVisibleColumn {
+	if primaryKeyIsOnVisibleColumn ||
+		(desc.IsPhysicalTable() && desc.PrimaryIndex.IsSharded()) {
 		f.WriteString(",\n\tCONSTRAINT ")
 		formatQuoteNames(&f.Buffer, desc.PrimaryIndex.Name)
 		f.WriteString(" ")
@@ -150,6 +156,10 @@ func ShowCreateTable(
 		return "", err
 	}
 
+	if err := showComments(desc, selectComment(ctx, p, desc.ID), &f.Buffer); err != nil {
+		return "", err
+	}
+
 	return f.CloseAndGetString(), nil
 }
 
@@ -173,7 +183,7 @@ func formatQuoteNames(buf *bytes.Buffer, names ...string) {
 // unless it is equal to the given dbPrefix. This allows us to elide
 // the prefix when the given table references other tables in the
 // current database.
-func ShowCreate(
+func (p *planner) ShowCreate(
 	ctx context.Context,
 	dbPrefix string,
 	allDescs []sqlbase.Descriptor,
@@ -189,7 +199,7 @@ func ShowCreate(
 		stmt, err = ShowCreateSequence(ctx, tn, desc)
 	} else {
 		lCtx := newInternalLookupCtxFromDescriptors(allDescs, nil /* want all tables */)
-		stmt, err = ShowCreateTable(ctx, tn, dbPrefix, desc, lCtx, ignoreFKs)
+		stmt, err = ShowCreateTable(ctx, p, tn, dbPrefix, desc, lCtx, ignoreFKs)
 	}
 
 	return stmt, err

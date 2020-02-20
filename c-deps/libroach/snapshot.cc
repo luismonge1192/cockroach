@@ -66,7 +66,7 @@ DBStatus DBSnapshot::EnvWriteFile(DBSlice path, DBSlice contents) {
   return FmtStatus("unsupported");
 }
 
-DBStatus DBSnapshot::EnvOpenFile(DBSlice path, rocksdb::WritableFile** file) {
+DBStatus DBSnapshot::EnvOpenFile(DBSlice path, uint64_t bytes_per_sync, rocksdb::WritableFile** file) {
   return FmtStatus("unsupported");
 }
 
@@ -87,6 +87,32 @@ DBStatus DBSnapshot::EnvDeleteFile(DBSlice path) { return FmtStatus("unsupported
 DBStatus DBSnapshot::EnvDeleteDirAndFiles(DBSlice dir) { return FmtStatus("unsupported"); }
 
 DBStatus DBSnapshot::EnvLinkFile(DBSlice oldname, DBSlice newname) {
+  return FmtStatus("unsupported");
+}
+
+DBStatus DBSnapshot::EnvOpenReadableFile(DBSlice path, rocksdb::RandomAccessFile** file) {
+  return FmtStatus("unsupported");
+}
+DBStatus DBSnapshot::EnvReadAtFile(rocksdb::RandomAccessFile* file, DBSlice buffer, int64_t offset,
+                                   int* n) {
+  return FmtStatus("unsupported");
+}
+DBStatus DBSnapshot::EnvCloseReadableFile(rocksdb::RandomAccessFile* file) {
+  return FmtStatus("unsupported");
+}
+DBStatus DBSnapshot::EnvOpenDirectory(DBSlice path, rocksdb::Directory** file) {
+  return FmtStatus("unsupported");
+}
+DBStatus DBSnapshot::EnvSyncDirectory(rocksdb::Directory* file) { return FmtStatus("unsupported"); }
+DBStatus DBSnapshot::EnvCloseDirectory(rocksdb::Directory* file) {
+  return FmtStatus("unsupported");
+}
+DBStatus DBSnapshot::EnvRenameFile(DBSlice oldname, DBSlice newname) {
+  return FmtStatus("unsupported");
+}
+DBStatus DBSnapshot::EnvCreateDir(DBSlice name) { return FmtStatus("unsupported"); }
+DBStatus DBSnapshot::EnvDeleteDir(DBSlice name) { return FmtStatus("unsupported"); }
+DBStatus DBSnapshot::EnvListDir(DBSlice name, std::vector<std::string>* result) {
   return FmtStatus("unsupported");
 }
 

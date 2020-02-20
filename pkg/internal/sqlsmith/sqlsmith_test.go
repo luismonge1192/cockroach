@@ -14,11 +14,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -60,6 +60,7 @@ func TestSetups(t *testing.T) {
 // sometimes put them into bad states that the parser would never do.
 func TestGenerateParse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer utilccl.TestingEnableEnterprise()()
 
 	ctx := context.Background()
 	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
@@ -97,6 +98,7 @@ func TestGenerateParse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer smither.Close()
 
 	seen := map[string]bool{}
 	for i := 0; i < *flagNum; i++ {
@@ -148,20 +150,5 @@ func TestGenerateParse(t *testing.T) {
 				}
 			}
 		}
-	}
-}
-
-func TestWeightedSampler(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	expected := []int{1, 1, 1, 1, 1, 0, 2, 2, 0, 0, 0, 1, 1, 2, 0, 2}
-
-	s := NewWeightedSampler([]int{1, 3, 4}, 0)
-	var got []int
-	for i := 0; i < 16; i++ {
-		got = append(got, s.Next())
-	}
-	if !reflect.DeepEqual(expected, got) {
-		t.Fatalf("got %v, expected %v", got, expected)
 	}
 }

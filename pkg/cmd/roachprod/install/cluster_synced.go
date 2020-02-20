@@ -64,14 +64,15 @@ type SyncedCluster struct {
 	Localities []string
 	VPCs       []string
 	// all other fields are populated in newCluster.
-	Nodes       []int
-	Secure      bool
-	Env         string
-	Args        []string
-	Tag         string
-	Impl        ClusterImpl
-	UseTreeDist bool
-	Quiet       bool
+	Nodes          []int
+	Secure         bool
+	Env            string
+	Args           []string
+	Tag            string
+	Impl           ClusterImpl
+	UseTreeDist    bool
+	Quiet          bool
+	MaxConcurrency int // used in Parallel
 	// AuthorizedKeys is used by SetupSSH to add additional authorized keys.
 	AuthorizedKeys []byte
 
@@ -1295,8 +1296,12 @@ func (c *SyncedCluster) Get(src, dest string) {
 
 				var copy func(src, dest string, info os.FileInfo) error
 				copy = func(src, dest string, info os.FileInfo) error {
+					// Make sure the destination file is world readable.
+					// See:
+					// https://github.com/cockroachdb/cockroach/issues/44843
+					mode := info.Mode() | 0444
 					if info.IsDir() {
-						if err := os.MkdirAll(dest, info.Mode()); err != nil {
+						if err := os.MkdirAll(dest, mode); err != nil {
 							return err
 						}
 
@@ -1317,7 +1322,7 @@ func (c *SyncedCluster) Get(src, dest string) {
 						return nil
 					}
 
-					if !info.Mode().IsRegular() {
+					if !mode.IsRegular() {
 						return nil
 					}
 
@@ -1327,7 +1332,7 @@ func (c *SyncedCluster) Get(src, dest string) {
 					}
 					defer out.Close()
 
-					if err := os.Chmod(out.Name(), info.Mode()); err != nil {
+					if err := os.Chmod(out.Name(), mode); err != nil {
 						return err
 					}
 
@@ -1358,6 +1363,29 @@ func (c *SyncedCluster) Get(src, dest string) {
 			}
 
 			err := c.scp(fmt.Sprintf("%s@%s:%s", c.user(c.Nodes[0]), c.host(c.Nodes[i]), src), dest)
+			if err == nil {
+				// Make sure all created files and directories are world readable.
+				// The CRDB process intentionally sets a 0007 umask (resulting in
+				// non-world-readable files). This creates annoyances during CI
+				// that we circumvent wholesale by adding o+r back here.
+				// See:
+				//
+				// https://github.com/cockroachdb/cockroach/issues/44843
+				chmod := func(path string, info os.FileInfo, err error) error {
+					if err != nil {
+						return err
+					}
+					const oRead = 0004
+					if mode := info.Mode(); mode&oRead == 0 {
+						if err := os.Chmod(path, mode|oRead); err != nil {
+							return err
+						}
+					}
+					return nil
+				}
+				err = filepath.Walk(dest, chmod)
+			}
+
 			results <- result{i, err}
 		}(i)
 	}
@@ -1535,7 +1563,9 @@ func (c *SyncedCluster) Parallel(
 	if concurrency == 0 || concurrency > count {
 		concurrency = count
 	}
-
+	if c.MaxConcurrency > 0 && concurrency > c.MaxConcurrency {
+		concurrency = c.MaxConcurrency
+	}
 	type result struct {
 		index int
 		out   []byte

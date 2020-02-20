@@ -13,8 +13,10 @@ package kv
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/errors"
 )
 
 // txnSeqNumAllocator is a txnInterceptor in charge of allocating sequence
@@ -57,13 +59,23 @@ import (
 //
 type txnSeqNumAllocator struct {
 	wrapped lockedSender
-	seqGen  enginepb.TxnSeq
 
-	// commandCount indicates how many requests have been sent through
-	// this transaction. Reset on retryable txn errors.
-	// TODO(andrei): let's get rid of this. It should be maintained
-	// in the SQL level.
-	commandCount int32
+	// writeSeq is the current write seqnum, i.e. the value last assigned
+	// to a write operation in a batch. It remains at 0 until the first
+	// write operation is encountered.
+	writeSeq enginepb.TxnSeq
+
+	// readSeq is the sequence number at which to perform read-only
+	// operations when steppingModeEnabled is set.
+	readSeq enginepb.TxnSeq
+
+	// steppingModeEnabled indicates whether to operate in stepping mode
+	// or read-own-writes:
+	// - in read-own-writes, read-only operations read at the latest
+	//   write seqnum.
+	// - when stepping, read-only operations read at a
+	//   fixed readSeq.
+	steppingModeEnabled bool
 }
 
 // SendLocked is part of the txnInterceptor interface.
@@ -71,20 +83,24 @@ func (s *txnSeqNumAllocator) SendLocked(
 	ctx context.Context, ba roachpb.BatchRequest,
 ) (*roachpb.BatchResponse, *roachpb.Error) {
 	for _, ru := range ba.Requests {
+		req := ru.GetInner()
 		// Only increment the sequence number generator for requests that
 		// will leave intents or requests that will commit the transaction.
 		// This enables ba.IsCompleteTransaction to work properly.
-		req := ru.GetInner()
-		if roachpb.IsTransactionWrite(req) || req.Method() == roachpb.EndTransaction {
-			s.seqGen++
+		if roachpb.IsTransactionWrite(req) || req.Method() == roachpb.EndTxn {
+			s.writeSeq++
 		}
 
+		// Note: only read-only requests can operate at a past seqnum.
+		// Combined read/write requests (e.g. CPut) always read at the
+		// latest write seqnum.
 		oldHeader := req.Header()
-		oldHeader.Sequence = s.seqGen
-		ru.GetInner().SetHeader(oldHeader)
+		oldHeader.Sequence = s.writeSeq
+		if s.steppingModeEnabled && roachpb.IsReadOnly(req) {
+			oldHeader.Sequence = s.readSeq
+		}
+		req.SetHeader(oldHeader)
 	}
-
-	s.commandCount += int32(len(ba.Requests))
 
 	return s.wrapped.SendLocked(ctx, ba)
 }
@@ -92,24 +108,71 @@ func (s *txnSeqNumAllocator) SendLocked(
 // setWrapped is part of the txnInterceptor interface.
 func (s *txnSeqNumAllocator) setWrapped(wrapped lockedSender) { s.wrapped = wrapped }
 
-// populateMetaLocked is part of the txnInterceptor interface.
-func (s *txnSeqNumAllocator) populateMetaLocked(meta *roachpb.TxnCoordMeta) {
-	meta.CommandCount = s.commandCount
-	meta.Txn.Sequence = s.seqGen
+// populateLeafInputState is part of the txnInterceptor interface.
+func (s *txnSeqNumAllocator) populateLeafInputState(tis *roachpb.LeafTxnInputState) {
+	tis.Txn.Sequence = s.writeSeq
+	tis.SteppingModeEnabled = s.steppingModeEnabled
+	tis.ReadSeqNum = s.readSeq
 }
 
-// augmentMetaLocked is part of the txnInterceptor interface.
-func (s *txnSeqNumAllocator) augmentMetaLocked(meta roachpb.TxnCoordMeta) {
-	s.commandCount += meta.CommandCount
-	if meta.Txn.Sequence > s.seqGen {
-		s.seqGen = meta.Txn.Sequence
+// initializeLeaf loads the read seqnum for a leaf transaction.
+func (s *txnSeqNumAllocator) initializeLeaf(tis *roachpb.LeafTxnInputState) {
+	s.steppingModeEnabled = tis.SteppingModeEnabled
+	s.readSeq = tis.ReadSeqNum
+}
+
+// populateLeafFinalState is part of the txnInterceptor interface.
+func (s *txnSeqNumAllocator) populateLeafFinalState(tfs *roachpb.LeafTxnFinalState) {}
+
+// importLeafFinalState is part of the txnInterceptor interface.
+func (s *txnSeqNumAllocator) importLeafFinalState(tfs *roachpb.LeafTxnFinalState) {}
+
+// stepLocked bumps the read seqnum to the current write seqnum.
+// Used by the TxnCoordSender's Step() method.
+func (s *txnSeqNumAllocator) stepLocked(ctx context.Context) error {
+	if !s.steppingModeEnabled {
+		return errors.AssertionFailedf("stepping mode is not enabled")
 	}
+	if s.readSeq > s.writeSeq {
+		return errors.AssertionFailedf(
+			"cannot step() after mistaken initialization (%d,%d)", s.writeSeq, s.readSeq)
+	}
+	s.readSeq = s.writeSeq
+	return nil
+}
+
+// configureSteppingLocked configures the stepping mode.
+//
+// When enabling stepping from the non-enabled state, the read seqnum
+// is set to the current write seqnum, as if a snapshot was taken at
+// the point stepping was enabled.
+//
+// The read seqnum is otherwise not modified when trying to enable
+// stepping when it was previously enabled already. This is the
+// behavior needed to provide the documented API semantics of
+// sender.ConfigureStepping() (see client/sender.go).
+func (s *txnSeqNumAllocator) configureSteppingLocked(
+	newMode client.SteppingMode,
+) (prevMode client.SteppingMode) {
+	prevEnabled := s.steppingModeEnabled
+	enabled := newMode == client.SteppingEnabled
+	s.steppingModeEnabled = enabled
+	if !prevEnabled && enabled {
+		s.readSeq = s.writeSeq
+	}
+	prevMode = client.SteppingDisabled
+	if prevEnabled {
+		prevMode = client.SteppingEnabled
+	}
+	return prevMode
 }
 
 // epochBumpedLocked is part of the txnInterceptor interface.
 func (s *txnSeqNumAllocator) epochBumpedLocked() {
-	s.seqGen = 0
-	s.commandCount = 0
+	// Note: we do not touch steppingModeEnabled here: if stepping mode
+	// was enabled on the txn, it remains enabled.
+	s.writeSeq = 0
+	s.readSeq = 0
 }
 
 // closeLocked is part of the txnInterceptor interface.

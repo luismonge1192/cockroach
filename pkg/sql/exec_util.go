@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -51,6 +52,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/storage/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
@@ -145,6 +147,30 @@ var ReorderJoinsLimitClusterValue = settings.RegisterValidatedIntSetting(
 	},
 )
 
+var requireExplicitPrimaryKeysClusterMode = settings.RegisterBoolSetting(
+	"sql.defaults.require_explicit_primary_keys.enabled",
+	"default value for requiring explicit primary keys in CREATE TABLE statements",
+	false,
+)
+
+var primaryKeyChangesEnabledClusterMode = settings.RegisterBoolSetting(
+	"sql.defaults.experimental_primary_key_changes.enabled",
+	"default value for experimental_enable_primary_key_changes session setting; allows use of primary key changes by default",
+	false,
+)
+
+var temporaryTablesEnabledClusterMode = settings.RegisterBoolSetting(
+	"sql.defaults.experimental_temporary_tables.enabled",
+	"default value for experimental_enable_temp_tables; allows for use of temporary tables by default",
+	false,
+)
+
+var hashShardedIndexesEnabledClusterMode = settings.RegisterBoolSetting(
+	"sql.defaults.experimental_hash_sharded_indexes.enabled",
+	"default value for experimental_enable_hash_sharded_indexes; allows for creation of hash sharded indexes by default",
+	false,
+)
+
 var zigzagJoinClusterMode = settings.RegisterBoolSetting(
 	"sql.defaults.zigzag_join.enabled",
 	"default value for enable_zigzag_join session setting; allows use of zig-zag join by default",
@@ -153,8 +179,14 @@ var zigzagJoinClusterMode = settings.RegisterBoolSetting(
 
 var optDrivenFKClusterMode = settings.RegisterBoolSetting(
 	"sql.defaults.experimental_optimizer_foreign_keys.enabled",
-	"enables optimizer-driven foreign key checks by default",
-	false,
+	"default value for experimental_optimizer_foreign_keys session setting; enables optimizer-driven foreign key checks by default",
+	true,
+)
+
+var insertFastPathClusterMode = settings.RegisterBoolSetting(
+	"sql.defaults.insert_fast_path.enabled",
+	"default value for enable_insert_fast_path session setting; enables a specialized insert path",
+	true,
 )
 
 // VectorizeClusterMode controls the cluster default for when automatic
@@ -496,7 +528,7 @@ type nodeStatusGenerator interface {
 type ExecutorConfig struct {
 	Settings *cluster.Settings
 	NodeInfo
-	DefaultZoneConfig *config.ZoneConfig
+	DefaultZoneConfig *zonepb.ZoneConfig
 	Locality          roachpb.Locality
 	AmbientCtx        log.AmbientContext
 	DB                *client.DB
@@ -516,6 +548,7 @@ type ExecutorConfig struct {
 	StatsRefresher    *stats.Refresher
 	ExecLogger        *log.SecondaryLogger
 	AuditLogger       *log.SecondaryLogger
+	SlowQueryLogger   *log.SecondaryLogger
 	InternalExecutor  *InternalExecutor
 	QueryCache        *querycache.C
 
@@ -530,6 +563,12 @@ type ExecutorConfig struct {
 	// Caches updated by DistSQL.
 	RangeDescriptorCache *kv.RangeDescriptorCache
 	LeaseHolderCache     *kv.LeaseHolderCache
+
+	// Role membership cache.
+	RoleMemberCache *MembershipCache
+
+	// ProtectedTimestampProvider encapsulates the protected timestamp subsystem.
+	ProtectedTimestampProvider protectedts.Provider
 }
 
 // Organization returns the value of cluster.organization.
@@ -821,6 +860,18 @@ func (p *planner) EvalAsOfTimestamp(asOf tree.AsOfClause) (_ hlc.Timestamp, err 
 }
 
 // ParseHLC parses a string representation of an `hlc.Timestamp`.
+// This differs from hlc.ParseTimestamp in that it parses the decimal
+// serialization of an hlc timestamp as opposed to the string serialization
+// performed by hlc.Timestamp.String().
+//
+// This function is used to parse:
+//
+//   1580361670629466905.0000000001
+//
+// hlc.ParseTimestamp() would be used to parse:
+//
+//   1580361670.629466905,1
+//
 func ParseHLC(s string) (hlc.Timestamp, error) {
 	dec, _, err := apd.NewFromString(s)
 	if err != nil {
@@ -866,6 +917,8 @@ func (p *planner) isAsOf(stmt tree.Statement) (*hlc.Timestamp, error) {
 			return nil, nil
 		}
 		asOf = s.Options.AsOf
+	case *tree.Explain:
+		return p.isAsOf(s.Statement)
 	default:
 		return nil, nil
 	}
@@ -921,6 +974,8 @@ type queryMeta struct {
 	// If set, this query will not be reported as part of SHOW QUERIES. This is
 	// set based on the statement implementing tree.HiddenFromShowQueries.
 	hidden bool
+
+	progressAtomic uint64
 }
 
 // cancel cancels the query associated with this queryMeta, by closing the associated
@@ -942,12 +997,6 @@ type SessionArgs struct {
 	RemoteAddr            net.Addr
 	ConnResultsBufferSize int64
 }
-
-// isDefined returns true iff the SessionArgs is well-defined.
-// This method exists because SessionArgs is passed by value but it
-// matters to the functions using it whether the value was explicitly
-// specified or left empty.
-func (s SessionArgs) isDefined() bool { return len(s.User) != 0 }
 
 // SessionRegistry stores a set of all sessions on this node.
 // Use register() and deregister() to modify this registry.
@@ -1065,6 +1114,8 @@ type schemaChangerCollection struct {
 	schemaChangers []SchemaChanger
 }
 
+type jobsCollection []int64
+
 func (scc *schemaChangerCollection) queueSchemaChanger(schemaChanger SchemaChanger) {
 	scc.schemaChangers = append(scc.schemaChangers, schemaChanger)
 }
@@ -1100,8 +1151,7 @@ func (scc *schemaChangerCollection) execSchemaChanges(
 		sc.settings = cfg.Settings
 		sc.ieFactory = ieFactory
 		for r := retry.Start(base.DefaultRetryOptions()); r.Next(); {
-			evalCtx := createSchemaChangeEvalCtx(ctx, cfg.Clock.Now(), tracing, ieFactory)
-			if err := sc.exec(ctx, true /* inSession */, &evalCtx); err != nil {
+			if err := sc.exec(ctx, true /* inSession */); err != nil {
 				if onError := cfg.SchemaChangerTestingKnobs.OnError; onError != nil {
 					onError(err)
 				}
@@ -1748,6 +1798,9 @@ type sessionDataMutator struct {
 	settings *cluster.Settings
 	// setCurTxnReadOnly is called when we execute SET transaction_read_only = ...
 	setCurTxnReadOnly func(val bool)
+	// onTempSchemaCreation is called when the temporary schema is set
+	// on the search path (the first and only time).
+	onTempSchemaCreation func()
 	// onSessionDataChangeListeners stores all the observers to execute when
 	// session data is modified, keyed by the value to change on.
 	onSessionDataChangeListeners map[string][]func(val string)
@@ -1786,6 +1839,11 @@ func (m *sessionDataMutator) SetDatabase(dbName string) {
 	m.data.Database = dbName
 }
 
+func (m *sessionDataMutator) SetTemporarySchemaName(scName string) {
+	m.onTempSchemaCreation()
+	m.data.SearchPath = m.data.SearchPath.WithTemporarySchemaName(scName)
+}
+
 func (m *sessionDataMutator) SetDefaultIntSize(size int) {
 	m.data.DefaultIntSize = size
 }
@@ -1802,12 +1860,16 @@ func (m *sessionDataMutator) SetForceSavepointRestart(val bool) {
 	m.data.ForceSavepointRestart = val
 }
 
-func (m *sessionDataMutator) SetForceSplitAt(val bool) {
-	m.data.ForceSplitAt = val
+func (m *sessionDataMutator) SetPrimaryKeyChangesEnabled(val bool) {
+	m.data.PrimaryKeyChangesEnabled = val
 }
 
 func (m *sessionDataMutator) SetZigzagJoinEnabled(val bool) {
 	m.data.ZigzagJoinEnabled = val
+}
+
+func (m *sessionDataMutator) SetRequireExplicitPrimaryKeys(val bool) {
+	m.data.RequireExplicitPrimaryKeys = val
 }
 
 func (m *sessionDataMutator) SetReorderJoinsLimit(val int) {
@@ -1826,6 +1888,10 @@ func (m *sessionDataMutator) SetOptimizerFKs(val bool) {
 	m.data.OptimizerFKs = val
 }
 
+func (m *sessionDataMutator) SetInsertFastPath(val bool) {
+	m.data.InsertFastPath = val
+}
+
 func (m *sessionDataMutator) SetSerialNormalizationMode(val sessiondata.SerialNormalizationMode) {
 	m.data.SerialNormalizationMode = val
 }
@@ -1834,8 +1900,8 @@ func (m *sessionDataMutator) SetSafeUpdates(val bool) {
 	m.data.SafeUpdates = val
 }
 
-func (m *sessionDataMutator) SetSearchPath(val sessiondata.SearchPath) {
-	m.data.SearchPath = val
+func (m *sessionDataMutator) UpdateSearchPath(paths []string) {
+	m.data.SearchPath = m.data.SearchPath.UpdatePaths(paths)
 }
 
 func (m *sessionDataMutator) SetLocation(loc *time.Location) {
@@ -1861,6 +1927,10 @@ func (m *sessionDataMutator) SetSaveTablesPrefix(prefix string) {
 
 func (m *sessionDataMutator) SetTempTablesEnabled(val bool) {
 	m.data.TempTablesEnabled = val
+}
+
+func (m *sessionDataMutator) SetHashShardedIndexesEnabled(val bool) {
+	m.data.HashShardedIndexesEnabled = val
 }
 
 // RecordLatestSequenceValue records that value to which the session incremented

@@ -17,8 +17,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -69,8 +71,11 @@ func (s *Server) gcSystemLog(
 ) (time.Time, int64, error) {
 	var totalRowsAffected int64
 	repl, err := s.node.stores.GetReplicaForRangeID(roachpb.RangeID(1))
-	if err != nil {
+	if roachpb.IsRangeNotFoundError(err) {
 		return timestampLowerBound, 0, nil
+	}
+	if err != nil {
+		return timestampLowerBound, 0, err
 	}
 
 	if !repl.IsFirstRange() || !repl.OwnsValidLease(s.clock.Now()) {
@@ -87,10 +92,11 @@ func (s *Server) gcSystemLog(
 		var rowsAffected int64
 		err := s.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
 			var err error
-			row, err := s.internalExecutor.QueryRow(
+			row, err := s.internalExecutor.QueryRowEx(
 				ctx,
 				table+"-gc",
 				txn,
+				sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
 				deleteStmt,
 				timestampLowerBound,
 				timestampUpperBound,

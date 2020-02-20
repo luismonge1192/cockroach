@@ -90,6 +90,7 @@ func runSysbench(ctx context.Context, t *test, c *cluster, opts sysbenchOptions)
 	t.Status("installing cockroach")
 	c.Put(ctx, cockroach, "./cockroach", allNodes)
 	c.Start(ctx, t, roachNodes)
+	waitForFullReplication(t, c.Conn(ctx, allNodes[0]))
 
 	t.Status("installing haproxy")
 	if err := c.Install(ctx, t.l, loadNode, "haproxy"); err != nil {
@@ -131,6 +132,7 @@ func registerSysbench(r *testRegistry) {
 
 		r.Add(testSpec{
 			Name:    fmt.Sprintf("sysbench/%s/nodes=%d/cpu=%d/conc=%d", w, n, cpus, conc),
+			Owner:   OwnerKV,
 			Cluster: makeClusterSpec(n+1, cpu(cpus)),
 			Run: func(ctx context.Context, t *test, c *cluster) {
 				runSysbench(ctx, t, c, opts)

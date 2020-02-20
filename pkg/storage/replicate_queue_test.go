@@ -21,7 +21,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -117,7 +117,7 @@ func testReplicateQueueRebalanceInner(t *testing.T, atomic bool) {
 		return counts
 	}
 
-	initialRanges, err := server.ExpectedInitialRangeCount(tc.Servers[0].DB(), config.DefaultZoneConfigRef(), config.DefaultSystemZoneConfigRef())
+	initialRanges, err := server.ExpectedInitialRangeCount(tc.Servers[0].DB(), zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,7 +382,7 @@ func TestLargeUnsplittableRangeReplicate(t *testing.T) {
 
 	// Create a cluster with really small ranges.
 	const rangeMaxSize = base.MinRangeMaxBytes
-	zcfg := config.DefaultZoneConfig()
+	zcfg := zonepb.DefaultZoneConfig()
 	zcfg.RangeMinBytes = proto.Int64(rangeMaxSize / 2)
 	zcfg.RangeMaxBytes = proto.Int64(rangeMaxSize)
 	tc := testcluster.StartTestCluster(t, 5,
@@ -600,14 +600,14 @@ func TestTransferLeaseToLaggingNode(t *testing.T) {
 	})
 	<-workerReady
 	// Wait until we see remote making progress
-	leaseHolderRepl, err := leaseHolderStore.GetReplica(roachpb.RangeID(rangeID))
+	leaseHolderRepl, err := leaseHolderStore.GetReplica(rangeID)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	var remoteRepl *storage.Replica
 	testutils.SucceedsSoon(t, func() error {
-		remoteRepl, err = remoteStore.GetReplica(roachpb.RangeID(rangeID))
+		remoteRepl, err = remoteStore.GetReplica(rangeID)
 		return err
 	})
 	testutils.SucceedsSoon(t, func() error {
@@ -637,11 +637,11 @@ func TestTransferLeaseToLaggingNode(t *testing.T) {
 	// to the remote node.
 	desc, zone := leaseHolderRepl.DescAndZone()
 	newZone := *zone
-	newZone.LeasePreferences = []config.LeasePreference{
+	newZone.LeasePreferences = []zonepb.LeasePreference{
 		{
-			Constraints: []config.Constraint{
+			Constraints: []zonepb.Constraint{
 				{
-					Type:  config.Constraint_REQUIRED,
+					Type:  zonepb.Constraint_REQUIRED,
 					Value: fmt.Sprintf("n%d", remoteNodeID),
 				},
 			},

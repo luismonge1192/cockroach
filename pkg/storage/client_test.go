@@ -33,6 +33,7 @@ import (
 	circuit "github.com/cockroachdb/circuitbreaker"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/gossip/resolver"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
@@ -186,7 +187,8 @@ func createTestStoreWithOpts(
 	if !opts.dontBootstrap {
 		var kvs []roachpb.KeyValue
 		var splits []roachpb.RKey
-		kvs, tableSplits := sqlbase.MakeMetadataSchema(storeCfg.DefaultZoneConfig, storeCfg.DefaultSystemZoneConfig).GetInitialValues()
+		bootstrapVersion := cluster.ClusterVersion{Version: cluster.BinaryServerVersion}
+		kvs, tableSplits := sqlbase.MakeMetadataSchema(storeCfg.DefaultZoneConfig, storeCfg.DefaultSystemZoneConfig).GetInitialValues(bootstrapVersion)
 		if !opts.dontCreateSystemRanges {
 			splits = config.StaticSplits()
 			splits = append(splits, tableSplits...)
@@ -837,7 +839,7 @@ func (m *multiTestContext) addStore(idx int) {
 		grpcServer,
 		m.transportStopper,
 		metric.NewRegistry(),
-		config.DefaultZoneConfigRef(),
+		zonepb.DefaultZoneConfigRef(),
 	)
 
 	nodeID := roachpb.NodeID(idx + 1)
@@ -868,7 +870,8 @@ func (m *multiTestContext) addStore(idx int) {
 	if needBootstrap && idx == 0 {
 		// Bootstrap the initial range on the first engine.
 		var splits []roachpb.RKey
-		kvs, tableSplits := sqlbase.MakeMetadataSchema(cfg.DefaultZoneConfig, cfg.DefaultSystemZoneConfig).GetInitialValues()
+		bootstrapVersion := cluster.ClusterVersion{Version: cluster.BinaryServerVersion}
+		kvs, tableSplits := sqlbase.MakeMetadataSchema(cfg.DefaultZoneConfig, cfg.DefaultSystemZoneConfig).GetInitialValues(bootstrapVersion)
 		if !m.startWithSingleRange {
 			splits = config.StaticSplits()
 			splits = append(splits, tableSplits...)
@@ -1294,6 +1297,14 @@ func (m *multiTestContext) readIntFromEngines(key roachpb.Key) []int64 {
 // testing.T which may differ from m.t.
 func (m *multiTestContext) waitForValuesT(t testing.TB, key roachpb.Key, expected []int64) {
 	t.Helper()
+	// This test relies on concurrently waiting for a value to change in the
+	// underlying engine(s). Since the teeing engine does not respond well to
+	// value mismatches, whether transient or permanent, skip this test if the
+	// teeing engine is being used. See
+	// https://github.com/cockroachdb/cockroach/issues/42656 for more context.
+	if engine.DefaultStorageEngine == enginepb.EngineTypeTeePebbleRocksDB {
+		t.Skip("disabled on teeing engine")
+	}
 	testutils.SucceedsSoon(t, func() error {
 		actual := m.readIntFromEngines(key)
 		if !reflect.DeepEqual(expected, actual) {
@@ -1553,8 +1564,10 @@ func TestSortRangeDescByAge(t *testing.T) {
 	}
 }
 
-func verifyRangeStats(eng engine.Reader, rangeID roachpb.RangeID, expMS enginepb.MVCCStats) error {
-	ms, err := stateloader.Make(rangeID).LoadMVCCStats(context.Background(), eng)
+func verifyRangeStats(
+	reader engine.Reader, rangeID roachpb.RangeID, expMS enginepb.MVCCStats,
+) error {
+	ms, err := stateloader.Make(rangeID).LoadMVCCStats(context.Background(), reader)
 	if err != nil {
 		return err
 	}
@@ -1567,9 +1580,9 @@ func verifyRangeStats(eng engine.Reader, rangeID roachpb.RangeID, expMS enginepb
 }
 
 func verifyRecomputedStats(
-	eng engine.Reader, d *roachpb.RangeDescriptor, expMS enginepb.MVCCStats, nowNanos int64,
+	reader engine.Reader, d *roachpb.RangeDescriptor, expMS enginepb.MVCCStats, nowNanos int64,
 ) error {
-	if ms, err := rditer.ComputeStatsForRange(d, eng, nowNanos); err != nil {
+	if ms, err := rditer.ComputeStatsForRange(d, reader, nowNanos); err != nil {
 		return err
 	} else if expMS != ms {
 		return fmt.Errorf("expected range's stats to agree with recomputation: got\n%+v\nrecomputed\n%+v", expMS, ms)
@@ -1578,12 +1591,12 @@ func verifyRecomputedStats(
 }
 
 func waitForTombstone(
-	t *testing.T, eng engine.Reader, rangeID roachpb.RangeID,
-) (tombstone roachpb.RaftTombstone) {
+	t *testing.T, reader engine.Reader, rangeID roachpb.RangeID,
+) (tombstone roachpb.RangeTombstone) {
 	testutils.SucceedsSoon(t, func() error {
-		tombstoneKey := keys.RaftTombstoneKey(rangeID)
+		tombstoneKey := keys.RangeTombstoneKey(rangeID)
 		ok, err := engine.MVCCGetProto(
-			context.TODO(), eng, tombstoneKey, hlc.Timestamp{}, &tombstone, engine.MVCCGetOptions{},
+			context.TODO(), reader, tombstoneKey, hlc.Timestamp{}, &tombstone, engine.MVCCGetOptions{},
 		)
 		if err != nil {
 			t.Fatalf("failed to read tombstone: %v", err)

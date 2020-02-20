@@ -396,7 +396,7 @@ limit
  ├── columns: x:1(int!null) y:2(int) z:3(int) w:4(int)
  ├── scan xyzw
  │    ├── columns: x:1(int!null) y:2(int) z:3(int) w:4(int)
- │    └── limit hint: -100.00
+ │    └── limit hint: 1.00
  └── const: -100 [type=int]
 
 # At execution time, this will cause the error: negative value for OFFSET
@@ -439,7 +439,8 @@ SELECT * FROM xyzw LIMIT 0
 limit
  ├── columns: x:1(int!null) y:2(int) z:3(int) w:4(int)
  ├── scan xyzw
- │    └── columns: x:1(int!null) y:2(int) z:3(int) w:4(int)
+ │    ├── columns: x:1(int!null) y:2(int) z:3(int) w:4(int)
+ │    └── limit hint: 1.00
  └── const: 0 [type=int]
 
 build
@@ -621,7 +622,7 @@ build
 SELECT 1 IN (1, 2) AS r
 ----
 project
- ├── columns: r:1(bool)
+ ├── columns: r:1(bool!null)
  ├── values
  │    └── tuple [type=tuple]
  └── projections
@@ -703,7 +704,7 @@ project
  └── projections
       └── any: eq [type=bool]
            ├── project
-           │    ├── columns: column3:3(tuple{int, int})
+           │    ├── columns: column3:3(tuple{int, int}!null)
            │    ├── values
            │    │    ├── columns: column1:1(int!null) column2:2(int!null)
            │    │    └── tuple [type=tuple{int, int}]
@@ -746,7 +747,7 @@ project
       └── not [type=bool]
            └── any: eq [type=bool]
                 ├── project
-                │    ├── columns: column3:3(tuple{int, int})
+                │    ├── columns: column3:3(tuple{int, int}!null)
                 │    ├── values
                 │    │    ├── columns: column1:1(int!null) column2:2(int!null)
                 │    │    └── tuple [type=tuple{int, int}]
@@ -794,7 +795,7 @@ project
  └── projections
       └── any: eq [type=bool]
            ├── project
-           │    ├── columns: column3:3(tuple{int, int})
+           │    ├── columns: column3:3(tuple{int, int}!null)
            │    ├── select
            │    │    ├── columns: column1:1(int!null) column2:2(int!null)
            │    │    ├── values
@@ -849,7 +850,7 @@ project
       └── not [type=bool]
            └── any: eq [type=bool]
                 ├── project
-                │    ├── columns: column3:3(tuple{int, int})
+                │    ├── columns: column3:3(tuple{int, int}!null)
                 │    ├── select
                 │    │    ├── columns: column1:1(int!null) column2:2(int!null)
                 │    │    ├── values
@@ -904,7 +905,7 @@ project
       └── not [type=bool]
            └── any: eq [type=bool]
                 ├── project
-                │    ├── columns: column3:3(tuple{int, int})
+                │    ├── columns: column3:3(tuple{int, int}!null)
                 │    ├── select
                 │    │    ├── columns: column1:1(int!null) column2:2(int!null)
                 │    │    ├── values
@@ -959,7 +960,7 @@ project
       └── not [type=bool]
            └── any: eq [type=bool]
                 ├── project
-                │    ├── columns: column3:3(tuple{int, int})
+                │    ├── columns: column3:3(tuple{int, int}!null)
                 │    ├── select
                 │    │    ├── columns: column1:1(int!null) column2:2(int!null)
                 │    │    ├── values
@@ -1047,7 +1048,7 @@ build
 SELECT @1 AS r, @2 AS s FROM a
 ----
 project
- ├── columns: r:3(int) s:4(float)
+ ├── columns: r:3(int!null) s:4(float)
  ├── scan a
  │    └── columns: x:1(int!null) y:2(float)
  └── projections
@@ -1105,7 +1106,7 @@ FROM (
 project
  ├── columns: e:2(int) f:3(string) g:4(bool)
  ├── project
- │    ├── columns: x:1(tuple{int AS e, string AS f, bool AS g})
+ │    ├── columns: x:1(tuple{int AS e, string AS f, bool AS g}!null)
  │    ├── values
  │    │    └── tuple [type=tuple]
  │    └── projections
@@ -1227,7 +1228,13 @@ build
 SELECT * FROM [55(1) as t(a)]
 ----
 scan t
- └── columns: a:1(int!null)
+ ├── columns: a:1(int!null)
+ └── check constraint expressions
+      └── lt [type=bool]
+           ├── plus [type=int]
+           │    ├── variable: a [type=int]
+           │    └── variable: b [type=int]
+           └── const: 10 [type=int]
 
 # Regression test for #28388. Ensure that selecting from a table with no
 # columns does not cause a panic.

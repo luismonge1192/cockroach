@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/stretchr/testify/require"
 )
 
 // Mock typing context for the typechecker.
@@ -96,7 +97,7 @@ func TestBasicBuiltinFunctions(t *testing.T) {
 						t.Fatal(err)
 					}
 
-					return NewBuiltinFunctionOperator(testAllocator, tctx, typedExpr.(*tree.FuncExpr), tc.outputTypes, tc.inputCols, 1, input[0]), nil
+					return NewBuiltinFunctionOperator(testAllocator, tctx, typedExpr.(*tree.FuncExpr), tc.outputTypes, tc.inputCols, 1, input[0])
 				})
 		})
 	}
@@ -135,7 +136,7 @@ func benchmarkBuiltinFunctions(b *testing.B, useSelectionVector bool, hasNulls b
 		}
 	}
 
-	source := NewRepeatableBatchSource(batch)
+	source := NewRepeatableBatchSource(testAllocator, batch)
 	source.Init()
 
 	expr, err := parser.ParseExpr("abs(@1)")
@@ -147,7 +148,8 @@ func benchmarkBuiltinFunctions(b *testing.B, useSelectionVector bool, hasNulls b
 	if err != nil {
 		b.Fatal(err)
 	}
-	op := NewBuiltinFunctionOperator(testAllocator, tctx, typedExpr.(*tree.FuncExpr), []types.T{*types.Int}, []int{0}, 1, source)
+	op, err := NewBuiltinFunctionOperator(testAllocator, tctx, typedExpr.(*tree.FuncExpr), []types.T{*types.Int}, []int{0}, 1, source)
+	require.NoError(b, err)
 
 	b.SetBytes(int64(8 * coldata.BatchSize()))
 	b.ResetTimer()
@@ -173,19 +175,17 @@ func BenchmarkCompareSpecializedOperators(b *testing.B) {
 	ctx := context.Background()
 	tctx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 
-	batch := testAllocator.NewMemBatch([]coltypes.T{coltypes.Bytes, coltypes.Int64, coltypes.Int64, coltypes.Bytes})
+	batch := testAllocator.NewMemBatch([]coltypes.T{coltypes.Bytes, coltypes.Int64, coltypes.Int64})
 	bCol := batch.ColVec(0).Bytes()
 	sCol := batch.ColVec(1).Int64()
 	eCol := batch.ColVec(2).Int64()
-	outCol := batch.ColVec(3).Bytes()
 	for i := 0; i < int(coldata.BatchSize()); i++ {
 		bCol.Set(i, []byte("hello there"))
 		sCol[i] = 1
 		eCol[i] = 4
 	}
 	batch.SetLength(coldata.BatchSize())
-	source := NewRepeatableBatchSource(batch)
-	source.Init()
+	source := NewRepeatableBatchSource(testAllocator, batch)
 
 	// Set up the default operator.
 	expr, err := parser.ParseExpr("substring(@1, @2, @3)")
@@ -215,22 +215,19 @@ func BenchmarkCompareSpecializedOperators(b *testing.B) {
 	defaultOp.Init()
 
 	// Set up the specialized substring operator.
-	specOp := &substringFunctionOperator{
-		OneInputNode: NewOneInputNode(source),
-		allocator:    testAllocator,
-		argumentCols: inputCols,
-		outputIdx:    3,
-	}
+	specOp := newSubstringOperator(
+		testAllocator, typs, inputCols, 3 /* outputIdx */, source,
+	)
 	specOp.Init()
 
 	b.Run("DefaultBuiltinOperator", func(b *testing.B) {
 		b.SetBytes(int64(len("hello there") * int(coldata.BatchSize())))
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			defaultOp.Next(ctx)
+			b := defaultOp.Next(ctx)
 			// Due to the flat byte updates, we have to reset the output
 			// bytes col after each next call.
-			outCol.Reset()
+			b.ColVec(3).Bytes().Reset()
 		}
 	})
 
@@ -238,10 +235,10 @@ func BenchmarkCompareSpecializedOperators(b *testing.B) {
 		b.SetBytes(int64(len("hello there") * int(coldata.BatchSize())))
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			specOp.Next(ctx)
+			b := specOp.Next(ctx)
 			// Due to the flat byte updates, we have to reset the output
 			// bytes col after each next call.
-			outCol.Reset()
+			b.ColVec(3).Bytes().Reset()
 		}
 	})
 }

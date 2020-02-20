@@ -126,6 +126,9 @@ type PhysicalPlan struct {
 	// reader in this plan will output. This information is used to decide
 	// whether to use the vectorized execution engine.
 	MaxEstimatedRowCount uint64
+	// TotalEstimatedScannedRows is the sum of the row count estimate of all the
+	// table readers in the plan.
+	TotalEstimatedScannedRows uint64
 }
 
 // NewStageID creates a stage identifier that can be used in processor specs.
@@ -602,6 +605,9 @@ func reverseProjection(outputColumns []uint32, indexVarMap []int) []int {
 func (p *PhysicalPlan) AddFilter(
 	expr tree.TypedExpr, exprCtx ExprContext, indexVarMap []int,
 ) error {
+	if expr == nil {
+		return errors.Errorf("nil filter")
+	}
 	post := p.GetLastStagePost()
 	if len(post.RenderExprs) > 0 || post.Offset != 0 || post.Limit != 0 {
 		// The last stage contains render expressions or a limit. The filter refers
@@ -629,6 +635,7 @@ func (p *PhysicalPlan) AddFilter(
 		return err
 	}
 	if !post.Filter.Empty() {
+		// Either Expr or LocalExpr will be set (not both).
 		if filter.Expr != "" {
 			filter.Expr = fmt.Sprintf("(%s) AND (%s)", post.Filter.Expr, filter.Expr)
 		} else if filter.LocalExpr != nil {
@@ -889,6 +896,14 @@ func MergePlans(
 	// Update the processor indices in the right routers.
 	for i := range rightRouters {
 		rightRouters[i] += rightProcStart
+	}
+
+	mergedPlan.TotalEstimatedScannedRows = left.TotalEstimatedScannedRows + right.TotalEstimatedScannedRows
+	// NB(dt): AFAIK no one looks at the MaxEstimatedRowCount of the overall plan
+	// but it is maintained here too just for completeness.
+	mergedPlan.MaxEstimatedRowCount = left.MaxEstimatedRowCount
+	if right.MaxEstimatedRowCount > left.MaxEstimatedRowCount {
+		mergedPlan.MaxEstimatedRowCount = left.MaxEstimatedRowCount
 	}
 
 	return mergedPlan, leftRouters, rightRouters

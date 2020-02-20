@@ -39,12 +39,13 @@ type pgCopyReader struct {
 var _ inputConverter = &pgCopyReader{}
 
 func newPgCopyReader(
+	ctx context.Context,
 	kvCh chan row.KVBatch,
 	opts roachpb.PgCopyOptions,
 	tableDesc *sqlbase.TableDescriptor,
 	evalCtx *tree.EvalContext,
 ) (*pgCopyReader, error) {
-	conv, err := row.NewDatumRowConverter(tableDesc, nil /* targetColNames */, evalCtx, kvCh)
+	conv, err := row.NewDatumRowConverter(ctx, tableDesc, nil /* targetColNames */, evalCtx, kvCh)
 	if err != nil {
 		return nil, err
 	}
@@ -271,8 +272,12 @@ func (d *pgCopyReader) readFile(
 	)
 	d.conv.KvBatch.Source = inputIdx
 	d.conv.FractionFn = input.ReadFraction
+	count := int64(1)
+	d.conv.CompletedRowFn = func() int64 {
+		return count
+	}
 
-	for count := int64(1); ; count++ {
+	for ; ; count++ {
 		row, err := c.Next()
 		if err == io.EOF {
 			break
@@ -280,6 +285,11 @@ func (d *pgCopyReader) readFile(
 		if err != nil {
 			return wrapRowErr(err, inputName, count, pgcode.Uncategorized, "")
 		}
+
+		if count <= resumePos {
+			continue
+		}
+
 		if len(row) != len(d.conv.VisibleColTypes) {
 			return makeRowErr(inputName, count, pgcode.Syntax,
 				"expected %d values, got %d", len(d.conv.VisibleColTypes), len(row))
@@ -288,7 +298,7 @@ func (d *pgCopyReader) readFile(
 			if s == nil {
 				d.conv.Datums[i] = tree.DNull
 			} else {
-				d.conv.Datums[i], err = tree.ParseDatumStringAs(d.conv.VisibleColTypes[i], *s, d.conv.EvalCtx)
+				d.conv.Datums[i], err = sqlbase.ParseDatumStringAs(d.conv.VisibleColTypes[i], *s, d.conv.EvalCtx)
 				if err != nil {
 					col := d.conv.VisibleCols[i]
 					return wrapRowErr(err, inputName, count, pgcode.Syntax,

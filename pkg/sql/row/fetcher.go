@@ -190,6 +190,9 @@ type Fetcher struct {
 	// table has no interleave children.
 	mustDecodeIndexKey bool
 
+	// lockStr represents the row-level locking mode to use when fetching rows.
+	lockStr sqlbase.ScanLockingStrength
+
 	// returnRangeInfo, if set, causes the underlying kvBatchFetcher to return
 	// information about the ranges descriptors/leases uses in servicing the
 	// requests. This has some cost, so it's only enabled by DistSQL when this
@@ -242,7 +245,9 @@ func (rf *Fetcher) Reset() {
 // non-primary index, tables.ValNeededForCol can only refer to columns in the
 // index.
 func (rf *Fetcher) Init(
-	reverse, returnRangeInfo bool,
+	reverse bool,
+	lockStr sqlbase.ScanLockingStrength,
+	returnRangeInfo bool,
 	isCheck bool,
 	alloc *sqlbase.DatumAlloc,
 	tables ...FetcherTableArgs,
@@ -252,6 +257,7 @@ func (rf *Fetcher) Init(
 	}
 
 	rf.reverse = reverse
+	rf.lockStr = lockStr
 	rf.returnRangeInfo = returnRangeInfo
 	rf.alloc = alloc
 	rf.isCheck = isCheck
@@ -390,7 +396,7 @@ func (rf *Fetcher) Init(
 		if table.isSecondaryIndex {
 			for i := range table.cols {
 				if table.neededCols.Contains(int(table.cols[i].ID)) && !table.index.ContainsColumnID(table.cols[i].ID) {
-					return fmt.Errorf("requested column %s not in index", table.cols[i].Name)
+					return errors.Errorf("requested column %s not in index", table.cols[i].Name)
 				}
 			}
 		}
@@ -426,7 +432,11 @@ func (rf *Fetcher) Init(
 
 		// Keep track of the maximum keys per row to accommodate a
 		// limitHint when StartScan is invoked.
-		if keysPerRow := table.desc.KeysPerRow(table.index.ID); keysPerRow > rf.maxKeysPerRow {
+		keysPerRow, err := table.desc.KeysPerRow(table.index.ID)
+		if err != nil {
+			return err
+		}
+		if keysPerRow > rf.maxKeysPerRow {
 			rf.maxKeysPerRow = keysPerRow
 		}
 
@@ -460,7 +470,13 @@ func (rf *Fetcher) StartScan(
 
 	rf.traceKV = traceKV
 	f, err := makeKVBatchFetcher(
-		txn, spans, rf.reverse, limitBatches, rf.firstBatchLimit(limitHint), rf.returnRangeInfo,
+		txn,
+		spans,
+		rf.reverse,
+		limitBatches,
+		rf.firstBatchLimit(limitHint),
+		rf.lockStr,
+		rf.returnRangeInfo,
 	)
 	if err != nil {
 		return err
@@ -499,7 +515,7 @@ func (rf *Fetcher) StartInconsistentScan(
 			maxTimestampAge,
 		)
 	}
-	txn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */, client.RootTxn)
+	txn := client.NewTxnWithSteppingEnabled(ctx, db, 0 /* gatewayNodeID */)
 	txn.SetFixedTimestamp(ctx, txnTimestamp)
 	if log.V(1) {
 		log.Infof(ctx, "starting inconsistent scan at timestamp %v", txnTimestamp)
@@ -514,7 +530,7 @@ func (rf *Fetcher) StartInconsistentScan(
 			// Advance the timestamp by the time that passed.
 			txnTimestamp = txnTimestamp.Add(now.Sub(txnStartTime).Nanoseconds(), 0 /* logical */)
 			txnStartTime = now
-			txn = client.NewTxn(ctx, db, 0 /* gatewayNodeID */, client.RootTxn)
+			txn = client.NewTxnWithSteppingEnabled(ctx, db, 0 /* gatewayNodeID */)
 			txn.SetFixedTimestamp(ctx, txnTimestamp)
 
 			if log.V(1) {
@@ -539,6 +555,7 @@ func (rf *Fetcher) StartInconsistentScan(
 		rf.reverse,
 		limitBatches,
 		rf.firstBatchLimit(limitHint),
+		rf.lockStr,
 		rf.returnRangeInfo,
 	)
 	if err != nil {
@@ -596,6 +613,11 @@ func (rf *Fetcher) NextKey(ctx context.Context) (rowDone bool, err error) {
 			return true, nil
 		}
 
+		// foundNull is set when decoding a new index key for a row finds a NULL value
+		// in the index key. This is used when decoding unique secondary indexes in order
+		// to tell whether they have extra columns appended to the key.
+		var foundNull bool
+
 		// unchangedPrefix will be set to true if we can skip decoding the index key
 		// completely, because the last key we saw has identical prefix to the
 		// current key.
@@ -628,7 +650,7 @@ func (rf *Fetcher) NextKey(ctx context.Context) (rowDone bool, err error) {
 			// it's trying to model is.
 			rf.rowReadyTable = rf.currentTable
 		} else if rf.mustDecodeIndexKey || rf.traceKV {
-			rf.keyRemainingBytes, ok, err = rf.ReadIndexKey(rf.kv.Key)
+			rf.keyRemainingBytes, ok, foundNull, err = rf.ReadIndexKey(rf.kv.Key)
 			if err != nil {
 				return false, err
 			}
@@ -646,6 +668,7 @@ func (rf *Fetcher) NextKey(ctx context.Context) (rowDone bool, err error) {
 			if err != nil {
 				return false, err
 			}
+
 			rf.keyRemainingBytes = rf.kv.Key[prefixLen:]
 		}
 
@@ -658,15 +681,34 @@ func (rf *Fetcher) NextKey(ctx context.Context) (rowDone bool, err error) {
 		//
 		// The index-key extracted from the above keys is /test/unique_idx/NULL. The
 		// trailing /0 and /1 are the primary key used to unique-ify the keys when a
-		// NULL is present. Currently we don't detect NULLs on decoding. If we did
-		// we could detect this case and enlarge the index-key. A simpler fix for
-		// this problem is to simply always output a row for each key scanned from a
-		// secondary index as secondary indexes have only one key per row.
-		// If rf.rowReadyTable differs from rf.currentTable, this denotes
-		// a row is ready for output.
+		// NULL is present. When a null is present in the index key, we cut off more
+		// of the index key so that the prefix includes the primary key columns.
+		//
+		// Note that we do not need to do this for non-unique secondary indexes because
+		// the extra columns in the primary key will _always_ be there, so we can decode
+		// them when processing the index. The difference with unique secondary indexes
+		// is that the extra columns are not always there, and are used to unique-ify
+		// the index key, rather than provide the primary key column values.
+		if foundNull && rf.currentTable.isSecondaryIndex && rf.currentTable.index.Unique && len(rf.currentTable.desc.Families) != 1 {
+			for _, colID := range rf.currentTable.index.ExtraColumnIDs {
+				colIdx := rf.currentTable.colIdxMap[colID]
+				var err error
+				// Slice off an extra encoded column from rf.keyRemainingBytes.
+				rf.keyRemainingBytes, err = sqlbase.SkipTableKey(
+					&rf.currentTable.cols[colIdx].Type,
+					rf.keyRemainingBytes,
+					// Extra columns are always stored in ascending order.
+					sqlbase.IndexDescriptor_ASC,
+				)
+				if err != nil {
+					return false, err
+				}
+			}
+		}
+
 		switch {
-		case rf.currentTable.isSecondaryIndex:
-			// Secondary indexes have only one key per row.
+		case len(rf.currentTable.desc.Families) == 1:
+			// If we only have one family, we know that there is only 1 k/v pair per row.
 			rowDone = true
 		case !unchangedPrefix:
 			// If the prefix of the key has changed, current key is from a different
@@ -707,7 +749,10 @@ func (rf *Fetcher) prettyEncDatums(types []types.T, vals []sqlbase.EncDatum) str
 // ReadIndexKey decodes an index key for a given table.
 // It returns whether or not the key is for any of the tables initialized
 // in Fetcher, and the remaining part of the key if it is.
-func (rf *Fetcher) ReadIndexKey(key roachpb.Key) (remaining []byte, ok bool, err error) {
+// ReadIndexKey additionally returns whether or not it encountered a null while decoding.
+func (rf *Fetcher) ReadIndexKey(
+	key roachpb.Key,
+) (remaining []byte, ok bool, foundNull bool, err error) {
 	// If there is only one table to check keys for, there is no need
 	// to go through the equivalence signature checks.
 	if len(rf.tables) == 1 {
@@ -729,14 +774,14 @@ func (rf *Fetcher) ReadIndexKey(key roachpb.Key) (remaining []byte, ok bool, err
 	// of the signature in order.
 	tableIdx, key, match, err := sqlbase.IndexKeyEquivSignature(key, rf.allEquivSignatures, rf.keySigBuf, rf.keyRestBuf)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	// The index key does not belong to our table because either:
 	// !match:	    part of the index key's signature did not match any of
 	//		    rf.allEquivSignatures.
 	// tableIdx == -1:  index key belongs to an ancestor.
 	if !match || tableIdx == -1 {
-		return nil, false, nil
+		return nil, false, false, nil
 	}
 
 	// The index key is not within our specified span of keys for the
@@ -747,7 +792,7 @@ func (rf *Fetcher) ReadIndexKey(key roachpb.Key) (remaining []byte, ok bool, err
 	// information to ContainsKey as a hint for which span to start
 	// checking first.
 	if !rf.tables[tableIdx].spans.ContainsKey(initialKey) {
-		return nil, false, nil
+		return nil, false, false, nil
 	}
 
 	// Either a new table is encountered or the rowReadyTable differs from
@@ -766,18 +811,19 @@ func (rf *Fetcher) ReadIndexKey(key roachpb.Key) (remaining []byte, ok bool, err
 	}
 
 	// We can simply decode all the column values we retrieved
-	// when processing the index key. The column values are at the
+	// when processing the ind
+	// ex key. The column values are at the
 	// front of the key.
-	if key, err = sqlbase.DecodeKeyVals(
+	if key, foundNull, err = sqlbase.DecodeKeyVals(
 		rf.currentTable.keyValTypes,
 		rf.currentTable.keyVals,
 		rf.currentTable.indexColumnDirs,
 		key,
 	); err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 
-	return key, true, nil
+	return key, true, foundNull, nil
 }
 
 // processKV processes the given key/value, setting values in the row
@@ -846,7 +892,9 @@ func (rf *Fetcher) processKV(
 		return prettyKey, prettyValue, nil
 	}
 
-	if !table.isSecondaryIndex && len(rf.keyRemainingBytes) > 0 {
+	// For covering secondary indexes, allow for decoding as a primary key.
+	if table.index.GetEncodingType(table.desc.PrimaryIndex.ID) == sqlbase.PrimaryIndexEncoding &&
+		len(rf.keyRemainingBytes) > 0 {
 		// If familyID is 0, kv.Value contains values for composite key columns.
 		// These columns already have a table.row value assigned above, but that value
 		// (obtained from the key encoding) might not be correct (e.g. for decimals,
@@ -882,36 +930,48 @@ func (rf *Fetcher) processKV(
 			return "", "", scrub.WrapError(scrub.IndexValueDecodingError, err)
 		}
 	} else {
-		valueBytes, err := kv.Value.GetBytes()
-		if err != nil {
-			return "", "", scrub.WrapError(scrub.IndexValueDecodingError, err)
-		}
-
-		if hasExtraCols(table) {
-			// This is a unique secondary index; decode the extra
-			// column values from the value.
-			var err error
-			valueBytes, err = sqlbase.DecodeKeyVals(
-				table.extraTypes,
-				table.extraVals,
-				nil,
-				valueBytes,
-			)
+		tag := kv.Value.GetTag()
+		var valueBytes []byte
+		switch tag {
+		case roachpb.ValueType_BYTES:
+			// If we have the ValueType_BYTES on a secondary index, then we know we
+			// are looking at column family 0. Column family 0 stores the extra primary
+			// key columns if they are present, so we decode them here.
+			valueBytes, err = kv.Value.GetBytes()
 			if err != nil {
-				return "", "", scrub.WrapError(scrub.SecondaryIndexKeyExtraValueDecodingError, err)
+				return "", "", scrub.WrapError(scrub.IndexValueDecodingError, err)
 			}
-			for i, id := range table.index.ExtraColumnIDs {
-				if table.neededCols.Contains(int(id)) {
-					table.row[table.colIdxMap[id]] = table.extraVals[i]
+			if hasExtraCols(table) {
+				// This is a unique secondary index; decode the extra
+				// column values from the value.
+				var err error
+				valueBytes, _, err = sqlbase.DecodeKeyVals(
+					table.extraTypes,
+					table.extraVals,
+					nil,
+					valueBytes,
+				)
+				if err != nil {
+					return "", "", scrub.WrapError(scrub.SecondaryIndexKeyExtraValueDecodingError, err)
+				}
+				for i, id := range table.index.ExtraColumnIDs {
+					if table.neededCols.Contains(int(id)) {
+						table.row[table.colIdxMap[id]] = table.extraVals[i]
+					}
+				}
+				if rf.traceKV {
+					prettyValue = rf.prettyEncDatums(table.extraTypes, table.extraVals)
 				}
 			}
-			if rf.traceKV {
-				prettyValue = rf.prettyEncDatums(table.extraTypes, table.extraVals)
+		case roachpb.ValueType_TUPLE:
+			valueBytes, err = kv.Value.GetTuple()
+			if err != nil {
+				return "", "", scrub.WrapError(scrub.IndexValueDecodingError, err)
 			}
 		}
 
 		if DebugRowFetch {
-			if hasExtraCols(table) {
+			if hasExtraCols(table) && tag == roachpb.ValueType_BYTES {
 				log.Infof(ctx, "Scan %s -> %s", kv.Key, rf.prettyEncDatums(table.extraTypes, table.extraVals))
 			} else {
 				log.Infof(ctx, "Scan %s", kv.Key)

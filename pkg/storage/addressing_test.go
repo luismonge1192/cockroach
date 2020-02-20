@@ -146,7 +146,7 @@ func TestUpdateRangeAddressing(t *testing.T) {
 		)
 		db := client.NewDB(actx, tcsf, store.cfg.Clock)
 		ctx := context.Background()
-		txn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */, client.RootTxn)
+		txn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */)
 		if err := txn.Run(ctx, b); err != nil {
 			t.Fatal(err)
 		}
@@ -166,8 +166,7 @@ func TestUpdateRangeAddressing(t *testing.T) {
 		//   to RocksDB will be asynchronous.
 		var kvs []roachpb.KeyValue
 		testutils.SucceedsSoon(t, func() error {
-			var err error
-			kvs, _, _, err = engine.MVCCScan(ctx, store.Engine(), keys.MetaMin, keys.MetaMax,
+			res, err := engine.MVCCScan(ctx, store.Engine(), keys.MetaMin, keys.MetaMax,
 				math.MaxInt64, hlc.MaxTimestamp, engine.MVCCScanOptions{})
 			if err != nil {
 				// Wait for the intent to be resolved.
@@ -176,6 +175,7 @@ func TestUpdateRangeAddressing(t *testing.T) {
 				}
 				t.Fatal(err)
 			}
+			kvs = res.KVs
 			return nil
 		})
 		metas := metaSlice{}

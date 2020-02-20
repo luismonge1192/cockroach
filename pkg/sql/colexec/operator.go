@@ -24,6 +24,13 @@ type Operator interface {
 	// Init initializes this operator. Will be called once at operator setup
 	// time. If an operator has an input operator, it's responsible for calling
 	// Init on that input operator as well.
+	// TODO(yuzefovich): we might need to clarify whether it is ok to call
+	// Init() multiple times before the first call to Next(). It is possible to
+	// hit the memory limit during Init(), and a disk-backed operator needs to
+	// make sure that the input has been initialized. We could also in case that
+	// Init() doesn't succeed for bufferingInMemoryOperator - which should only
+	// happen when 'workmem' setting is too low - just bail, even if we have
+	// disk spilling for that operator.
 	Init()
 
 	// Next returns the next Batch from this operator. Once the operator is
@@ -38,6 +45,17 @@ type Operator interface {
 
 	execinfra.OpNode
 }
+
+// OperatorInitStatus indicates whether Init method has already been called on
+// an Operator.
+type OperatorInitStatus int
+
+const (
+	// OperatorNotInitialized indicates that Init has not been called yet.
+	OperatorNotInitialized OperatorInitStatus = iota
+	// OperatorInitialized indicates that Init has already been called.
+	OperatorInitialized
+)
 
 // NonExplainable is a marker interface which identifies an Operator that
 // should be omitted from the output of EXPLAIN (VEC). Note that VERBOSE
@@ -58,12 +76,12 @@ type OneInputNode struct {
 }
 
 // ChildCount implements the execinfra.OpNode interface.
-func (OneInputNode) ChildCount() int {
+func (OneInputNode) ChildCount(verbose bool) int {
 	return 1
 }
 
 // Child implements the execinfra.OpNode interface.
-func (n OneInputNode) Child(nth int) execinfra.OpNode {
+func (n OneInputNode) Child(nth int, verbose bool) execinfra.OpNode {
 	if nth == 0 {
 		return n.input
 	}
@@ -81,12 +99,12 @@ func (n OneInputNode) Input() Operator {
 type ZeroInputNode struct{}
 
 // ChildCount implements the execinfra.OpNode interface.
-func (ZeroInputNode) ChildCount() int {
+func (ZeroInputNode) ChildCount(verbose bool) int {
 	return 0
 }
 
 // Child implements the execinfra.OpNode interface.
-func (ZeroInputNode) Child(nth int) execinfra.OpNode {
+func (ZeroInputNode) Child(nth int, verbose bool) execinfra.OpNode {
 	execerror.VectorizedInternalPanic(fmt.Sprintf("invalid index %d", nth))
 	// This code is unreachable, but the compiler cannot infer that.
 	return nil
@@ -102,11 +120,11 @@ type twoInputNode struct {
 	inputTwo Operator
 }
 
-func (twoInputNode) ChildCount() int {
+func (twoInputNode) ChildCount(verbose bool) int {
 	return 2
 }
 
-func (n *twoInputNode) Child(nth int) execinfra.OpNode {
+func (n *twoInputNode) Child(nth int, verbose bool) execinfra.OpNode {
 	switch nth {
 	case 0:
 		return n.inputOne
@@ -188,9 +206,8 @@ func (s *zeroOperator) Init() {
 
 func (s *zeroOperator) Next(ctx context.Context) coldata.Batch {
 	// TODO(solon): Can we avoid calling Next on the input at all?
-	next := s.input.Next(ctx)
-	next.SetLength(0)
-	return next
+	s.input.Next(ctx)
+	return coldata.ZeroBatch
 }
 
 type singleTupleNoInputOperator struct {
@@ -217,8 +234,7 @@ func (s *singleTupleNoInputOperator) Init() {
 func (s *singleTupleNoInputOperator) Next(ctx context.Context) coldata.Batch {
 	s.batch.ResetInternalBatch()
 	if s.nexted {
-		s.batch.SetLength(0)
-		return s.batch
+		return coldata.ZeroBatch
 	}
 	s.nexted = true
 	s.batch.SetLength(1)

@@ -43,6 +43,30 @@ func alterZoneConfigAndClusterSettings(
 		return err
 	}
 
+	if _, err := db.ExecContext(
+		ctx, `ALTER TABLE system.public.jobs CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 120;`,
+	); err != nil {
+		return err
+	}
+
+	if _, err := db.ExecContext(
+		ctx, `ALTER RANGE meta CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 120;`,
+	); err != nil {
+		return err
+	}
+
+	if _, err := db.ExecContext(
+		ctx, `ALTER RANGE system CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 120;`,
+	); err != nil {
+		return err
+	}
+
+	if _, err := db.ExecContext(
+		ctx, `ALTER RANGE liveness CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 120;`,
+	); err != nil {
+		return err
+	}
+
 	// TODO(rafi): remove this check once we stop testing against 2.0 and 2.1
 	if strings.HasPrefix(version, "v2.0") || strings.HasPrefix(version, "v2.1") {
 		return nil
@@ -52,6 +76,15 @@ func alterZoneConfigAndClusterSettings(
 		ctx, `SET CLUSTER SETTING jobs.retention_time = '180s';`,
 	); err != nil {
 		return err
+	}
+
+	// Enable temp tables for v20.1
+	if strings.HasPrefix(version, "v20.") {
+		if _, err := db.ExecContext(
+			ctx, `SET CLUSTER SETTING sql.defaults.experimental_temporary_tables.enabled = 'true';`,
+		); err != nil {
+			return err
+		}
 	}
 
 	return nil

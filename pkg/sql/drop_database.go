@@ -17,11 +17,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
@@ -62,9 +64,20 @@ func (p *planner) DropDatabase(ctx context.Context, n *tree.DropDatabase) (planN
 		return nil, err
 	}
 
-	tbNames, err := GetObjectNames(ctx, p.txn, p, dbDesc, tree.PublicSchema, true /*explicitPrefix*/)
+	schemas, err := p.Tables().getSchemasForDatabase(ctx, p.txn, dbDesc.ID)
 	if err != nil {
 		return nil, err
+	}
+
+	var tbNames TableNames
+	for _, schema := range schemas {
+		toAppend, err := GetObjectNames(
+			ctx, p.txn, p, dbDesc, schema, true, /*explicitPrefix*/
+		)
+		if err != nil {
+			return nil, err
+		}
+		tbNames = append(tbNames, toAppend...)
 	}
 
 	if len(tbNames) > 0 {
@@ -106,11 +119,12 @@ func (p *planner) DropDatabase(ctx context.Context, n *tree.DropDatabase) (planN
 	if err != nil {
 		return nil, err
 	}
-
 	return &dropDatabaseNode{n: n, dbDesc: dbDesc, td: td}, nil
 }
 
 func (n *dropDatabaseNode) startExec(params runParams) error {
+	telemetry.Inc(sqltelemetry.SchemaChangeDrop("database"))
+
 	ctx := params.ctx
 	p := params.p
 	tbNameStrings := make([]string, 0, len(n.td))
@@ -140,34 +154,28 @@ func (n *dropDatabaseNode) startExec(params runParams) error {
 	}
 
 	for _, toDel := range n.td {
-		tbDesc := toDel.desc
-		if tbDesc.IsView() {
-			cascadedViews, err := p.dropViewImpl(ctx, tbDesc, tree.DropCascade)
-			if err != nil {
-				return err
-			}
-			// TODO(knz): dependent dropped views should be qualified here.
-			tbNameStrings = append(tbNameStrings, cascadedViews...)
-		} else {
-			cascadedViews, err := p.dropTableImpl(params, tbDesc)
-			if err != nil {
-				return err
-			}
-			// TODO(knz): dependent dropped table names should be qualified here.
-			tbNameStrings = append(tbNameStrings, cascadedViews...)
+		cascadedObjects, err := p.dropObject(ctx, toDel.desc, tree.DropCascade)
+		if err != nil {
+			return err
 		}
+		tbNameStrings = append(tbNameStrings, cascadedObjects...)
 		tbNameStrings = append(tbNameStrings, toDel.tn.FQString())
 	}
 
-	_ /* zoneKey */, nameKey, descKey := getKeysForDatabaseDescriptor(n.dbDesc)
+	descKey := sqlbase.MakeDescMetadataKey(n.dbDesc.ID)
 
 	b := &client.Batch{}
 	if p.ExtendedEvalContext().Tracing.KVTracingEnabled() {
 		log.VEventf(ctx, 2, "Del %s", descKey)
-		log.VEventf(ctx, 2, "Del %s", nameKey)
 	}
 	b.Del(descKey)
-	b.Del(nameKey)
+
+	err = sqlbase.RemoveDatabaseNamespaceEntry(
+		ctx, p.txn, n.dbDesc.Name, p.ExtendedEvalContext().Tracing.KVTracingEnabled(),
+	)
+	if err != nil {
+		return err
+	}
 
 	// No job was created because no tables were dropped, so zone config can be
 	// immediately removed.

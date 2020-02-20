@@ -36,6 +36,10 @@ type testSpec struct {
 	SkipDetails string
 
 	Name string
+	// Owner is the name of the team responsible for signing off on failures of
+	// this test that happen in the release process. This must be one of a limited
+	// set of values (the keys in the roachtestTeams map).
+	Owner Owner
 	// The maximum duration the test is allowed to run before it is considered
 	// failed. If not specified, the default timeout is 10m before the test's
 	// associated cluster expires. The timeout is always truncated to 10m before
@@ -121,6 +125,10 @@ type test struct {
 	// artifactsDir is the path to the directory holding all the artifacts for
 	// this test. It will contain a test.log file and cluster logs.
 	artifactsDir string
+	// artifactsSpec is a TeamCity artifacts spec used to publish this test's
+	// artifacts. See:
+	// https://www.jetbrains.com/help/teamcity/2019.1/configuring-general-settings.html#Artifact-Paths
+	artifactsSpec string
 
 	mu struct {
 		syncutil.RWMutex
@@ -237,6 +245,9 @@ func (t *test) Skip(msg string, details string) {
 // Fatal marks the test as failed, prints the args to t.l, and calls
 // runtime.GoExit(). It can be called multiple times.
 //
+// If the only argument is an error, it is formatted by "%+v", so it will show
+// stack traces and such.
+//
 // ATTENTION: Since this calls runtime.GoExit(), it should only be called from a
 // test's closure. The test runner itself should never call this.
 func (t *test) Fatal(args ...interface{}) {
@@ -246,6 +257,16 @@ func (t *test) Fatal(args ...interface{}) {
 // Fatalf is like Fatal, but takes a format string.
 func (t *test) Fatalf(format string, args ...interface{}) {
 	t.fatalfInner(format, args...)
+}
+
+// FailNow implements the TestingT interface.
+func (t *test) FailNow() {
+	t.Fatal()
+}
+
+// Errorf implements the TestingT interface.
+func (t *test) Errorf(format string, args ...interface{}) {
+	t.Fatalf(format, args...)
 }
 
 func (t *test) fatalfInner(format string, args ...interface{}) {
@@ -266,10 +287,24 @@ func FatalIfErr(t *test, err error) {
 }
 
 func (t *test) printAndFail(skip int, args ...interface{}) {
-	t.failWithMsg(t.decorate(skip+1, fmt.Sprint(args...)))
+	var msg string
+	if len(args) == 1 {
+		// If we were passed only an error, then format it with "%+v" in order to
+		// get any stack traces.
+		if err, ok := args[0].(error); ok {
+			msg = fmt.Sprintf("%+v", err)
+		}
+	}
+	if msg == "" {
+		msg = fmt.Sprint(args...)
+	}
+	t.failWithMsg(t.decorate(skip+1, msg))
 }
 
 func (t *test) printfAndFail(skip int, format string, args ...interface{}) {
+	if format == "" {
+		panic(fmt.Sprintf("invalid empty format. args: %s", args))
+	}
 	t.failWithMsg(t.decorate(skip+1, fmt.Sprintf(format, args...)))
 }
 
@@ -280,15 +315,17 @@ func (t *test) failWithMsg(msg string) {
 	prefix := ""
 	if t.mu.failed {
 		prefix = "[not the first failure] "
+		// NB: the first failure is not always the relevant one due to:
+		// https://github.com/cockroachdb/cockroach/issues/44436
+		//
+		// So we chain all failures together in the order in which we see
+		// them.
+		msg = "\n" + msg
 	}
 	t.l.Printf("%stest failure: %s", prefix, msg)
 
-	if t.mu.failed {
-		return
-	}
-
 	t.mu.failed = true
-	t.mu.failureMsg = msg
+	t.mu.failureMsg += msg
 	t.mu.output = append(t.mu.output, msg...)
 	if t.mu.cancel != nil {
 		t.mu.cancel()

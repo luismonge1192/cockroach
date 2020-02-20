@@ -11,7 +11,7 @@
 import _ from "lodash";
 import classNames from "classnames";
 import React from "react";
-import { Link } from "react-router";
+import { Link } from "react-router-dom";
 
 import * as protos from "src/js/protos";
 import { CachedDataReducerState } from "src/redux/cachedDataReducer";
@@ -91,7 +91,7 @@ export default function ConnectionsTable(props: ConnectionsTableProps) {
     .value();
   return (
     <div>
-      <h2>Connections (via Node {data.node_id})</h2>
+      <h2 className="base-heading">Connections (via Node {data.node_id})</h2>
       <table className="connections-table">
         <tbody>
           <tr className="connections-table__row connections-table__row--header">

@@ -62,6 +62,7 @@ func (b *Builder) buildCreateView(cv *memo.CreateViewExpr) (execPlan, error) {
 	root, err := b.factory.ConstructCreateView(
 		schema,
 		cv.ViewName,
+		cv.IfNotExists,
 		cv.Temporary,
 		cv.ViewQuery,
 		cols,
@@ -118,9 +119,9 @@ func (b *Builder) buildExplain(explain *memo.ExplainExpr) (execPlan, error) {
 		// The auto commit flag should reflect what would happen if this statement
 		// was run without the explain, so recalculate it.
 		defer func(oldVal bool) {
-			b.autoCommit = oldVal
-		}(b.autoCommit)
-		b.autoCommit = b.canAutoCommit(explain.Input)
+			b.allowAutoCommit = oldVal
+		}(b.allowAutoCommit)
+		b.allowAutoCommit = b.canAutoCommit(explain.Input)
 
 		input, err := b.buildRelational(explain.Input)
 		if err != nil {

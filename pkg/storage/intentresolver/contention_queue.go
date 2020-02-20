@@ -131,8 +131,7 @@ func txnID(txn *roachpb.Transaction) string {
 
 // add adds the intent specified in the supplied wiErr to the
 // contention queue. This may block the current goroutine if the
-// pusher has no transaction or the transaction is not yet writing
-// (i.e. read-only or hasn't successfully executed BeginTxn).
+// pusher has no transaction or the transaction is not yet writing.
 //
 // Note that the supplied wiErr write intent error must have only a
 // single intent (len(wiErr.Intents) == 1).
@@ -222,11 +221,7 @@ func (cq *contentionQueue) add(
 					log.VEventf(ctx, 3, "%s exiting contention queue to push %s", txnID(curPusher.txn), txnMeta.ID.Short())
 					wiErrCopy := *wiErr
 					wiErrCopy.Intents = []roachpb.Intent{
-						{
-							Span:   intent.Span,
-							Txn:    *txnMeta,
-							Status: roachpb.PENDING,
-						},
+						roachpb.MakePendingIntent(txnMeta, intent.Span),
 					}
 					wiErr = &wiErrCopy
 				} else {
@@ -265,11 +260,10 @@ func (cq *contentionQueue) add(
 					RequestHeader: roachpb.RequestHeader{
 						Key: pusheeTxn.Key,
 					},
-					PusherTxn:       getPusherTxn(h),
-					PusheeTxn:       *pusheeTxn,
-					PushTo:          h.Timestamp.Next(),
-					InclusivePushTo: true,
-					PushType:        roachpb.PUSH_ABORT,
+					PusherTxn: getPusherTxn(h),
+					PusheeTxn: *pusheeTxn,
+					PushTo:    h.Timestamp.Next(),
+					PushType:  roachpb.PUSH_ABORT,
 				})
 				log.VEventf(ctx, 3, "%s pushing %s to detect dependency cycles", txnID(curPusher.txn), pusheeTxn.ID.Short())
 				if err := cq.db.Run(ctx, b); err != nil {

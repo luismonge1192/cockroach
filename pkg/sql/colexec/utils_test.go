@@ -25,6 +25,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/pkg/errors"
@@ -69,6 +72,9 @@ var unorderedVerifier verifier = (*opTestOutput).VerifyAnyOrder
 // maybeHasNulls is a helper function that returns whether any of the columns in b
 // (maybe) have nulls.
 func maybeHasNulls(b coldata.Batch) bool {
+	if b.Length() == 0 {
+		return false
+	}
 	for i := 0; i < b.Width(); i++ {
 		if b.ColVec(i).MaybeHasNulls() {
 			return true
@@ -221,6 +227,9 @@ func runTestsWithoutAllNullsInjection(
 		// output on its second Next call (we need the first call to Next to get a
 		// reference to a batch to modify), and a second time to modify the batch
 		// and verify that this does not change the operator output.
+		// NOTE: this test makes sense only if the operator returns two non-zero
+		// length batches (if not, we short-circuit the test since the operator
+		// doesn't have to restore anything on a zero-length batch).
 		var (
 			secondBatchHasSelection, secondBatchHasNulls bool
 			inputTypes                                   []coltypes.T
@@ -246,6 +255,9 @@ func runTestsWithoutAllNullsInjection(
 			}
 			ctx := context.Background()
 			b := op.Next(ctx)
+			if b.Length() == 0 {
+				return
+			}
 			if round == 1 {
 				if secondBatchHasSelection {
 					b.SetSelection(false)
@@ -262,6 +274,9 @@ func runTestsWithoutAllNullsInjection(
 				}
 			}
 			b = op.Next(ctx)
+			if b.Length() == 0 {
+				return
+			}
 			if round == 0 {
 				secondBatchHasSelection = b.Selection() != nil
 				secondBatchHasNulls = maybeHasNulls(b)
@@ -324,7 +339,17 @@ func runTestsWithFn(
 ) {
 	rng, _ := randutil.NewPseudoRand()
 
-	for _, batchSize := range []uint16{1, uint16(math.Trunc(.002 * float64(coldata.BatchSize()))), uint16(math.Trunc(.003 * float64(coldata.BatchSize()))), uint16(math.Trunc(.016 * float64(coldata.BatchSize()))), coldata.BatchSize()} {
+	// Run tests over batchSizes of 1, (sometimes) a batch size that is small but
+	// greater than 1, and a full coldata.BatchSize().
+	batchSizes := make([]uint16, 0, 3)
+	batchSizes = append(batchSizes, 1)
+	smallButGreaterThanOne := uint16(math.Trunc(.002 * float64(coldata.BatchSize())))
+	if smallButGreaterThanOne > 1 {
+		batchSizes = append(batchSizes, smallButGreaterThanOne)
+	}
+	batchSizes = append(batchSizes, coldata.BatchSize())
+
+	for _, batchSize := range batchSizes {
 		for _, useSel := range []bool{false, true} {
 			t.Run(fmt.Sprintf("batchSize=%d/sel=%t", batchSize, useSel), func(t *testing.T) {
 				inputSources := make([]Operator, len(tups))
@@ -480,8 +505,7 @@ func (s *opTestInput) Init() {
 func (s *opTestInput) Next(context.Context) coldata.Batch {
 	s.batch.ResetInternalBatch()
 	if len(s.tuples) == 0 {
-		s.batch.SetLength(0)
-		return s.batch
+		return coldata.ZeroBatch
 	}
 	batchSize := s.batchSize
 	if len(s.tuples) < int(batchSize) {
@@ -533,8 +557,10 @@ func (s *opTestInput) Next(context.Context) coldata.Batch {
 	}
 
 	// Reset nulls for all columns in this batch.
-	for i := 0; i < s.batch.Width(); i++ {
-		s.batch.ColVec(i).Nulls().UnsetNulls()
+	for _, colVec := range s.batch.ColVecs() {
+		if colVec.Type() != coltypes.Unhandled {
+			colVec.Nulls().UnsetNulls()
+		}
 	}
 
 	rng := rand.New(rand.NewSource(123))
@@ -692,8 +718,7 @@ func (s *opFixedSelTestInput) Next(context.Context) coldata.Batch {
 		}
 	} else {
 		if s.idx == uint16(len(s.sel)) {
-			s.batch.SetLength(0)
-			return s.batch
+			return coldata.ZeroBatch
 		}
 		batchSize = s.batchSize
 		if uint16(len(s.sel))-s.idx < batchSize {
@@ -918,7 +943,7 @@ var _ Operator = &finiteBatchSource{}
 // batch a specified number of times.
 func newFiniteBatchSource(batch coldata.Batch, usableCount int) *finiteBatchSource {
 	return &finiteBatchSource{
-		repeatableBatch: NewRepeatableBatchSource(batch),
+		repeatableBatch: NewRepeatableBatchSource(testAllocator, batch),
 		usableCount:     usableCount,
 	}
 }
@@ -933,6 +958,10 @@ func (f *finiteBatchSource) Next(ctx context.Context) coldata.Batch {
 		return f.repeatableBatch.Next(ctx)
 	}
 	return coldata.ZeroBatch
+}
+
+func (f *finiteBatchSource) reset(usableCount int) {
+	f.usableCount = usableCount
 }
 
 // finiteChunksSource is an Operator that returns a batch specified number of
@@ -952,7 +981,7 @@ var _ Operator = &finiteChunksSource{}
 
 func newFiniteChunksSource(batch coldata.Batch, usableCount int, matchLen int) *finiteChunksSource {
 	return &finiteChunksSource{
-		repeatableBatch: NewRepeatableBatchSource(batch),
+		repeatableBatch: NewRepeatableBatchSource(testAllocator, batch),
 		usableCount:     usableCount,
 		matchLen:        matchLen,
 	}
@@ -1013,8 +1042,11 @@ func TestRepeatableBatchSource(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	batch := testAllocator.NewMemBatch([]coltypes.T{coltypes.Int64})
 	batchLen := uint16(10)
+	if coldata.BatchSize() < batchLen {
+		batchLen = coldata.BatchSize()
+	}
 	batch.SetLength(batchLen)
-	input := NewRepeatableBatchSource(batch)
+	input := NewRepeatableBatchSource(testAllocator, batch)
 
 	b := input.Next(context.Background())
 	b.SetLength(0)
@@ -1033,12 +1065,16 @@ func TestRepeatableBatchSourceWithFixedSel(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	batch := testAllocator.NewMemBatch([]coltypes.T{coltypes.Int64})
 	rng, _ := randutil.NewPseudoRand()
-	sel := randomSel(rng, 10 /* batchSize */, 0 /* probOfOmitting */)
+	batchSize := uint16(10)
+	if batchSize > coldata.BatchSize() {
+		batchSize = coldata.BatchSize()
+	}
+	sel := randomSel(rng, batchSize, 0 /* probOfOmitting */)
 	batchLen := uint16(len(sel))
 	batch.SetLength(batchLen)
 	batch.SetSelection(true)
 	copy(batch.Selection(), sel)
-	input := NewRepeatableBatchSource(batch)
+	input := NewRepeatableBatchSource(testAllocator, batch)
 	b := input.Next(context.Background())
 
 	b.SetLength(0)
@@ -1113,14 +1149,14 @@ func (c *chunkingBatchSource) Init() {
 
 func (c *chunkingBatchSource) Next(context.Context) coldata.Batch {
 	if c.curIdx >= c.len {
-		c.batch.SetLength(0)
+		return coldata.ZeroBatch
 	}
 	lastIdx := c.curIdx + uint64(coldata.BatchSize())
 	if lastIdx > c.len {
 		lastIdx = c.len
 	}
 	for i, vec := range c.batch.ColVecs() {
-		vec.SetCol(c.cols[i].Slice(c.typs[i], c.curIdx, lastIdx).Col())
+		vec.SetCol(c.cols[i].Window(c.typs[i], c.curIdx, lastIdx).Col())
 		nullsSlice := c.cols[i].Nulls().Slice(c.curIdx, lastIdx)
 		vec.SetNulls(&nullsSlice)
 	}
@@ -1131,4 +1167,58 @@ func (c *chunkingBatchSource) Next(context.Context) coldata.Batch {
 
 func (c *chunkingBatchSource) reset() {
 	c.curIdx = 0
+}
+
+// joinTestCase is a helper struct shared by the hash and merge join unit
+// tests. Not all fields have to be filled in, but init() method *must* be
+// called.
+type joinTestCase struct {
+	description           string
+	joinType              sqlbase.JoinType
+	leftTuples            []tuple
+	leftTypes             []coltypes.T
+	leftOutCols           []uint32
+	leftEqCols            []uint32
+	leftDirections        []execinfrapb.Ordering_Column_Direction
+	rightTuples           []tuple
+	rightTypes            []coltypes.T
+	rightOutCols          []uint32
+	rightEqCols           []uint32
+	rightDirections       []execinfrapb.Ordering_Column_Direction
+	leftEqColsAreKey      bool
+	rightEqColsAreKey     bool
+	expected              []tuple
+	outputBatchSize       uint16
+	skipAllNullsInjection bool
+	onExpr                execinfrapb.Expression
+}
+
+func (tc *joinTestCase) init() {
+	if tc.outputBatchSize == 0 {
+		tc.outputBatchSize = coldata.BatchSize()
+	}
+
+	if len(tc.leftDirections) == 0 {
+		tc.leftDirections = make([]execinfrapb.Ordering_Column_Direction, len(tc.leftTypes))
+		for i := range tc.leftDirections {
+			tc.leftDirections[i] = execinfrapb.Ordering_Column_ASC
+		}
+	}
+
+	if len(tc.rightDirections) == 0 {
+		tc.rightDirections = make([]execinfrapb.Ordering_Column_Direction, len(tc.rightTypes))
+		for i := range tc.rightDirections {
+			tc.rightDirections[i] = execinfrapb.Ordering_Column_ASC
+		}
+	}
+}
+
+type sortTestCase struct {
+	description string
+	tuples      tuples
+	expected    tuples
+	logTypes    []types.T
+	ordCols     []execinfrapb.Ordering_Column
+	matchLen    int
+	k           uint16
 }

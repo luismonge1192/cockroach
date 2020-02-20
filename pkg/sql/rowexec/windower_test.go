@@ -50,7 +50,7 @@ func TestWindowerAccountingForResults(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
-	tempEngine, err := engine.NewTempEngine(engine.DefaultStorageEngine, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+	tempEngine, _, err := engine.NewTempEngine(ctx, engine.DefaultStorageEngine, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func TestWindowerAccountingForResults(t *testing.T) {
 
 	post := &execinfrapb.PostProcessSpec{}
 	input := execinfra.NewRepeatableRowSource(sqlbase.OneIntCol, sqlbase.MakeIntRows(1000, 1))
-	aggSpec := execinfrapb.AggregatorSpec_Func(execinfrapb.AggregatorSpec_ARRAY_AGG)
+	aggSpec := execinfrapb.AggregatorSpec_ARRAY_AGG
 	spec := execinfrapb.WindowerSpec{
 		PartitionBy: []uint32{},
 		WindowFns: []execinfrapb.WindowerSpec_WindowFn{{

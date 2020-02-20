@@ -43,7 +43,8 @@ var (
 )
 
 const (
-	cockroachIndexEncoding = "prefix"
+	indexTypeForwardIndex  = "prefix"
+	indexTypeInvertedIndex = "inverted"
 	defaultCollationTag    = "en-US"
 )
 
@@ -58,13 +59,8 @@ const (
 	indoptionNullsFirst = 0x02
 )
 
-var cockroachIndexEncodingOid *tree.DOid
-
-func init() {
-	h := makeOidHasher()
-	h.writeStr(cockroachIndexEncoding)
-	cockroachIndexEncodingOid = h.getOid()
-}
+var forwardIndexOid = stringOid(indexTypeForwardIndex)
+var invertedIndexOid = stringOid(indexTypeInvertedIndex)
 
 // pgCatalog contains a set of system tables mirroring PostgreSQL's pg_catalog schema.
 // This code attempts to comply as closely as possible to the system catalogs documented
@@ -201,6 +197,7 @@ var pgCatalog = virtualSchema{
 		sqlbase.PgCatalogAmTableID:                  pgCatalogAmTable,
 		sqlbase.PgCatalogAttrDefTableID:             pgCatalogAttrDefTable,
 		sqlbase.PgCatalogAttributeTableID:           pgCatalogAttributeTable,
+		sqlbase.PgCatalogAuthIDTableID:              pgCatalogAuthIDTable,
 		sqlbase.PgCatalogAuthMembersTableID:         pgCatalogAuthMembersTable,
 		sqlbase.PgCatalogAvailableExtensionsTableID: pgCatalogAvailableExtensionsTable,
 		sqlbase.PgCatalogCastTableID:                pgCatalogCastTable,
@@ -298,18 +295,58 @@ CREATE TABLE pg_catalog.pg_am (
 	amtype CHAR
 )`,
 	populate: func(_ context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return addRow(
-			cockroachIndexEncodingOid,             // oid - all versions
-			tree.NewDName(cockroachIndexEncoding), // amname - all versions
+		// add row for forward indexes
+		if err := addRow(
+			forwardIndexOid,                      // oid - all versions
+			tree.NewDName(indexTypeForwardIndex), // amname - all versions
+			zeroVal,                              // amstrategies - < v9.6
+			zeroVal,                              // amsupport - < v9.6
+			tree.DBoolTrue,                       // amcanorder - < v9.6
+			tree.DBoolFalse,                      // amcanorderbyop - < v9.6
+			tree.DBoolTrue,                       // amcanbackward - < v9.6
+			tree.DBoolTrue,                       // amcanunique - < v9.6
+			tree.DBoolTrue,                       // amcanmulticol - < v9.6
+			tree.DBoolTrue,                       // amoptionalkey - < v9.6
+			tree.DBoolTrue,                       // amsearcharray - < v9.6
+			tree.DBoolTrue,                       // amsearchnulls - < v9.6
+			tree.DBoolFalse,                      // amstorage - < v9.6
+			tree.DBoolFalse,                      // amclusterable - < v9.6
+			tree.DBoolFalse,                      // ampredlocks - < v9.6
+			oidZero,                              // amkeytype - < v9.6
+			tree.DNull,                           // aminsert - < v9.6
+			tree.DNull,                           // ambeginscan - < v9.6
+			oidZero,                              // amgettuple - < v9.6
+			oidZero,                              // amgetbitmap - < v9.6
+			tree.DNull,                           // amrescan - < v9.6
+			tree.DNull,                           // amendscan - < v9.6
+			tree.DNull,                           // ammarkpos - < v9.6
+			tree.DNull,                           // amrestrpos - < v9.6
+			tree.DNull,                           // ambuild - < v9.6
+			tree.DNull,                           // ambuildempty - < v9.6
+			tree.DNull,                           // ambulkdelete - < v9.6
+			tree.DNull,                           // amvacuumcleanup - < v9.6
+			tree.DNull,                           // amcanreturn - < v9.6
+			tree.DNull,                           // amcostestimate - < v9.6
+			tree.DNull,                           // amoptions - < v9.6
+			tree.DNull,                           // amhandler - > v9.6
+			tree.NewDString("i"),                 // amtype - > v9.6
+		); err != nil {
+			return err
+		}
+
+		// add row for inverted indexes
+		if err := addRow(
+			invertedIndexOid,                      // oid - all versions
+			tree.NewDName(indexTypeInvertedIndex), // amname - all versions
 			zeroVal,                               // amstrategies - < v9.6
 			zeroVal,                               // amsupport - < v9.6
-			tree.DBoolTrue,                        // amcanorder - < v9.6
+			tree.DBoolFalse,                       // amcanorder - < v9.6
 			tree.DBoolFalse,                       // amcanorderbyop - < v9.6
-			tree.DBoolTrue,                        // amcanbackward - < v9.6
-			tree.DBoolTrue,                        // amcanunique - < v9.6
-			tree.DBoolTrue,                        // amcanmulticol - < v9.6
-			tree.DBoolTrue,                        // amoptionalkey - < v9.6
-			tree.DBoolTrue,                        // amsearcharray - < v9.6
+			tree.DBoolFalse,                       // amcanbackward - < v9.6
+			tree.DBoolFalse,                       // amcanunique - < v9.6
+			tree.DBoolFalse,                       // amcanmulticol - < v9.6
+			tree.DBoolFalse,                       // amoptionalkey - < v9.6
+			tree.DBoolFalse,                       // amsearcharray - < v9.6
 			tree.DBoolTrue,                        // amsearchnulls - < v9.6
 			tree.DBoolFalse,                       // amstorage - < v9.6
 			tree.DBoolFalse,                       // amclusterable - < v9.6
@@ -332,7 +369,10 @@ CREATE TABLE pg_catalog.pg_am (
 			tree.DNull,                            // amoptions - < v9.6
 			tree.DNull,                            // amhandler - > v9.6
 			tree.NewDString("i"),                  // amtype - > v9.6
-		)
+		); err != nil {
+			return err
+		}
+		return nil
 	},
 }
 
@@ -496,6 +536,48 @@ CREATE TABLE pg_catalog.pg_cast (
 	},
 }
 
+var pgCatalogAuthIDTable = virtualSchemaTable{
+	comment: `authorization identifiers - differs from postgres as we do not display passwords, 
+and thus do not require admin privileges for access. 
+https://www.postgresql.org/docs/9.5/catalog-pg-authid.html`,
+	schema: `
+CREATE TABLE pg_catalog.pg_authid (
+  oid OID,
+  rolname NAME,
+  rolsuper BOOL,
+  rolinherit BOOL,
+  rolcreaterole BOOL,
+  rolcreatedb BOOL,
+  rolcanlogin BOOL,
+  rolreplication BOOL,
+  rolbypassrls BOOL,
+  rolconnlimit INT4,
+  rolpassword TEXT, 
+  rolvaliduntil TIMESTAMPTZ
+)`,
+	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		h := makeOidHasher()
+		return forEachRole(ctx, p, func(username string, isRole bool) error {
+			isRoot := tree.DBool(username == security.RootUser || username == sqlbase.AdminRole)
+			isRoleDBool := tree.DBool(isRole)
+			return addRow(
+				h.UserOid(username),          // oid
+				tree.NewDName(username),      // rolname
+				tree.MakeDBool(isRoot),       // rolsuper
+				tree.MakeDBool(isRoleDBool),  // rolinherit. Roles inherit by default.
+				tree.MakeDBool(isRoot),       // rolcreaterole
+				tree.MakeDBool(isRoot),       // rolcreatedb
+				tree.MakeDBool(!isRoleDBool), // rolcanlogin. Only users can login.
+				tree.DBoolFalse,              // rolreplication
+				tree.DBoolFalse,              // rolbypassrls
+				negOneVal,                    // rolconnlimit
+				passwdStarString,             // rolpassword
+				tree.DNull,                   // rolvaliduntil
+			)
+		})
+	},
+}
+
 var pgCatalogAuthMembersTable = virtualSchemaTable{
 	comment: `role membership
 https://www.postgresql.org/docs/9.5/catalog-pg-auth-members.html`,
@@ -583,13 +665,17 @@ CREATE TABLE pg_catalog.pg_class (
 		h := makeOidHasher()
 		return forEachTableDesc(ctx, p, dbContext, virtualMany,
 			func(db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor) error {
-				// The only difference between tables, views and sequences is the relkind column.
+				// The only difference between tables, views and sequences are the relkind and relam columns.
 				relKind := relKindTable
+				relAm := forwardIndexOid
 				if table.IsView() {
 					relKind = relKindView
+					relAm = oidZero
 				} else if table.IsSequence() {
 					relKind = relKindSequence
+					relAm = oidZero
 				}
+
 				namespaceOid := h.NamespaceOid(db, scName)
 				if err := addRow(
 					defaultOid(table.ID),      // oid
@@ -598,7 +684,7 @@ CREATE TABLE pg_catalog.pg_class (
 					oidZero,                   // reltype (PG creates a composite type in pg_type for each table)
 					oidZero,                   // reloftype (PG creates a composite type in pg_type for each table)
 					tree.DNull,                // relowner
-					cockroachIndexEncodingOid, // relam
+					relAm,                     // relam
 					oidZero,                   // relfilenode
 					oidZero,                   // reltablespace
 					tree.DNull,                // relpages
@@ -633,6 +719,11 @@ CREATE TABLE pg_catalog.pg_class (
 
 				// Indexes.
 				return forEachIndexInTable(table, func(index *sqlbase.IndexDescriptor) error {
+					indexType := forwardIndexOid
+					if index.Type == sqlbase.IndexDescriptor_INVERTED {
+						indexType = invertedIndexOid
+					}
+
 					return addRow(
 						h.IndexOid(table.ID, index.ID), // oid
 						tree.NewDName(index.Name),      // relname
@@ -640,7 +731,7 @@ CREATE TABLE pg_catalog.pg_class (
 						oidZero,                        // reltype
 						oidZero,                        // reloftype
 						tree.DNull,                     // relowner
-						cockroachIndexEncodingOid,      // relam
+						indexType,                      // relam
 						oidZero,                        // relfilenode
 						oidZero,                        // reltablespace
 						tree.DNull,                     // relpages
@@ -820,7 +911,7 @@ CREATE TABLE pg_catalog.pg_constraint (
 					condef = tree.NewDString(table.PrimaryKeyString())
 
 				case sqlbase.ConstraintTypeFK:
-					oid = h.ForeignKeyConstraintOid(db, tree.PublicSchema, table, con.FK)
+					oid = h.ForeignKeyConstraintOid(db, scName, table, con.FK)
 					contype = conTypeFK
 					// Foreign keys don't have a single linked index. Pick the first one
 					// that matches on the referenced table.
@@ -828,7 +919,7 @@ CREATE TABLE pg_catalog.pg_constraint (
 					if err != nil {
 						return err
 					}
-					if idx, err := referencedTable.FindIndexByID(con.FK.LegacyReferencedIndex); err != nil {
+					if idx, err := sqlbase.FindFKReferencedIndex(referencedTable, con.FK.ReferencedColumnIDs); err != nil {
 						// We couldn't find an index that matched. This shouldn't happen.
 						log.Warningf(ctx, "broken fk reference: %v", err)
 					} else {
@@ -987,9 +1078,11 @@ CREATE TABLE pg_catalog.pg_database (
 	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return forEachDatabaseDesc(ctx, p, nil /*all databases*/, func(db *sqlbase.DatabaseDescriptor) error {
 			return addRow(
-				defaultOid(db.ID),          // oid
-				tree.NewDName(db.Name),     // datname
-				tree.DNull,                 // datdba
+				defaultOid(db.ID),      // oid
+				tree.NewDName(db.Name), // datname
+				tree.DNull,             // datdba
+				// If there is a change in encoding value for the database we must update
+				// the definitions of getdatabaseencoding within pg_builtin.
 				builtins.DatEncodingUTFId,  // encoding
 				builtins.DatEncodingEnUTF8, // datcollate
 				builtins.DatEncodingEnUTF8, // datctype
@@ -1112,13 +1205,13 @@ CREATE TABLE pg_catalog.pg_depend (
 					return err
 				}
 				refObjID := oidZero
-				if idx, err := referencedTable.FindIndexByID(con.FK.LegacyReferencedIndex); err != nil {
+				if idx, err := sqlbase.FindFKReferencedIndex(referencedTable, con.FK.ReferencedColumnIDs); err != nil {
 					// We couldn't find an index that matched. This shouldn't happen.
 					log.Warningf(ctx, "broken fk reference: %v", err)
 				} else {
 					refObjID = h.IndexOid(con.ReferencedTable.ID, idx.ID)
 				}
-				constraintOid := h.ForeignKeyConstraintOid(db, tree.PublicSchema, table, con.FK)
+				constraintOid := h.ForeignKeyConstraintOid(db, scName, table, con.FK)
 
 				if err := addRow(
 					pgConstraintTableOid, // classid
@@ -2944,4 +3037,10 @@ func (h oidHasher) OperatorOid(name string, leftType, rightType, returnType *tre
 
 func defaultOid(id sqlbase.ID) *tree.DOid {
 	return tree.NewDOid(tree.DInt(id))
+}
+
+func stringOid(s string) *tree.DOid {
+	h := makeOidHasher()
+	h.writeStr(s)
+	return h.getOid()
 }

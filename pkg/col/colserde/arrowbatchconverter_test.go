@@ -31,8 +31,8 @@ func randomBatch(allocator *colexec.Allocator) ([]coltypes.T, coldata.Batch) {
 
 	availableTyps := make([]coltypes.T, 0, len(coltypes.AllTypes))
 	for _, typ := range coltypes.AllTypes {
-		// TODO(asubiotto,jordan): We do not support decimal, timestamp conversion yet.
-		if typ == coltypes.Decimal || typ == coltypes.Timestamp {
+		// TODO(yuzefovich): We do not support interval conversion yet.
+		if typ == coltypes.Interval {
 			continue
 		}
 		availableTyps = append(availableTyps, typ)
@@ -48,79 +48,10 @@ func randomBatch(allocator *colexec.Allocator) ([]coltypes.T, coldata.Batch) {
 	return typs, b
 }
 
-// copyBatch copies the original batch. However, to increase test coverage, only
-// use the returned batch to assert equality, not as an input to a testing
-// function, since Copy simplifies the internals (e.g. if there are zero
-// elements to copy, copyBatch returns a zero-capacity batch, which is less
-// interesting than testing a batch with a different capacity of BatchSize() but
-// zero elements).
-func copyBatch(original coldata.Batch) coldata.Batch {
-	typs := make([]coltypes.T, original.Width())
-	for i, vec := range original.ColVecs() {
-		typs[i] = vec.Type()
-	}
-	b := coldata.NewMemBatchWithSize(typs, int(original.Length()))
-	b.SetLength(original.Length())
-	for colIdx, col := range original.ColVecs() {
-		b.ColVec(colIdx).Copy(coldata.CopySliceArgs{
-			SliceArgs: coldata.SliceArgs{
-				ColType:   typs[colIdx],
-				Src:       col,
-				SrcEndIdx: uint64(original.Length()),
-			},
-		})
-	}
-	return b
-}
-
-func assertEqualBatches(t *testing.T, expected, actual coldata.Batch) {
-	t.Helper()
-
-	if actual.Selection() != nil {
-		t.Fatal("violated invariant that batches have no selection vectors")
-	}
-	require.Equal(t, expected.Length(), actual.Length())
-	require.Equal(t, expected.Width(), actual.Width())
-	for colIdx := 0; colIdx < expected.Width(); colIdx++ {
-		// Verify equality of ColVecs (this includes nulls). Since the coldata.Vec
-		// backing array is always of coldata.BatchSize() due to the scratch batch
-		// that the converter keeps around, the coldata.Vec needs to be sliced to
-		// the first length elements to match on length, otherwise the check will
-		// fail.
-		expectedVec := expected.ColVec(colIdx)
-		actualVec := actual.ColVec(colIdx)
-		typ := expectedVec.Type()
-		require.Equal(t, typ, actualVec.Type())
-		require.Equal(
-			t,
-			expectedVec.Nulls().Slice(0, uint64(expected.Length())),
-			actualVec.Nulls().Slice(0, uint64(actual.Length())),
-		)
-		if typ == coltypes.Bytes {
-			// Cannot use require.Equal for this type.
-			// TODO(asubiotto): Again, why not?
-			expectedBytes := expectedVec.Bytes().Slice(0, int(expected.Length()))
-			resultBytes := actualVec.Bytes().Slice(0, int(actual.Length()))
-			require.Equal(t, expectedBytes.Len(), resultBytes.Len())
-			for i := 0; i < expectedBytes.Len(); i++ {
-				if !bytes.Equal(expectedBytes.Get(i), resultBytes.Get(i)) {
-					t.Fatalf("bytes mismatch at index %d:\nexpected:\n%sactual:\n%s", i, expectedBytes, resultBytes)
-				}
-			}
-		} else {
-			require.Equal(
-				t,
-				expectedVec.Slice(expectedVec.Type(), 0, uint64(expected.Length())),
-				actualVec.Slice(actualVec.Type(), 0, uint64(actual.Length())),
-			)
-		}
-	}
-}
-
 func TestArrowBatchConverterRejectsUnsupportedTypes(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	unsupportedTypes := []coltypes.T{coltypes.Decimal}
+	unsupportedTypes := []coltypes.T{coltypes.Interval}
 	for _, typ := range unsupportedTypes {
 		_, err := colserde.NewArrowBatchConverter([]coltypes.T{typ})
 		require.Error(t, err)
@@ -136,14 +67,14 @@ func TestArrowBatchConverterRandom(t *testing.T) {
 
 	// Make a copy of the original batch because the converter modifies and casts
 	// data without copying for performance reasons.
-	expected := copyBatch(b)
+	expected := colexec.CopyBatch(testAllocator, b)
 
 	arrowData, err := c.BatchToArrow(b)
 	require.NoError(t, err)
 	actual := coldata.NewMemBatchWithSize(nil, 0)
 	require.NoError(t, c.ArrowToBatch(arrowData, actual))
 
-	assertEqualBatches(t, expected, actual)
+	coldata.AssertEquivalentBatches(t, expected, actual)
 }
 
 // roundTripBatch is a helper function that round trips a batch through the
@@ -177,19 +108,21 @@ func roundTripBatch(
 func TestRecordBatchRoundtripThroughBytes(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	typs, b := randomBatch(testAllocator)
-	c, err := colserde.NewArrowBatchConverter(typs)
-	require.NoError(t, err)
-	r, err := colserde.NewRecordBatchSerializer(typs)
-	require.NoError(t, err)
+	for run := 0; run < 10; run++ {
+		typs, b := randomBatch(testAllocator)
+		c, err := colserde.NewArrowBatchConverter(typs)
+		require.NoError(t, err)
+		r, err := colserde.NewRecordBatchSerializer(typs)
+		require.NoError(t, err)
 
-	// Make a copy of the original batch because the converter modifies and casts
-	// data without copying for performance reasons.
-	expected := copyBatch(b)
-	actual, err := roundTripBatch(b, c, r)
-	require.NoError(t, err)
+		// Make a copy of the original batch because the converter modifies and
+		// casts data without copying for performance reasons.
+		expected := colexec.CopyBatch(testAllocator, b)
+		actual, err := roundTripBatch(b, c, r)
+		require.NoError(t, err)
 
-	assertEqualBatches(t, expected, actual)
+		coldata.AssertEquivalentBatches(t, expected, actual)
+	}
 }
 
 func BenchmarkArrowBatchConverter(b *testing.B) {
@@ -202,6 +135,7 @@ func BenchmarkArrowBatchConverter(b *testing.B) {
 	typs := []coltypes.T{
 		coltypes.Bool,
 		coltypes.Bytes,
+		coltypes.Decimal,
 		coltypes.Int64,
 		coltypes.Timestamp,
 	}
@@ -211,6 +145,7 @@ func BenchmarkArrowBatchConverter(b *testing.B) {
 	numBytes := []int64{
 		int64(coldata.BatchSize()),
 		fixedLen * int64(coldata.BatchSize()),
+		0, // The number of bytes for decimals will be set below.
 		8 * int64(coldata.BatchSize()),
 		3 * 8 * int64(coldata.BatchSize()),
 	}
@@ -238,6 +173,15 @@ func BenchmarkArrowBatchConverter(b *testing.B) {
 				}
 			}
 			batch.ColVec(0).SetCol(newBytes)
+		} else if typ == coltypes.Decimal {
+			// Decimal is variable length type, so we want to calculate precisely the
+			// total size of all decimals in the vector.
+			decimals := batch.ColVec(0).Decimal()
+			for _, d := range decimals {
+				marshaled, err := d.MarshalText()
+				require.NoError(b, err)
+				numBytes[typIdx] += int64(len(marshaled))
+			}
 		}
 		c, err := colserde.NewArrowBatchConverter([]coltypes.T{typ})
 		require.NoError(b, err)

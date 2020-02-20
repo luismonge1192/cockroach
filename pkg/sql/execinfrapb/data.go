@@ -16,13 +16,12 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
 )
 
 // ConvertToColumnOrdering converts an Ordering type (as defined in data.proto)
@@ -142,30 +141,22 @@ func NewError(ctx context.Context, err error) *Error {
 
 	// Encode the full error to the best of our ability.
 	// This field is ignored by 19.1 nodes and prior.
-	fullError := errors.EncodeError(ctx, err)
+	ctx = logtags.AddTag(ctx, "sent-error", nil)
+	fullError := errors.EncodeError(ctx, errors.WithContextTags(err, ctx))
 	resErr.FullError = &fullError
 
-	// Now populate compatibility fields for 19.1 nodes.
-	// TODO(knz): Remove this code in the 19.3 release.
-	cause := errors.UnwrapAll(err)
-	switch e := cause.(type) {
-	case *roachpb.UnhandledRetryableError:
-		resErr.Detail = &Error_RetryableTxnError{RetryableTxnError: e}
-	case *roachpb.NodeUnavailableError:
-		err = pgerror.WithCandidateCode(err, pgcode.RangeUnavailable)
-		resErr.Detail = &Error_PGError{PGError: pgerror.Flatten(err)}
-	default:
-		err = errors.NewAssertionErrorWithWrappedErrf(err, "uncaught error")
-		resErr.Detail = &Error_PGError{PGError: pgerror.Flatten(err)}
-	}
 	return resErr
 }
 
 // ErrorDetail returns the payload as a Go error.
-func (e *Error) ErrorDetail(ctx context.Context) error {
+func (e *Error) ErrorDetail(ctx context.Context) (err error) {
 	if e == nil {
 		return nil
 	}
+	defer func() {
+		ctx = logtags.AddTag(ctx, "received-error", nil)
+		err = errors.WithContextTags(err, ctx)
+	}()
 
 	if e.FullError != nil {
 		// If there's a 19.2-forward full error, decode and use that.
@@ -173,19 +164,10 @@ func (e *Error) ErrorDetail(ctx context.Context) error {
 		return errors.DecodeError(ctx, *e.FullError)
 	}
 
-	// Fallback to pre-19.2 logic.
-	// TODO(knz): Remove in 19.3.
-	switch t := e.Detail.(type) {
-	case *Error_PGError:
-		return t.PGError
-	case *Error_RetryableTxnError:
-		return t.RetryableTxnError
-	default:
-		// We're receiving an error we don't know about. It's all right,
-		// it's still an error, just one we didn't expect. Let it go
-		// through. We'll pick it up in reporting.
-		return errors.AssertionFailedf("unknown error detail type: %+v", t)
-	}
+	// We're receiving an error we don't know about. It's all right,
+	// it's still an error, just one we didn't expect. Let it go
+	// through. We'll pick it up in reporting.
+	return errors.AssertionFailedf("unknown error from remote node")
 }
 
 // ProducerMetadata represents a metadata record flowing through a DistSQL flow.
@@ -198,10 +180,10 @@ type ProducerMetadata struct {
 	Err error
 	// TraceData is sent if snowball tracing is enabled.
 	TraceData []tracing.RecordedSpan
-	// TxnCoordMeta contains the updated transaction coordinator metadata,
-	// to be sent from leaf transactions to augment the root transaction,
-	// held by the flow's ultimate receiver.
-	TxnCoordMeta *roachpb.TxnCoordMeta
+	// LeafTxnFinalState contains the final state of the LeafTxn to be
+	// sent from leaf flows to the RootTxn held by the flow's ultimate
+	// receiver.
+	LeafTxnFinalState *roachpb.LeafTxnFinalState
 	// RowNum corresponds to a row produced by a "source" processor that takes no
 	// inputs. It is used in tests to verify that all metadata is forwarded
 	// exactly once to the receiver on the gateway node.
@@ -270,8 +252,8 @@ func RemoteProducerMetaToLocalMeta(
 		meta.Ranges = v.RangeInfo.RangeInfo
 	case *RemoteProducerMetadata_TraceData_:
 		meta.TraceData = v.TraceData.CollectedSpans
-	case *RemoteProducerMetadata_TxnCoordMeta:
-		meta.TxnCoordMeta = v.TxnCoordMeta
+	case *RemoteProducerMetadata_LeafTxnFinalState:
+		meta.LeafTxnFinalState = v.LeafTxnFinalState
 	case *RemoteProducerMetadata_RowNum_:
 		meta.RowNum = v.RowNum
 	case *RemoteProducerMetadata_SamplerProgress_:
@@ -306,9 +288,9 @@ func LocalMetaToRemoteProducerMeta(
 				CollectedSpans: meta.TraceData,
 			},
 		}
-	} else if meta.TxnCoordMeta != nil {
-		rpm.Value = &RemoteProducerMetadata_TxnCoordMeta{
-			TxnCoordMeta: meta.TxnCoordMeta,
+	} else if meta.LeafTxnFinalState != nil {
+		rpm.Value = &RemoteProducerMetadata_LeafTxnFinalState{
+			LeafTxnFinalState: meta.LeafTxnFinalState,
 		}
 	} else if meta.RowNum != nil {
 		rpm.Value = &RemoteProducerMetadata_RowNum_{

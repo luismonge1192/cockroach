@@ -19,15 +19,15 @@ import (
 )
 
 func init() {
-	RegisterCommand(roachpb.Delete, DefaultDeclareKeys, Delete)
+	RegisterReadWriteCommand(roachpb.Delete, DefaultDeclareKeys, Delete)
 }
 
 // Delete deletes the key and value specified by key.
 func Delete(
-	ctx context.Context, batch engine.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, readWriter engine.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
 ) (result.Result, error) {
 	args := cArgs.Args.(*roachpb.DeleteRequest)
 	h := cArgs.Header
 
-	return result.Result{}, engine.MVCCDelete(ctx, batch, cArgs.Stats, args.Key, h.Timestamp, h.Txn)
+	return result.Result{}, engine.MVCCDelete(ctx, readWriter, cArgs.Stats, args.Key, h.Timestamp, h.Txn)
 }

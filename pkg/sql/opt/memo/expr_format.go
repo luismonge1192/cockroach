@@ -14,6 +14,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"unicode"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
@@ -90,10 +92,10 @@ func (f ExprFmtFlags) HasFlags(subset ExprFmtFlags) bool {
 
 // FormatExpr returns a string representation of the given expression, formatted
 // according to the specified flags.
-func FormatExpr(e opt.Expr, flags ExprFmtFlags, catalog cat.Catalog) string {
-	var mem *Memo
-	if nd, ok := e.(RelExpr); ok {
-		mem = nd.Memo()
+func FormatExpr(e opt.Expr, flags ExprFmtFlags, mem *Memo, catalog cat.Catalog) string {
+	if catalog == nil {
+		// Automatically hide qualifications if we have no catalog.
+		flags |= ExprFmtHideQualifications
 	}
 	f := MakeExprFmtCtx(flags, mem, catalog)
 	f.FormatExpr(e)
@@ -215,7 +217,7 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 		}
 
 	case *WithScanExpr:
-		fmt.Fprintf(f.Buffer, "%v &%d", e.Op(), t.ID)
+		fmt.Fprintf(f.Buffer, "%v &%d", e.Op(), t.With)
 		if t.Name != "" {
 			fmt.Fprintf(f.Buffer, " (%s)", t.Name)
 		}
@@ -224,7 +226,17 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 		fmt.Fprintf(f.Buffer, "%v", e.Op())
 		if opt.IsJoinNonApplyOp(t) {
 			// All join ops that weren't handled above execute as a hash join.
-			f.Buffer.WriteString(" (hash)")
+			if leftEqCols, _ := ExtractJoinEqualityColumns(
+				e.Child(0).(RelExpr).Relational().OutputCols,
+				e.Child(1).(RelExpr).Relational().OutputCols,
+				*e.Child(2).(*FiltersExpr),
+			); len(leftEqCols) == 0 {
+				// The case where there are no equality columns is executed as a
+				// degenerate case of hash join; let's be explicit about that.
+				f.Buffer.WriteString(" (cross)")
+			} else {
+				f.Buffer.WriteString(" (hash)")
+			}
 		}
 	}
 
@@ -300,8 +312,43 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 		}
 
 	case *ScanExpr:
-		if t.Constraint != nil {
-			tp.Childf("constraint: %s", t.Constraint)
+		if t.IsCanonical() {
+			// For the canonical scan, show the expressions attached to the TableMeta.
+			tab := md.TableMeta(t.Table)
+			if len(tab.Constraints) > 0 {
+				c := tp.Childf("check constraint expressions")
+				for i := 0; i < len(tab.Constraints); i++ {
+					f.formatExpr(tab.Constraints[i], c)
+				}
+			}
+			if len(tab.ComputedCols) > 0 {
+				c := tp.Childf("computed column expressions")
+				cols := make(opt.ColList, 0, len(tab.ComputedCols))
+				for col := range tab.ComputedCols {
+					cols = append(cols, col)
+				}
+				sort.Slice(cols, func(i, j int) bool {
+					return cols[i] < cols[j]
+				})
+				for _, col := range cols {
+					f.Buffer.Reset()
+					formatCol(f, "" /* label */, col, opt.ColSet{} /* notNullCols */, false /* omitType */)
+					colInfo := strings.TrimPrefix(f.Buffer.String(), " ")
+					f.formatExpr(tab.ComputedCols[col], c.Child(colInfo))
+				}
+			}
+		}
+		if c := t.Constraint; c != nil {
+			if c.IsContradiction() {
+				tp.Childf("constraint: contradiction")
+			} else if c.Spans.Count() == 1 {
+				tp.Childf("constraint: %s: %s", c.Columns.String(), c.Spans.Get(0).String())
+			} else {
+				n := tp.Childf("constraint: %s", c.Columns.String())
+				for i := 0; i < c.Spans.Count(); i++ {
+					n.Child(c.Spans.Get(i).String())
+				}
+			}
 		}
 		if t.HardLimit.IsSet() {
 			tp.Childf("limit: %s", t.HardLimit)
@@ -322,6 +369,33 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 				tp.Childf("flags: force-index=%s%s", idx.Name(), dir)
 			}
 		}
+		if t.Locking != nil {
+			strength := ""
+			switch t.Locking.Strength {
+			case tree.ForNone:
+			case tree.ForKeyShare:
+				strength = "for-key-share"
+			case tree.ForShare:
+				strength = "for-share"
+			case tree.ForNoKeyUpdate:
+				strength = "for-no-key-update"
+			case tree.ForUpdate:
+				strength = "for-update"
+			default:
+				panic(errors.AssertionFailedf("unexpected strength"))
+			}
+			wait := ""
+			switch t.Locking.WaitPolicy {
+			case tree.LockWaitBlock:
+			case tree.LockWaitSkip:
+				wait = ",skip-locked"
+			case tree.LockWaitError:
+				wait = ",nowait"
+			default:
+				panic(errors.AssertionFailedf("unexpected wait policy"))
+			}
+			tp.Childf("locking: %s%s", strength, wait)
+		}
 
 	case *LookupJoinExpr:
 		if !t.Flags.Empty() {
@@ -334,6 +408,9 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 		}
 		if !f.HasFlags(ExprFmtHideColumns) {
 			tp.Childf("key columns: %v = %v", t.KeyCols, idxCols)
+		}
+		if t.LookupColsAreTableKey {
+			tp.Childf("lookup columns are key")
 		}
 
 	case *ZigzagJoinExpr:
@@ -698,8 +775,8 @@ func (f *ExprFmtCtx) FormatScalarProps(scalar opt.ScalarExpr) {
 			writeProp("type=%s", typ)
 		}
 
-		if propsExpr, ok := scalar.(ScalarPropsExpr); ok && f.Memo != nil {
-			scalarProps := propsExpr.ScalarProps(f.Memo)
+		if propsExpr, ok := scalar.(ScalarPropsExpr); ok {
+			scalarProps := propsExpr.ScalarProps()
 			if !f.HasFlags(ExprFmtHideMiscProps) {
 				if !scalarProps.OuterCols.Empty() {
 					writeProp("outer=%s", scalarProps.OuterCols)
@@ -977,8 +1054,12 @@ func FormatPrivate(f *ExprFmtCtx, private interface{}, physProps *physical.Requi
 	switch t := private.(type) {
 	case *opt.ColumnID:
 		fullyQualify := !f.HasFlags(ExprFmtHideQualifications)
-		label := f.Memo.metadata.QualifiedAlias(*t, fullyQualify, f.Catalog)
-		fmt.Fprintf(f.Buffer, " %s", label)
+		if f.Memo != nil {
+			label := f.Memo.metadata.QualifiedAlias(*t, fullyQualify, f.Catalog)
+			fmt.Fprintf(f.Buffer, " %s", label)
+		} else {
+			fmt.Fprintf(f.Buffer, " unknown%d", *t)
+		}
 
 	case *TupleOrdinal:
 		fmt.Fprintf(f.Buffer, " %d", *t)

@@ -12,7 +12,6 @@ package sql
 
 import (
 	"context"
-	"strconv"
 	"strings"
 	"time"
 
@@ -215,21 +214,13 @@ func timeZoneVarGetStringVal(
 	switch v := tree.UnwrapDatum(&evalCtx.EvalContext, d).(type) {
 	case *tree.DString:
 		location := string(*v)
-		loc, err = timeutil.LoadLocation(location)
+		loc, err = timeutil.TimeZoneStringToLocation(
+			location,
+			timeutil.TimeZoneStringToLocationISO8601Standard,
+		)
 		if err != nil {
-			var err1 error
-			loc, err1 = timeutil.LoadLocation(strings.ToUpper(location))
-			if err1 != nil {
-				loc, err1 = timeutil.LoadLocation(strings.ToTitle(location))
-				if err1 != nil {
-					var ok bool
-					offset, ok = timeutil.TimeZoneOffsetStringConversion(location)
-					if !ok {
-						return "", wrapSetVarError("timezone", values[0].String(),
-							"cannot find time zone %q: %v", location, err)
-					}
-				}
-			}
+			return "", wrapSetVarError("timezone", values[0].String(),
+				"cannot find time zone %q: %v", location, err)
 		}
 
 	case *tree.DInterval:
@@ -267,15 +258,12 @@ func timeZoneVarGetStringVal(
 }
 
 func timeZoneVarSet(_ context.Context, m *sessionDataMutator, s string) error {
-	loc, err := timeutil.TimeZoneStringToLocation(s)
+	loc, err := timeutil.TimeZoneStringToLocation(
+		s,
+		timeutil.TimeZoneStringToLocationISO8601Standard,
+	)
 	if err != nil {
-		// Maybe the string is coming from pgwire as a simple number.
-		intVal, err1 := strconv.ParseInt(s, 10, 64)
-		if err1 != nil {
-			// Ignore the int conversion, the original error is good enough.
-			return wrapSetVarError("TimeZone", s, "%v", err)
-		}
-		loc = timeutil.FixedOffsetTimeZoneToLocation(int(intVal)*60*60, s)
+		return wrapSetVarError("TimeZone", s, "%v", err)
 	}
 
 	m.SetLocation(loc)
@@ -309,7 +297,11 @@ func stmtTimeoutVarGetStringVal(
 }
 
 func stmtTimeoutVarSet(ctx context.Context, m *sessionDataMutator, s string) error {
-	interval, err := tree.ParseDIntervalWithField(s, tree.Millisecond)
+	interval, err := tree.ParseDIntervalWithTypeMetadata(s, types.IntervalTypeMetadata{
+		DurationField: types.IntervalDurationField{
+			DurationType: types.IntervalDurationType_MILLISECOND,
+		},
+	})
 	if err != nil {
 		return wrapSetVarError("statement_timeout", s, "%v", err)
 	}

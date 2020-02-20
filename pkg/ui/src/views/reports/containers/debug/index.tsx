@@ -55,7 +55,7 @@ function DebugTableRow(props: { title: string, children?: React.ReactNode }) {
 function DebugTable(props: { heading: string, children?: React.ReactNode }) {
   return (
     <div>
-      <h2>{props.heading}</h2>
+      <h2 className="base-heading">{props.heading}</h2>
       <table className="debug-table">
         <tbody>
           {props.children}
@@ -82,10 +82,8 @@ function DebugPanelLink(props: { name: string, url: string,  note: string }) {
 export default function Debug() {
   return (
     <div className="section">
-      <Helmet>
-        <title>Debug</title>
-      </Helmet>
-      <h1>Advanced Debugging</h1>
+      <Helmet title="Debug" />
+      <h1 className="base-heading page-title">Advanced Debugging</h1>
       <div className="debug-header">
         <InfoBox>
           <p>
@@ -147,6 +145,11 @@ export default function Debug() {
             name="Nodes filtered by locality (regex)"
             url="#/reports/nodes?locality=region=us-east"
             note="#/reports/nodes?locality=[regex]"
+          />
+          <DebugTableLink
+            name="Decommissioned node history"
+            url="#/reports/nodes/history"
+            note="#/reports/nodes/history"
           />
         </DebugTableRow>
         <DebugTableRow title="Stores">

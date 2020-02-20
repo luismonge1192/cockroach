@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/pkg/errors"
 )
 
@@ -99,6 +100,9 @@ var _ apd.Decimal
 
 // Dummy import to pull in "time" package.
 var _ time.Time
+
+// Dummy import to pull in "duration" package.
+var _ duration.Duration
 
 // Dummy import to pull in "tree" package.
 var _ tree.Datum
@@ -268,14 +272,14 @@ func (p *sortedDistinct_TYPEOp) Next(ctx context.Context) coldata.Batch {
 		// Bounds check elimination.
 		col = execgen.SLICE(col, 0, int(n))
 		outputCol = outputCol[:n]
-		_ = outputCol[execgen.LEN(col)-1]
+		_ = outputCol[n-1]
 		if nulls != nil {
-			for execgen.RANGE(checkIdx, col) {
+			for execgen.RANGE(checkIdx, col, 0, int(n)) {
 				outputIdx := checkIdx
 				_CHECK_DISTINCT_WITH_NULLS(checkIdx, outputIdx, lastVal, nulls, lastValNull, col, outputCol)
 			}
 		} else {
-			for execgen.RANGE(checkIdx, col) {
+			for execgen.RANGE(checkIdx, col, 0, int(n)) {
 				outputIdx := checkIdx
 				_CHECK_DISTINCT(checkIdx, outputIdx, lastVal, col, outputCol)
 			}
@@ -334,12 +338,12 @@ func (p partitioner_TYPE) partition(colVec coldata.Vec, outputCol []bool, n uint
 	outputCol = outputCol[:n]
 	outputCol[0] = true
 	if nulls != nil {
-		for execgen.RANGE(checkIdx, col) {
+		for execgen.RANGE(checkIdx, col, 0, int(n)) {
 			outputIdx := checkIdx
 			_CHECK_DISTINCT_WITH_NULLS(checkIdx, outputIdx, lastVal, nulls, lastValNull, col, outputCol)
 		}
 	} else {
-		for execgen.RANGE(checkIdx, col) {
+		for execgen.RANGE(checkIdx, col, 0, int(n)) {
 			outputIdx := checkIdx
 			_CHECK_DISTINCT(checkIdx, outputIdx, lastVal, col, outputCol)
 		}

@@ -16,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 )
 
 // column is an interface that represents a raw array of a Go native type.
@@ -79,6 +80,8 @@ type Vec interface {
 	Decimal() []apd.Decimal
 	// Timestamp returns a time.Time slice.
 	Timestamp() []time.Time
+	// Interval returns a duration.Duration slice.
+	Interval() []duration.Duration
 
 	// Col returns the raw, typeless backing storage for this Vec.
 	Col() interface{}
@@ -106,9 +109,11 @@ type Vec interface {
 	// Refer to the CopySliceArgs comment for specifics and TestCopy for examples.
 	Copy(CopySliceArgs)
 
-	// Slice returns a new Vec representing a slice of the current Vec from
-	// [start, end).
-	Slice(colType coltypes.T, start uint64, end uint64) Vec
+	// Window returns a "window" into the Vec. A "window" is similar to Golang's
+	// slice of the current Vec from [start, end), but the returned object is NOT
+	// allowed to be modified (the modification might result in an undefined
+	// behavior).
+	Window(colType coltypes.T, start uint64, end uint64) Vec
 
 	// PrettyValueAt returns a "pretty"value for the idx'th value in this Vec.
 	// It uses the reflect package and is not suitable for calling in hot paths.
@@ -169,6 +174,10 @@ func NewMemColumn(t coltypes.T, n int) Vec {
 		return &memColumn{t: t, col: make([]apd.Decimal, n), nulls: nulls}
 	case coltypes.Timestamp:
 		return &memColumn{t: t, col: make([]time.Time, n), nulls: nulls}
+	case coltypes.Interval:
+		return &memColumn{t: t, col: make([]duration.Duration, n), nulls: nulls}
+	case coltypes.Unhandled:
+		return unknown{}
 	default:
 		panic(fmt.Sprintf("unhandled type %s", t))
 	}
@@ -214,6 +223,10 @@ func (m *memColumn) Timestamp() []time.Time {
 	return m.col.([]time.Time)
 }
 
+func (m *memColumn) Interval() []duration.Duration {
+	return m.col.([]duration.Duration)
+}
+
 func (m *memColumn) Col() interface{} {
 	return m.col
 }
@@ -252,6 +265,8 @@ func (m *memColumn) Length() int {
 		return len(m.col.([]apd.Decimal))
 	case coltypes.Timestamp:
 		return len(m.col.([]time.Time))
+	case coltypes.Interval:
+		return len(m.col.([]duration.Duration))
 	default:
 		panic(fmt.Sprintf("unhandled type %s", m.t))
 	}
@@ -275,6 +290,8 @@ func (m *memColumn) SetLength(l int) {
 		m.col = m.col.([]apd.Decimal)[:l]
 	case coltypes.Timestamp:
 		m.col = m.col.([]time.Time)[:l]
+	case coltypes.Interval:
+		m.col = m.col.([]duration.Duration)[:l]
 	default:
 		panic(fmt.Sprintf("unhandled type %s", m.t))
 	}
@@ -298,6 +315,8 @@ func (m *memColumn) Capacity() int {
 		return cap(m.col.([]apd.Decimal))
 	case coltypes.Timestamp:
 		return cap(m.col.([]time.Time))
+	case coltypes.Interval:
+		return cap(m.col.([]duration.Duration))
 	default:
 		panic(fmt.Sprintf("unhandled type %s", m.t))
 	}

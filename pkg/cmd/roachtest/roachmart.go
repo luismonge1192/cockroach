@@ -39,12 +39,7 @@ func registerRoachmart(r *testRegistry) {
 				"--orders=100",
 				fmt.Sprintf("--partition=%v", partition))
 
-			l, err := t.l.ChildLogger(fmt.Sprint(nodes[i].i))
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer l.close()
-			if err := c.RunL(ctx, l, c.Node(nodes[i].i), args...); err != nil {
+			if err := c.RunE(ctx, c.Node(nodes[i].i), args...); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -70,6 +65,7 @@ func registerRoachmart(r *testRegistry) {
 		v := v
 		r.Add(testSpec{
 			Name:    fmt.Sprintf("roachmart/partition=%v", v),
+			Owner:   OwnerPartitioning,
 			Cluster: makeClusterSpec(9, geo(), zones("us-central1-b,us-west1-b,europe-west2-b")),
 			Run: func(ctx context.Context, t *test, c *cluster) {
 				runRoachmart(ctx, t, c, v)

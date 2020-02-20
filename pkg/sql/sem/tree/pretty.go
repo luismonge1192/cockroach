@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/pretty"
 	"github.com/cockroachdb/errors"
 )
@@ -52,6 +53,9 @@ type PrettyCfg struct {
 	Simplify bool
 	// Case, if set, transforms case-insensitive strings (like SQL keywords).
 	Case func(string) string
+	// JSONFmt, when set, pretty-prints strings that are asserted or cast
+	// to JSON.
+	JSONFmt bool
 }
 
 // DefaultPrettyCfg returns a PrettyCfg with the default
@@ -540,45 +544,8 @@ func (node *Select) docTable(p *PrettyCfg) []pretty.TableRow {
 	}
 	items = append(items, node.OrderBy.docRow(p))
 	items = append(items, node.Limit.docTable(p)...)
-	items = append(items, node.ForLocked.docTable(p)...)
+	items = append(items, node.Locking.docTable(p)...)
 	return items
-}
-
-func (node ForLocked) doc(p *PrettyCfg) pretty.Doc {
-	return p.rlTable(node.docTable(p)...)
-}
-
-func (node ForLocked) docTable(p *PrettyCfg) []pretty.TableRow {
-	if node.Strength == ForNone {
-		return nil
-	}
-	items := make([]pretty.TableRow, 0, 2)
-	items = append(items, node.Strength.docTable(p)...)
-	if len(node.Targets) > 0 {
-		items = append(items, p.row("OF", p.Doc(&node.Targets)))
-	}
-	return items
-}
-
-func (node LockingStrength) doc(p *PrettyCfg) pretty.Doc {
-	return p.rlTable(node.docTable(p)...)
-}
-
-func (node LockingStrength) docTable(p *PrettyCfg) []pretty.TableRow {
-	var keyword string
-	switch node {
-	case ForNone:
-		return nil
-	case ForUpdate:
-		keyword = "FOR UPDATE"
-	case ForNoKeyUpdate:
-		keyword = "FOR NO KEY UPDATE"
-	case ForShare:
-		keyword = "FOR SHARE"
-	case ForKeyShare:
-		keyword = "FOR KEY SHARE"
-	}
-	return []pretty.TableRow{p.row("", pretty.Keyword(keyword))}
 }
 
 func (node *SelectClause) doc(p *PrettyCfg) pretty.Doc {
@@ -812,6 +779,59 @@ func (node *WindowFrameBound) doc(p *PrettyCfg) pretty.Doc {
 	}
 }
 
+func (node *LockingClause) doc(p *PrettyCfg) pretty.Doc {
+	return p.rlTable(node.docTable(p)...)
+}
+
+func (node *LockingClause) docTable(p *PrettyCfg) []pretty.TableRow {
+	items := make([]pretty.TableRow, len(*node))
+	for i, n := range *node {
+		items[i] = p.row("", p.Doc(n))
+	}
+	return items
+}
+
+func (node *LockingItem) doc(p *PrettyCfg) pretty.Doc {
+	return p.rlTable(node.docTable(p)...)
+}
+
+func (node *LockingItem) docTable(p *PrettyCfg) []pretty.TableRow {
+	if node.Strength == ForNone {
+		return nil
+	}
+	items := make([]pretty.TableRow, 0, 3)
+	items = append(items, node.Strength.docTable(p)...)
+	if len(node.Targets) > 0 {
+		items = append(items, p.row("OF", p.Doc(&node.Targets)))
+	}
+	items = append(items, node.WaitPolicy.docTable(p)...)
+	return items
+}
+
+func (node LockingStrength) doc(p *PrettyCfg) pretty.Doc {
+	return p.rlTable(node.docTable(p)...)
+}
+
+func (node LockingStrength) docTable(p *PrettyCfg) []pretty.TableRow {
+	str := node.String()
+	if str == "" {
+		return nil
+	}
+	return []pretty.TableRow{p.row("", pretty.Keyword(str))}
+}
+
+func (node LockingWaitPolicy) doc(p *PrettyCfg) pretty.Doc {
+	return p.rlTable(node.docTable(p)...)
+}
+
+func (node LockingWaitPolicy) docTable(p *PrettyCfg) []pretty.TableRow {
+	str := node.String()
+	if str == "" {
+		return nil
+	}
+	return []pretty.TableRow{p.row("", pretty.Keyword(str))}
+}
+
 func (p *PrettyCfg) peelCompOperand(e Expr) Expr {
 	if !p.Simplify {
 		return e
@@ -959,6 +979,12 @@ func (node *CastExpr) doc(p *PrettyCfg) pretty.Doc {
 		}
 		fallthrough
 	case CastShort:
+		switch node.Type.Family() {
+		case types.JsonFamily:
+			if sv, ok := node.Expr.(*StrVal); ok && p.JSONFmt {
+				return p.jsonCast(sv, "::", node.Type)
+			}
+		}
 		return pretty.Fold(pretty.Concat,
 			p.exprDocWithParen(node.Expr),
 			pretty.Text("::"),
@@ -1207,6 +1233,9 @@ func (node *CreateView) doc(p *PrettyCfg) pretty.Doc {
 		title = pretty.ConcatSpace(title, pretty.Keyword("TEMPORARY"))
 	}
 	title = pretty.ConcatSpace(title, pretty.Keyword("VIEW"))
+	if node.IfNotExists {
+		title = pretty.ConcatSpace(title, pretty.Keyword("IF NOT EXISTS"))
+	}
 	d := pretty.ConcatSpace(
 		title,
 		p.Doc(&node.Name),
@@ -1422,6 +1451,18 @@ func (node *RangePartition) doc(p *PrettyCfg) pretty.Doc {
 	return p.nestUnder(title, pretty.Group(pretty.Stack(clauses...)))
 }
 
+func (node *ShardedIndexDef) doc(p *PrettyCfg) pretty.Doc {
+	// Final layout:
+	//
+	// USING HASH WITH BUCKET_COUNT = bucket_count
+	//
+	parts := []pretty.Doc{
+		pretty.Keyword("USING HASH WITH BUCKET_COUNT = "),
+		p.Doc(node.ShardBuckets),
+	}
+	return pretty.Fold(pretty.ConcatSpace, parts...)
+}
+
 func (node *InterleaveDef) doc(p *PrettyCfg) pretty.Doc {
 	// Final layout:
 	//
@@ -1462,12 +1503,15 @@ func (node *CreateIndex) doc(p *PrettyCfg) pretty.Doc {
 		title = append(title, p.Doc(&node.Name))
 	}
 
-	clauses := make([]pretty.Doc, 0, 4)
+	clauses := make([]pretty.Doc, 0, 5)
 	clauses = append(clauses, pretty.Fold(pretty.ConcatSpace,
 		pretty.Keyword("ON"),
 		p.Doc(&node.Table),
 		p.bracket("(", p.Doc(&node.Columns), ")")))
 
+	if node.Sharded != nil {
+		clauses = append(clauses, p.Doc(node.Sharded))
+	}
 	if len(node.Storing) > 0 {
 		clauses = append(clauses, p.bracketKeyword(
 			"STORING", " (",
@@ -1535,7 +1579,10 @@ func (node *IndexTableDef) doc(p *PrettyCfg) pretty.Doc {
 	}
 	title = pretty.ConcatSpace(title, p.bracket("(", p.Doc(&node.Columns), ")"))
 
-	clauses := make([]pretty.Doc, 0, 3)
+	clauses := make([]pretty.Doc, 0, 4)
+	if node.Sharded != nil {
+		clauses = append(clauses, p.Doc(node.Sharded))
+	}
 	if node.Storing != nil {
 		clauses = append(clauses, p.bracketKeyword(
 			"STORING", "(",
@@ -1570,7 +1617,7 @@ func (node *UniqueConstraintTableDef) doc(p *PrettyCfg) pretty.Doc {
 	//    [INTERLEAVE ...]
 	//    [PARTITION BY ...]
 	//
-	clauses := make([]pretty.Doc, 0, 4)
+	clauses := make([]pretty.Doc, 0, 5)
 	var title pretty.Doc
 	if node.PrimaryKey {
 		title = pretty.Keyword("PRIMARY KEY")
@@ -1581,6 +1628,9 @@ func (node *UniqueConstraintTableDef) doc(p *PrettyCfg) pretty.Doc {
 	if node.Name != "" {
 		clauses = append(clauses, title)
 		title = pretty.ConcatSpace(pretty.Keyword("CONSTRAINT"), p.Doc(&node.Name))
+	}
+	if node.Sharded != nil {
+		clauses = append(clauses, p.Doc(node.Sharded))
 	}
 	if node.Storing != nil {
 		clauses = append(clauses, p.bracketKeyword(
@@ -1725,7 +1775,7 @@ func (node *ColumnTableDef) docRow(p *PrettyCfg) pretty.TableRow {
 
 	// PRIMARY KEY / UNIQUE constraint.
 	pkConstraint := pretty.Nil
-	if node.PrimaryKey {
+	if node.PrimaryKey.IsPrimaryKey {
 		pkConstraint = pretty.Keyword("PRIMARY KEY")
 	} else if node.Unique {
 		pkConstraint = pretty.Keyword("UNIQUE")
@@ -1734,6 +1784,10 @@ func (node *ColumnTableDef) docRow(p *PrettyCfg) pretty.TableRow {
 		clauses = append(clauses, p.maybePrependConstraintName(&node.UniqueConstraintName, pkConstraint))
 	}
 
+	if node.PrimaryKey.Sharded {
+		clauses = append(clauses, pretty.Keyword("USING HASH WITH BUCKET_COUNT = "))
+		clauses = append(clauses, p.Doc(node.PrimaryKey.ShardBuckets))
+	}
 	// CHECK expressions/constraints.
 	for _, checkExpr := range node.CheckExprs {
 		clauses = append(clauses, p.maybePrependConstraintName(&checkExpr.ConstraintName,
@@ -2058,4 +2112,66 @@ func (node *Execute) docTable(p *PrettyCfg) []pretty.TableRow {
 		rows = append(rows, p.row("", pretty.Keyword("DISCARD ROWS")))
 	}
 	return rows
+}
+
+func (node *AnnotateTypeExpr) doc(p *PrettyCfg) pretty.Doc {
+	if node.SyntaxMode == AnnotateShort {
+		switch node.Type.Family() {
+		case types.JsonFamily:
+			if sv, ok := node.Expr.(*StrVal); ok && p.JSONFmt {
+				return p.jsonCast(sv, ":::", node.Type)
+			}
+		}
+	}
+	return p.docAsString(node)
+}
+
+// jsonCast attempts to pretty print a string that is cast or asserted as JSON.
+func (p *PrettyCfg) jsonCast(sv *StrVal, op string, typ *types.T) pretty.Doc {
+	return pretty.Fold(pretty.Concat,
+		p.jsonString(sv.RawString()),
+		pretty.Text(op),
+		pretty.Text(typ.SQLString()),
+	)
+}
+
+// jsonString parses s as JSON and pretty prints it.
+func (p *PrettyCfg) jsonString(s string) pretty.Doc {
+	j, err := json.ParseJSON(s)
+	if err != nil {
+		return pretty.Text(s)
+	}
+	return p.bracket(`'`, p.jsonNode(j), `'`)
+}
+
+// jsonNode pretty prints a JSON node.
+func (p *PrettyCfg) jsonNode(j json.JSON) pretty.Doc {
+	// Figure out what type this is.
+	if it, _ := j.ObjectIter(); it != nil {
+		// Object.
+		elems := make([]pretty.Doc, 0, j.Len())
+		for it.Next() {
+			elems = append(elems, p.nestUnder(
+				pretty.Concat(
+					pretty.Text(json.FromString(it.Key()).String()),
+					pretty.Text(`:`),
+				),
+				p.jsonNode(it.Value()),
+			))
+		}
+		return p.bracket("{", p.commaSeparated(elems...), "}")
+	} else if n := j.Len(); n > 0 {
+		// Non-empty array.
+		elems := make([]pretty.Doc, n)
+		for i := 0; i < n; i++ {
+			elem, err := j.FetchValIdx(i)
+			if err != nil {
+				return pretty.Text(j.String())
+			}
+			elems[i] = p.jsonNode(elem)
+		}
+		return p.bracket("[", p.commaSeparated(elems...), "]")
+	}
+	// Other.
+	return pretty.Text(j.String())
 }

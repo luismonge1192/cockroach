@@ -45,6 +45,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/heapprofiler"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -63,6 +64,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/closedts/container"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/protectedts"
+	"github.com/cockroachdb/cockroach/pkg/storage/protectedts/ptprovider"
 	"github.com/cockroachdb/cockroach/pkg/storage/reports"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/ts"
@@ -188,6 +192,7 @@ type Server struct {
 	internalExecutor *sql.InternalExecutor
 	leaseMgr         *sql.LeaseManager
 	blobService      *blobs.Service
+	debug            *debug.Server
 	// sessionRegistry can be queried for info on running SQL sessions. It is
 	// shared between the sql.Server and the statusServer.
 	sessionRegistry     *sql.SessionRegistry
@@ -198,7 +203,8 @@ type Server struct {
 	internalMemMetrics  sql.MemoryMetrics
 	adminMemMetrics     sql.MemoryMetrics
 	// sqlMemMetrics are used to track memory usage of sql sessions.
-	sqlMemMetrics sql.MemoryMetrics
+	sqlMemMetrics       sql.MemoryMetrics
+	protectedtsProvider protectedts.Provider
 }
 
 // NewServer creates a Server from a server.Config.
@@ -406,7 +412,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	// Set up the DistSQL temp engine.
 
 	useStoreSpec := cfg.Stores.Specs[s.cfg.TempStorageConfig.SpecIdx]
-	tempEngine, err := engine.NewTempEngine(s.cfg.StorageEngine, s.cfg.TempStorageConfig, useStoreSpec)
+	tempEngine, tempFS, err := engine.NewTempEngine(ctx, s.cfg.StorageEngine, s.cfg.TempStorageConfig, useStoreSpec)
 	if err != nil {
 		return nil, errors.Wrap(err, "could not create temp storage")
 	}
@@ -472,6 +478,12 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		)
 	}
 
+	s.protectedtsProvider = ptprovider.New(ptprovider.Config{
+		DB:               s.db,
+		InternalExecutor: internalExecutor,
+		Settings:         st,
+	})
+
 	// Similarly for execCfg.
 	var execCfg sql.ExecutorConfig
 
@@ -520,9 +532,10 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			Dialer: s.nodeDialer.CTDialer(),
 		}),
 
-		EnableEpochRangeLeases: true,
-		ExternalStorage:        externalStorage,
-		ExternalStorageFromURI: externalStorageFromURI,
+		EnableEpochRangeLeases:  true,
+		ExternalStorage:         externalStorage,
+		ExternalStorageFromURI:  externalStorageFromURI,
+		ProtectedTimestampCache: s.protectedtsProvider,
 	}
 	if storeTestingKnobs := s.cfg.TestingKnobs.Store; storeTestingKnobs != nil {
 		storeCfg.TestingKnobs = *storeTestingKnobs.(*storage.StoreTestingKnobs)
@@ -545,6 +558,13 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		s.ClusterSettings(), s.nodeLiveness, internalExecutor)
 
 	s.sessionRegistry = sql.NewSessionRegistry()
+	var jobAdoptionStopFile string
+	for _, spec := range s.cfg.Stores.Specs {
+		if !spec.InMemory && spec.Path != "" {
+			jobAdoptionStopFile = filepath.Join(spec.Path, jobs.PreventAdoptionFile)
+			break
+		}
+	}
 	s.jobRegistry = jobs.MakeRegistry(
 		s.cfg.AmbientCtx,
 		s.stopper,
@@ -559,6 +579,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			// in sql/jobs/registry.go on planHookMaker.
 			return sql.NewInternalPlanner(opName, nil, user, &sql.MemoryMetrics{}, &execCfg)
 		},
+		jobAdoptionStopFile,
 	)
 	s.registry.AddMetricStruct(s.jobRegistry.MetricsStruct())
 
@@ -596,8 +617,10 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		ClusterID:      &s.rpcContext.ClusterID,
 		ClusterName:    s.cfg.ClusterName,
 
-		TempStorage: tempEngine,
-		DiskMonitor: s.cfg.TempStorageConfig.Mon,
+		TempStorage:     tempEngine,
+		TempStoragePath: s.cfg.TempStorageConfig.Path,
+		TempFS:          tempFS,
+		DiskMonitor:     s.cfg.TempStorageConfig.Mon,
 
 		ParentMemoryMonitor: &rootSQLMemoryMonitor,
 		BulkAdder: func(
@@ -700,6 +723,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		HistogramWindowInterval: s.cfg.HistogramWindowInterval(),
 		RangeDescriptorCache:    s.distSender.RangeDescriptorCache(),
 		LeaseHolderCache:        s.distSender.LeaseHolderCache(),
+		RoleMemberCache:         &sql.MembershipCache{},
 		TestingKnobs:            sqlExecutorTestingKnobs,
 
 		DistSQLPlanner: sql.NewDistSQLPlanner(
@@ -734,7 +758,13 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			true /*enableGc*/, true /*forceSyncWrites*/, true, /* enableMsgCount */
 		),
 
-		QueryCache: querycache.New(s.cfg.SQLQueryCacheSize),
+		SlowQueryLogger: log.NewSecondaryLogger(
+			loggerCtx, nil, "sql-slow",
+			true /*enableGc*/, false /*forceSyncWrites*/, true, /* enableMsgCount */
+		),
+
+		QueryCache:                 querycache.New(s.cfg.SQLQueryCacheSize),
+		ProtectedTimestampProvider: s.protectedtsProvider,
 	}
 
 	if sqlSchemaChangerTestingKnobs := s.cfg.TestingKnobs.SQLSchemaChanger; sqlSchemaChangerTestingKnobs != nil {
@@ -782,14 +812,14 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		func(
 			ctx context.Context, sessionData *sessiondata.SessionData,
 		) sqlutil.InternalExecutor {
-			ie := sql.NewSessionBoundInternalExecutor(
+			ie := sql.MakeInternalExecutor(
 				ctx,
-				sessionData,
 				s.pgServer.SQLServer,
 				s.sqlMemMetrics,
 				s.st,
 			)
-			return ie
+			ie.SetSessionData(sessionData)
+			return &ie
 		}
 
 	for _, m := range s.pgServer.Metrics() {
@@ -809,6 +839,8 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	s.node.InitLogger(&execCfg)
 	s.cfg.DefaultZoneConfig = cfg.DefaultZoneConfig
+
+	s.debug = debug.NewServer(s.ClusterSettings(), s.pgServer.HBADebugFn())
 
 	return s, nil
 }
@@ -1004,12 +1036,7 @@ func ensureClockMonotonicity(
 		// As an optimization for tests, we don't sleep if all the stores are brand
 		// new. In this case, the node will not serve anything anyway until it
 		// synchronizes with other nodes.
-
-		// Don't have to sleep for monotonicity when using clockless reads
-		// (nor can we, for we would sleep forever).
-		if maxOffset := clock.MaxOffset(); maxOffset != timeutil.ClocklessMaxOffset {
-			sleepUntil = startTime.UnixNano() + int64(maxOffset) + 1
-		}
+		sleepUntil = startTime.UnixNano() + int64(clock.MaxOffset()) + 1
 	}
 
 	currentWallTimeFn := func() int64 { /* function to report current time */
@@ -1239,7 +1266,7 @@ func (s *Server) Start(ctx context.Context) error {
 	//
 	// TODO(marc): when cookie-based authentication exists, apply it to all web
 	// endpoints.
-	s.mux.Handle(debug.Endpoint, debug.NewServer(s.st))
+	s.mux.Handle(debug.Endpoint, s.debug)
 
 	// Initialize grpc-gateway mux and context in order to get the /health
 	// endpoint working even before the node has fully initialized.
@@ -1585,20 +1612,12 @@ func (s *Server) Start(ctx context.Context) error {
 	// Begin recording status summaries.
 	s.node.startWriteNodeStatus(DefaultMetricsSampleInterval)
 
-	{
-		var regLiveness jobs.NodeLiveness = s.nodeLiveness
-		if testingLiveness := s.cfg.TestingKnobs.RegistryLiveness; testingLiveness != nil {
-			regLiveness = testingLiveness.(*jobs.FakeNodeLiveness)
-		}
-		if err := s.jobRegistry.Start(
-			ctx, s.stopper, regLiveness, jobs.DefaultCancelInterval, jobs.DefaultAdoptInterval,
-		); err != nil {
-			return err
-		}
-	}
-
 	// Start the background thread for periodically refreshing table statistics.
 	if err := s.statsRefresher.Start(ctx, s.stopper, stats.DefaultRefreshInterval); err != nil {
+		return err
+	}
+
+	if err := s.protectedtsProvider.Start(ctx, s.stopper); err != nil {
 		return err
 	}
 
@@ -1610,13 +1629,27 @@ func (s *Server) Start(ctx context.Context) error {
 	if migrationManagerTestingKnobs := s.cfg.TestingKnobs.SQLMigrationManager; migrationManagerTestingKnobs != nil {
 		mmKnobs = *migrationManagerTestingKnobs.(*sqlmigrations.MigrationManagerTestingKnobs)
 	}
+	migrationsExecutor := sql.MakeInternalExecutor(
+		ctx, s.pgServer.SQLServer, s.internalMemMetrics, s.ClusterSettings())
+	migrationsExecutor.SetSessionData(
+		&sessiondata.SessionData{
+			// Migrations need an executor with query distribution turned off. This is
+			// because the node crashes if migrations fail to execute, and query
+			// distribution introduces more moving parts. Local execution is more
+			// robust; for example, the DistSender has retries if it can't connect to
+			// another node, but DistSQL doesn't. Also see #44101 for why DistSQL is
+			// particularly fragile immediately after a node is started (i.e. the
+			// present situation).
+			DistSQLMode: sessiondata.DistSQLOff,
+		})
 	migMgr := sqlmigrations.NewManager(
 		s.stopper,
 		s.db,
-		s.internalExecutor,
+		&migrationsExecutor,
 		s.clock,
 		mmKnobs,
 		s.NodeID().String(),
+		s.ClusterSettings(),
 	)
 
 	var bootstrapVersion roachpb.Version
@@ -1685,6 +1718,24 @@ func (s *Server) Start(ctx context.Context) error {
 		return err
 	}
 
+	// Record node start in telemetry. Get the right counter for this storage
+	// engine type as well as type of start (initial boot vs restart).
+	nodeStartCounter := "storage.engine."
+	switch s.cfg.StorageEngine {
+	case enginepb.EngineTypePebble:
+		nodeStartCounter += "pebble."
+	case enginepb.EngineTypeRocksDB:
+		nodeStartCounter += "rocksdb."
+	case enginepb.EngineTypeTeePebbleRocksDB:
+		nodeStartCounter += "pebble+rocksdb."
+	}
+	if s.InitialBoot() {
+		nodeStartCounter += "initial-boot"
+	} else {
+		nodeStartCounter += "restart"
+	}
+	telemetry.Count(nodeStartCounter)
+
 	// Record that this node joined the cluster in the event log. Since this
 	// executes a SQL query, this must be done after the SQL layer is ready.
 	s.node.recordJoinEvent()
@@ -1692,6 +1743,18 @@ func (s *Server) Start(ctx context.Context) error {
 	// Delete all orphaned table leases created by a prior instance of this
 	// node. This also uses SQL.
 	s.leaseMgr.DeleteOrphanedLeases(timeThreshold)
+
+	{
+		var regLiveness jobs.NodeLiveness = s.nodeLiveness
+		if testingLiveness := s.cfg.TestingKnobs.RegistryLiveness; testingLiveness != nil {
+			regLiveness = testingLiveness.(*jobs.FakeNodeLiveness)
+		}
+		if err := s.jobRegistry.Start(
+			ctx, s.stopper, regLiveness, jobs.DefaultCancelInterval, jobs.DefaultAdoptInterval,
+		); err != nil {
+			return err
+		}
+	}
 
 	log.Event(ctx, "server ready")
 
@@ -1898,8 +1961,8 @@ func (s *Server) startServeSQL(
 			connCtx := logtags.AddTag(pgCtx, "client", conn.RemoteAddr().String())
 			tcpKeepAlive.configure(connCtx, conn)
 
-			if err := s.pgServer.ServeConn(connCtx, conn); err != nil {
-				log.Error(connCtx, err)
+			if err := s.pgServer.ServeConn(connCtx, conn, pgwire.SocketTCP); err != nil {
+				log.Errorf(connCtx, "serving SQL client conn: %v", err)
 			}
 		}))
 	})
@@ -1924,7 +1987,7 @@ func (s *Server) startServeSQL(
 		s.stopper.RunWorker(pgCtx, func(pgCtx context.Context) {
 			netutil.FatalIfUnexpected(connManager.ServeWith(pgCtx, s.stopper, unixLn, func(conn net.Conn) {
 				connCtx := logtags.AddTag(pgCtx, "client", conn.RemoteAddr().String())
-				if err := s.pgServer.ServeConn(connCtx, conn); err != nil {
+				if err := s.pgServer.ServeConn(connCtx, conn, pgwire.SocketUnix); err != nil {
 					log.Error(connCtx, err)
 				}
 			}))

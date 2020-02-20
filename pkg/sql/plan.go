@@ -13,6 +13,7 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -130,6 +131,25 @@ type planNodeFastPath interface {
 	FastPathResults() (int, bool)
 }
 
+// planNodeReadingOwnWrites can be implemented by planNodes which do
+// not use the standard SQL principle of reading at the snapshot
+// established at the start of the transaction. It requests that
+// the top-level (shared) `startExec` function disable stepping
+// mode for the duration of the node's `startExec()` call.
+//
+// This done e.g. for most DDL statements that perform multiple KV
+// operations on descriptors, expecting to read their own writes.
+//
+// Note that only `startExec()` runs with the modified stepping mode,
+// not the `Next()` methods. This interface (and the idea of
+// temporarily disabling stepping mode) is neither sensical nor
+// applicable to planNodes whose execution is interleaved with
+// that of others.
+type planNodeReadingOwnWrites interface {
+	// ReadingOwnWrites is a marker interface.
+	ReadingOwnWrites()
+}
+
 var _ planNode = &alterIndexNode{}
 var _ planNode = &alterSequenceNode{}
 var _ planNode = &alterTableNode{}
@@ -163,6 +183,7 @@ var _ planNode = &groupNode{}
 var _ planNode = &hookFnNode{}
 var _ planNode = &indexJoinNode{}
 var _ planNode = &insertNode{}
+var _ planNode = &insertFastPathNode{}
 var _ planNode = &joinNode{}
 var _ planNode = &limitNode{}
 var _ planNode = &max1RowNode{}
@@ -205,6 +226,16 @@ var _ planNodeFastPath = &rowCountNode{}
 var _ planNodeFastPath = &serializeNode{}
 var _ planNodeFastPath = &setZoneConfigNode{}
 var _ planNodeFastPath = &controlJobsNode{}
+
+var _ planNodeReadingOwnWrites = &alterIndexNode{}
+var _ planNodeReadingOwnWrites = &alterSequenceNode{}
+var _ planNodeReadingOwnWrites = &alterTableNode{}
+var _ planNodeReadingOwnWrites = &createIndexNode{}
+var _ planNodeReadingOwnWrites = &createSequenceNode{}
+var _ planNodeReadingOwnWrites = &createTableNode{}
+var _ planNodeReadingOwnWrites = &createViewNode{}
+var _ planNodeReadingOwnWrites = &changePrivilegesNode{}
+var _ planNodeReadingOwnWrites = &setZoneConfigNode{}
 
 // planNodeRequireSpool serves as marker for nodes whose parent must
 // ensure that the node is fully run to completion (and the results
@@ -250,11 +281,6 @@ type planTop struct {
 	// This is (currently) used by CREATE VIEW.
 	// TODO(knz): Remove this in favor of a better encapsulated mechanism.
 	deps planDependencies
-
-	// hasStar collects whether any star expansion has occurred during
-	// logical plan construction. This is used by CREATE VIEW until
-	// #10028 is addressed.
-	hasStar bool
 
 	// subqueryPlans contains all the sub-query plans.
 	subqueryPlans []subquery
@@ -322,6 +348,11 @@ func (p *planTop) close(ctx context.Context) {
 // startExec calls startExec() on each planNode using a depth-first, post-order
 // traversal.  The subqueries, if any, are also started.
 //
+// If the planNode also implements the nodeReadingOwnWrites interface,
+// the txn is temporarily reconfigured to use read-your-own-writes for
+// the duration of the call to startExec. This is used e.g. by
+// DDL statements.
+//
 // Reminder: walkPlan() ensures that subqueries and sub-plans are
 // started before startExec() is called.
 func startExec(params runParams, plan planNode) error {
@@ -337,7 +368,11 @@ func startExec(params runParams, plan planNode) error {
 			}
 			return true, nil
 		},
-		leaveNode: func(_ string, n planNode) error {
+		leaveNode: func(_ string, n planNode) (err error) {
+			if _, ok := n.(planNodeReadingOwnWrites); ok {
+				prevMode := params.p.Txn().ConfigureStepping(params.ctx, client.SteppingDisabled)
+				defer func() { _ = params.p.Txn().ConfigureStepping(params.ctx, prevMode) }()
+			}
 			return n.startExec(params)
 		},
 	}

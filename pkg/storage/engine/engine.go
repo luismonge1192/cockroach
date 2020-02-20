@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -144,7 +145,7 @@ type MVCCIterator interface {
 	// in the buffer.
 	MVCCScan(
 		start, end roachpb.Key, max int64, timestamp hlc.Timestamp, opts MVCCScanOptions,
-	) (kvData [][]byte, numKVs int64, resumeSpan *roachpb.Span, intents []roachpb.Intent, err error)
+	) (MVCCScanResult, error)
 }
 
 // IterOptions contains options used to create an Iterator.
@@ -199,9 +200,22 @@ type Reader interface {
 	// within the interval is exported. Deletions are included if all revisions are
 	// requested or if the start.Timestamp is non-zero. Returns the bytes of an
 	// SSTable containing the exported keys, the size of exported data, or an error.
+	//
+	// If targetSize is positive, it indicates that the export should produce SSTs
+	// which are roughly target size. Specifically, it will return an SST such that
+	// the last key is responsible for meeting or exceeding the targetSize. If the
+	// resumeKey is non-nil then the data size of the returned sst will be greater
+	// than or equal to the targetSize.
+	//
+	// If maxSize is positive, it is an absolute maximum on byte size for the
+	// returned sst. If it is the case that the versions of the last key will lead
+	// to an SST that exceeds maxSize, an error will be returned. This parameter
+	// exists to prevent creating SSTs which are too large to be used.
 	ExportToSst(
-		startKey, endKey roachpb.Key, startTS, endTS hlc.Timestamp, exportAllRevisions bool, io IterOptions,
-	) ([]byte, roachpb.BulkOpSummary, error)
+		startKey, endKey roachpb.Key, startTS, endTS hlc.Timestamp,
+		exportAllRevisions bool, targetSize uint64, maxSize uint64,
+		io IterOptions,
+	) (sst []byte, _ roachpb.BulkOpSummary, resumeKey roachpb.Key, _ error)
 	// Get returns the value for the given key, nil otherwise.
 	//
 	// Deprecated: use MVCCGet instead.
@@ -400,24 +414,17 @@ type Engine interface {
 	// addSSTablePreApply to select alternate code paths, but really there should
 	// be a unified code path there.
 	InMem() bool
-	// OpenFile opens a DBFile with the given filename. The file should be created
-	// if it doesn't exist already, and should be writable.
-	OpenFile(filename string) (DBFile, error)
+
+	// Filesystem functionality.
+	fs.FS
 	// ReadFile reads the content from the file with the given filename int this RocksDB's env.
 	ReadFile(filename string) ([]byte, error)
 	// WriteFile writes data to a file in this RocksDB's env.
 	WriteFile(filename string, data []byte) error
-	// DeleteFile deletes the file with the given filename from this RocksDB's env.
-	// If the file with given filename doesn't exist, return os.ErrNotExist.
-	DeleteFile(filename string) error
 	// DeleteDirAndFiles deletes the directory and any files it contains but
 	// not subdirectories from this RocksDB's env. If dir does not exist,
 	// DeleteDirAndFiles returns nil (no error).
 	DeleteDirAndFiles(dir string) error
-	// LinkFile creates 'newname' as a hard link to 'oldname'. This is done using
-	// the engine implementation. For RocksDB, this means using the Env responsible for the file
-	// which may handle extra logic (eg: copy encryption settings for EncryptedEnv).
-	LinkFile(oldname, newname string) error
 	// CreateCheckpoint creates a checkpoint of the engine in the given directory,
 	// which must not exist. The directory should be on the same file system so
 	// that hard links can be used.
@@ -527,6 +534,8 @@ func NewEngine(
 			Opts:          DefaultPebbleOptions(),
 		}
 		pebbleConfig.Opts.Cache = pebble.NewCache(cacheSize)
+		defer pebbleConfig.Opts.Cache.Unref()
+
 		pebbleConfig.Dir = filepath.Join(pebbleConfig.Dir, "pebble")
 		cache := NewRocksDBCache(cacheSize)
 		defer cache.Release()
@@ -551,6 +560,7 @@ func NewEngine(
 			Opts:          DefaultPebbleOptions(),
 		}
 		pebbleConfig.Opts.Cache = pebble.NewCache(cacheSize)
+		defer pebbleConfig.Opts.Cache.Unref()
 
 		return NewPebble(context.Background(), pebbleConfig)
 	case enginepb.EngineTypeRocksDB:
@@ -576,14 +586,14 @@ func NewDefaultEngine(cacheSize int64, storageConfig base.StorageConfig) (Engine
 //
 // Deprecated: use MVCCPutProto instead.
 func PutProto(
-	engine Writer, key MVCCKey, msg protoutil.Message,
+	writer Writer, key MVCCKey, msg protoutil.Message,
 ) (keyBytes, valBytes int64, err error) {
 	bytes, err := protoutil.Marshal(msg)
 	if err != nil {
 		return 0, 0, err
 	}
 
-	if err := engine.Put(key, bytes); err != nil {
+	if err := writer.Put(key, bytes); err != nil {
 		return 0, 0, err
 	}
 
@@ -593,9 +603,9 @@ func PutProto(
 // Scan returns up to max key/value objects starting from
 // start (inclusive) and ending at end (non-inclusive).
 // Specify max=0 for unbounded scans.
-func Scan(engine Reader, start, end roachpb.Key, max int64) ([]MVCCKeyValue, error) {
+func Scan(reader Reader, start, end roachpb.Key, max int64) ([]MVCCKeyValue, error) {
 	var kvs []MVCCKeyValue
-	err := engine.Iterate(start, end, func(kv MVCCKeyValue) (bool, error) {
+	err := reader.Iterate(start, end, func(kv MVCCKeyValue) (bool, error) {
 		if max != 0 && int64(len(kvs)) >= max {
 			return true, nil
 		}
@@ -623,8 +633,8 @@ func WriteSyncNoop(ctx context.Context, eng Engine) error {
 // ClearRangeWithHeuristic clears the keys from start (inclusive) to end
 // (exclusive). Depending on the number of keys, it will either use ClearRange
 // or ClearIterRange.
-func ClearRangeWithHeuristic(eng Reader, writer Writer, start, end roachpb.Key) error {
-	iter := eng.NewIterator(IterOptions{UpperBound: end})
+func ClearRangeWithHeuristic(reader Reader, writer Writer, start, end roachpb.Key) error {
+	iter := reader.NewIterator(IterOptions{UpperBound: end})
 	defer iter.Close()
 
 	// It is expensive for there to be many range deletion tombstones in the same

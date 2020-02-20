@@ -26,7 +26,7 @@ import (
 )
 
 func init() {
-	RegisterCommand(roachpb.PushTxn, declareKeysPushTransaction, PushTxn)
+	RegisterReadWriteCommand(roachpb.PushTxn, declareKeysPushTransaction, PushTxn)
 }
 
 func declareKeysPushTransaction(
@@ -102,7 +102,7 @@ func declareKeysPushTransaction(
 // records for which the transaction coordinator must have found out via
 // its heartbeats that the transaction has failed.
 func PushTxn(
-	ctx context.Context, batch engine.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, readWriter engine.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
 ) (result.Result, error) {
 	args := cArgs.Args.(*roachpb.PushTxnRequest)
 	h := cArgs.Header
@@ -123,6 +123,11 @@ func PushTxn(
 		// This condition must hold for the timestamp cache access/update to be safe.
 		return result.Result{}, errors.Errorf("request timestamp %s less than pushee txn timestamp %s", h.Timestamp, args.PusheeTxn.WriteTimestamp)
 	}
+	now := cArgs.EvalCtx.Clock().Now()
+	if now.Less(h.Timestamp) {
+		// The batch's timestamp should have been used to update the clock.
+		return result.Result{}, errors.Errorf("request timestamp %s less than current clock time %s", h.Timestamp, now)
+	}
 	if !bytes.Equal(args.Key, args.PusheeTxn.Key) {
 		return result.Result{}, errors.Errorf("request key %s should match pushee txn key %s", args.Key, args.PusheeTxn.Key)
 	}
@@ -130,7 +135,7 @@ func PushTxn(
 
 	// Fetch existing transaction; if missing, we're allowed to abort.
 	var existTxn roachpb.Transaction
-	ok, err := engine.MVCCGetProto(ctx, batch, key, hlc.Timestamp{}, &existTxn, engine.MVCCGetOptions{})
+	ok, err := engine.MVCCGetProto(ctx, readWriter, key, hlc.Timestamp{}, &existTxn, engine.MVCCGetOptions{})
 	if err != nil {
 		return result.Result{}, err
 	} else if !ok {
@@ -163,7 +168,7 @@ func PushTxn(
 			// that only the transaction's own coordinator can create its
 			// transaction record.
 			result := result.Result{}
-			result.Local.UpdatedTxns = &[]*roachpb.Transaction{&reply.PusheeTxn}
+			result.Local.UpdatedTxns = []*roachpb.Transaction{&reply.PusheeTxn}
 			return result, nil
 		}
 	} else {
@@ -184,7 +189,7 @@ func PushTxn(
 
 	// If we're trying to move the timestamp forward, and it's already
 	// far enough forward, return success.
-	if args.PushType == roachpb.PUSH_TIMESTAMP && !reply.PusheeTxn.WriteTimestamp.Less(args.PushTo) {
+	if args.PushType == roachpb.PUSH_TIMESTAMP && args.PushTo.LessEq(reply.PusheeTxn.WriteTimestamp) {
 		// Trivial noop.
 		return result.Result{}, nil
 	}
@@ -217,7 +222,7 @@ func PushTxn(
 	var reason string
 
 	switch {
-	case txnwait.IsExpired(h.Timestamp, &reply.PusheeTxn):
+	case txnwait.IsExpired(now, &reply.PusheeTxn):
 		reason = "pushee is expired"
 		// When cleaning up, actually clean up (as opposed to simply pushing
 		// the garbage in the path of future writers).
@@ -280,10 +285,10 @@ func PushTxn(
 		}
 	case roachpb.PUSH_TIMESTAMP:
 		// Otherwise, update timestamp to be one greater than the request's
-		// timestamp. This new timestamp will be use to update the read
-		// timestamp cache. If the transaction record was not already present
-		// then we rely on the read timestamp cache to prevent the record from
-		// ever being written with a timestamp beneath this timestamp.
+		// timestamp. This new timestamp will be use to update the read timestamp
+		// cache. If the transaction record was not already present then we rely on
+		// the timestamp cache to prevent the record from ever being written with a
+		// timestamp beneath this timestamp.
 		reply.PusheeTxn.WriteTimestamp.Forward(args.PushTo)
 	default:
 		return result.Result{}, errors.Errorf("unexpected push type: %v", pushType)
@@ -294,16 +299,16 @@ func PushTxn(
 	// transactions to be revived. Instead, we obey the invariant that only the
 	// transaction's own coordinator can issue requests that create its
 	// transaction record. To ensure that a timestamp push or an abort is
-	// respected for transactions without transaction records, we rely on the
-	// read and write timestamp cache, respectively.
+	// respected for transactions without transaction records, we rely on markers
+	// in the timestamp cache.
 	if ok {
 		txnRecord := reply.PusheeTxn.AsRecord()
-		if err := engine.MVCCPutProto(ctx, batch, cArgs.Stats, key, hlc.Timestamp{}, nil, &txnRecord); err != nil {
+		if err := engine.MVCCPutProto(ctx, readWriter, cArgs.Stats, key, hlc.Timestamp{}, nil, &txnRecord); err != nil {
 			return result.Result{}, err
 		}
 	}
 
 	result := result.Result{}
-	result.Local.UpdatedTxns = &[]*roachpb.Transaction{&reply.PusheeTxn}
+	result.Local.UpdatedTxns = []*roachpb.Transaction{&reply.PusheeTxn}
 	return result, nil
 }

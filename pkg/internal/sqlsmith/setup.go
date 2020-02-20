@@ -57,12 +57,18 @@ func stringSetup(s string) Setup {
 }
 
 func randTables(r *rand.Rand) string {
+	var sb strings.Builder
+	// Since we use the stats mutator, disable auto stats generation.
+	sb.WriteString(`
+		SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false;
+		SET CLUSTER SETTING sql.stats.histogram_collection.enabled = false;
+	`)
+
 	stmts := sqlbase.RandCreateTables(r, "table", r.Intn(5)+1,
 		mutations.ForeignKeyMutator,
 		mutations.StatisticsMutator,
 	)
 
-	var sb strings.Builder
 	for _, stmt := range stmts {
 		sb.WriteString(stmt.String())
 		sb.WriteString(";\n")
@@ -104,10 +110,14 @@ CREATE INVERTED INDEX on seed (_jsonb);
 	vecSeedTable = `
 CREATE TABLE IF NOT EXISTS seed_vec AS
 	SELECT
+		g::INT2 AS _int2,
+		g::INT4 AS _int4,
 		g::INT8 AS _int8,
 		g::FLOAT8 AS _float8,
 		'2001-01-01'::DATE + g AS _date,
 		'2001-01-01'::TIMESTAMP + g * '1 day'::INTERVAL AS _timestamp,
+		'2001-01-01'::TIMESTAMPTZ + g * '1 day'::INTERVAL AS _timestamptz,
+		g * '1 day'::INTERVAL AS _interval,
 		g % 2 = 1 AS _bool,
 		g::DECIMAL AS _decimal,
 		g::STRING AS _string,
@@ -150,6 +160,7 @@ var Settings = map[string]SettingFunc{
 	"default+rand":      randSetting(Parallel),
 	"no-mutations+rand": randSetting(Parallel, DisableMutations()),
 	"no-ddl+rand":       randSetting(NoParallel, DisableDDLs()),
+	"ddl-nodrop":        randSetting(NoParallel, OnlyNoDropDDLs()),
 }
 
 // SettingVectorize is the setting for vectorizable. It is not included in

@@ -73,6 +73,10 @@ func PhysicalTypeColElemToDatum(
 		return da.NewDUuid(tree.DUuid{UUID: id})
 	case types.TimestampFamily:
 		return da.NewDTimestamp(tree.DTimestamp{Time: col.Timestamp()[rowIdx]})
+	case types.TimestampTZFamily:
+		return da.NewDTimestampTZ(tree.DTimestampTZ{Time: col.Timestamp()[rowIdx]})
+	case types.IntervalFamily:
+		return da.NewDInterval(tree.DInterval{Duration: col.Interval()[rowIdx]})
 	default:
 		execerror.VectorizedInternalPanic(fmt.Sprintf("Unsupported column type %s", ct.String()))
 		// This code is unreachable, but the compiler cannot infer that.

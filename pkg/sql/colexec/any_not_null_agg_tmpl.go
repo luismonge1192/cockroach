@@ -11,9 +11,9 @@
 // {{/*
 // +build execgen_template
 //
-// This file is the execgen template for distinct.eg.go. It's formatted in a
-// special way, so it's both valid Go and a valid text/template input. This
-// permits editing this file with editor support.
+// This file is the execgen template for any_not_null_agg.eg.go. It's formatted
+// in a special way, so it's both valid Go and a valid text/template input.
+// This permits editing this file with editor support.
 //
 // */}}
 
@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/pkg/errors"
 )
 
@@ -50,6 +51,9 @@ var _ apd.Decimal
 // Dummy import to pull in "time" package.
 var _ time.Time
 
+// Dummy import to pull in "duration" package.
+var _ duration.Duration
+
 // _GOTYPESLICE is the template Go type slice variable for this operator. It
 // will be replaced by the Go slice representation for each type in coltypes.T, for
 // example []int64 for coltypes.Int64.
@@ -72,21 +76,23 @@ type anyNotNull_TYPEAgg struct {
 	allocator                   *Allocator
 	done                        bool
 	groups                      []bool
-	vec                         _GOTYPESLICE
+	vec                         coldata.Vec
+	col                         _GOTYPESLICE
 	nulls                       *coldata.Nulls
 	curIdx                      int
+	curAgg                      _GOTYPE
 	foundNonNullForCurrentGroup bool
 }
 
 func (a *anyNotNull_TYPEAgg) Init(groups []bool, vec coldata.Vec) {
 	a.groups = groups
-	a.vec = vec._TemplateType()
+	a.vec = vec
+	a.col = vec._TemplateType()
 	a.nulls = vec.Nulls()
 	a.Reset()
 }
 
 func (a *anyNotNull_TYPEAgg) Reset() {
-	execgen.ZERO(a.vec)
 	a.curIdx = -1
 	a.done = false
 	a.foundNonNullForCurrentGroup = false
@@ -100,9 +106,6 @@ func (a *anyNotNull_TYPEAgg) CurrentOutputIndex() int {
 func (a *anyNotNull_TYPEAgg) SetOutputIndex(idx int) {
 	if a.curIdx != -1 {
 		a.curIdx = idx
-		vecLen := execgen.LEN(a.vec)
-		target := execgen.SLICE(a.vec, idx+1, vecLen)
-		execgen.ZERO(target)
 		a.nulls.UnsetNullsAfter(uint16(idx + 1))
 	}
 }
@@ -117,6 +120,8 @@ func (a *anyNotNull_TYPEAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 		// this group should be null.
 		if !a.foundNonNullForCurrentGroup {
 			a.nulls.SetNull(uint16(a.curIdx))
+		} else {
+			execgen.SET(a.col, a.curIdx, a.curAgg)
 		}
 		a.curIdx++
 		a.done = true
@@ -125,8 +130,8 @@ func (a *anyNotNull_TYPEAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 	vec, sel := b.ColVec(int(inputIdxs[0])), b.Selection()
 	col, nulls := vec._TemplateType(), vec.Nulls()
 
-	a.allocator.performOperation(
-		[]coldata.Vec{vec},
+	a.allocator.PerformOperation(
+		[]coldata.Vec{a.vec},
 		func() {
 			if nulls.MaybeHasNulls() {
 				if sel != nil {
@@ -136,7 +141,7 @@ func (a *anyNotNull_TYPEAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 					}
 				} else {
 					col = execgen.SLICE(col, 0, int(inputLen))
-					for execgen.RANGE(i, col) {
+					for execgen.RANGE(i, col, 0, int(inputLen)) {
 						_FIND_ANY_NOT_NULL(a, nulls, i, true)
 					}
 				}
@@ -148,7 +153,7 @@ func (a *anyNotNull_TYPEAgg) Compute(b coldata.Batch, inputIdxs []uint32) {
 					}
 				} else {
 					col = execgen.SLICE(col, 0, int(inputLen))
-					for execgen.RANGE(i, col) {
+					for execgen.RANGE(i, col, 0, int(inputLen)) {
 						_FIND_ANY_NOT_NULL(a, nulls, i, false)
 					}
 				}
@@ -169,14 +174,19 @@ func (a *anyNotNull_TYPEAgg) HandleEmptyInputScalar() {
 // the first row of a new group, and no non-nulls have been found for the
 // current group, then the output for the current group is set to null.
 func _FIND_ANY_NOT_NULL(a *anyNotNull_TYPEAgg, nulls *coldata.Nulls, i int, _HAS_NULLS bool) { // */}}
+	// {{define "findAnyNotNull" -}}
 
-	// {{define "findAnyNotNull"}}
 	if a.groups[i] {
-		// If this is a new group, check if any non-nulls have been found for the
-		// current group. The `a.curIdx` check is necessary because for the first
+		// The `a.curIdx` check is necessary because for the first
 		// group in the result set there is no "current group."
-		if !a.foundNonNullForCurrentGroup && a.curIdx >= 0 {
-			a.nulls.SetNull(uint16(a.curIdx))
+		if a.curIdx >= 0 {
+			// If this is a new group, check if any non-nulls have been found for the
+			// current group.
+			if !a.foundNonNullForCurrentGroup {
+				a.nulls.SetNull(uint16(a.curIdx))
+			} else {
+				execgen.SET(a.col, a.curIdx, a.curAgg)
+			}
 		}
 		a.curIdx++
 		a.foundNonNullForCurrentGroup = false
@@ -191,11 +201,14 @@ func _FIND_ANY_NOT_NULL(a *anyNotNull_TYPEAgg, nulls *coldata.Nulls, i int, _HAS
 		// If we haven't seen any non-nulls for the current group yet, and the
 		// current value is non-null, then we can pick the current value to be the
 		// output.
-		// Explicit template language is used here because the type receiver differs
-		// from the rest of the template file.
-		// TODO(asubiotto): Figure out a way to alias this.
-		// v := {{ .Global.Get "col" "int(i)" }}
-		// {{ .Global.Set "a.vec" "a.curIdx" "v" }}
+		// {{ if eq .LTyp.String "Bytes" }}
+		// Bytes type is special - we actually need to copy the value that we're
+		// getting in an "unsafe" way because col might be reused (and the
+		// underlying memory overwritten) on the next batches.
+		a.curAgg = append(a.curAgg[:0], execgen.UNSAFEGET(col, int(i))...)
+		// {{ else }}
+		a.curAgg = execgen.UNSAFEGET(col, int(i))
+		// {{ end }}
 		a.foundNonNullForCurrentGroup = true
 	}
 	// {{end}}

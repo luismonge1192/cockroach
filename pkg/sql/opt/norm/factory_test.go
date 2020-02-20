@@ -29,13 +29,15 @@ import (
 // operator is created.
 func TestSimplifyFilters(t *testing.T) {
 	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
-	var f norm.Factory
-	f.Init(&evalCtx)
 
 	cat := testcat.New()
 	if _, err := cat.ExecuteDDL("CREATE TABLE a (x INT PRIMARY KEY, y INT)"); err != nil {
 		t.Fatal(err)
 	}
+
+	var f norm.Factory
+	f.Init(&evalCtx, cat)
+
 	tn := tree.NewTableName("t", "a")
 	a := f.Metadata().AddTable(cat.Table(tn), tn)
 	ax := a.ColumnID(0)
@@ -47,16 +49,20 @@ func TestSimplifyFilters(t *testing.T) {
 	// Filters expression evaluates to False if any operand is False.
 	vals := f.ConstructValues(memo.ScalarListWithEmptyTuple, &memo.ValuesPrivate{
 		Cols: opt.ColList{},
-		ID:   f.Metadata().NextValuesID(),
+		ID:   f.Metadata().NextUniqueID(),
 	})
-	filters := memo.FiltersExpr{{Condition: eq}, {Condition: memo.FalseSingleton}, {Condition: eq}}
+	filters := memo.FiltersExpr{
+		f.ConstructFiltersItem(eq),
+		f.ConstructFiltersItem(memo.FalseSingleton),
+		f.ConstructFiltersItem(eq),
+	}
 	sel := f.ConstructSelect(vals, filters)
 	if sel.Relational().Cardinality.Max != 0 {
 		t.Fatalf("result should have been collapsed to zero cardinality rowset")
 	}
 
 	// Filters operator skips True operands.
-	filters = memo.FiltersExpr{{Condition: eq}, {Condition: memo.TrueSingleton}}
+	filters = memo.FiltersExpr{f.ConstructFiltersItem(eq), f.ConstructFiltersItem(memo.TrueSingleton)}
 	sel = f.ConstructSelect(vals, filters)
 	if len(sel.(*memo.SelectExpr).Filters) != 1 {
 		t.Fatalf("filters result should have filtered True operator")
@@ -93,7 +99,7 @@ func TestCopyAndReplace(t *testing.T) {
 
 	m := o.Factory().DetachMemo()
 
-	o.Init(&evalCtx)
+	o.Init(&evalCtx, cat)
 	var replaceFn norm.ReplaceFunc
 	replaceFn = func(e opt.Expr) opt.Expr {
 		if e.Op() == opt.PlaceholderOp {

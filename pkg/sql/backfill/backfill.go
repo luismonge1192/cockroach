@@ -121,7 +121,12 @@ func (cb *ColumnBackfiller) Init(
 		ValNeededForCol: valNeededForCol,
 	}
 	return cb.fetcher.Init(
-		false /* reverse */, false /* returnRangeInfo */, false /* isCheck */, &cb.alloc, tableArgs,
+		false, /* reverse */
+		sqlbase.ScanLockingStrength_FOR_NONE,
+		false, /* returnRangeInfo */
+		false, /* isCheck */
+		&cb.alloc,
+		tableArgs,
 	)
 }
 
@@ -168,6 +173,7 @@ func (cb *ColumnBackfiller) RunColumnBackfillChunk(
 	requestedCols = append(requestedCols, tableDesc.Columns...)
 	requestedCols = append(requestedCols, cb.added...)
 	ru, err := row.MakeUpdater(
+		ctx,
 		txn,
 		tableDesc,
 		fkTables,
@@ -332,7 +338,8 @@ func (ib *IndexBackfiller) Init(desc *sqlbase.ImmutableTableDescriptor) error {
 			ib.added = append(ib.added, *idx)
 			for i := range cols {
 				id := cols[i].ID
-				if idx.ContainsColumnID(id) {
+				if idx.ContainsColumnID(id) ||
+					idx.GetEncodingType(desc.PrimaryIndex.ID) == sqlbase.PrimaryIndexEncoding {
 					valNeededForCol.Add(i)
 				}
 			}
@@ -357,7 +364,12 @@ func (ib *IndexBackfiller) Init(desc *sqlbase.ImmutableTableDescriptor) error {
 		ValNeededForCol: valNeededForCol,
 	}
 	return ib.fetcher.Init(
-		false /* reverse */, false /* returnRangeInfo */, false /* isCheck */, &ib.alloc, tableArgs,
+		false, /* reverse */
+		sqlbase.ScanLockingStrength_FOR_NONE,
+		false, /* returnRangeInfo */
+		false, /* isCheck */
+		&ib.alloc,
+		tableArgs,
 	)
 }
 

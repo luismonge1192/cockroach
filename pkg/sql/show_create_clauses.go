@@ -16,10 +16,60 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
 )
+
+// tableComments stores the comment data for a table.
+type tableComments struct {
+	comment *string
+	columns []comment
+	indexes []comment
+}
+
+type comment struct {
+	subID   int
+	comment string
+}
+
+// selectComment retrieves all the comments pertaining to a table (comments on the table
+// itself but also column and index comments.)
+func selectComment(ctx context.Context, p PlanHookState, tableID sqlbase.ID) (tc *tableComments) {
+	query := fmt.Sprintf("SELECT type, object_id, sub_id, comment FROM system.comments WHERE object_id = %d", tableID)
+
+	commentRows, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.Query(
+		ctx, "show-tables-with-comment", p.Txn(), query)
+	if err != nil {
+		log.VEventf(ctx, 1, "%q", err)
+	} else {
+		for _, row := range commentRows {
+			commentType := int(tree.MustBeDInt(row[0]))
+			switch commentType {
+			case keys.TableCommentType, keys.ColumnCommentType, keys.IndexCommentType:
+				subID := int(tree.MustBeDInt(row[2]))
+				cmt := string(tree.MustBeDString(row[3]))
+
+				if tc == nil {
+					tc = &tableComments{}
+				}
+
+				switch commentType {
+				case keys.TableCommentType:
+					tc.comment = &cmt
+				case keys.ColumnCommentType:
+					tc.columns = append(tc.columns, comment{subID, cmt})
+				case keys.IndexCommentType:
+					tc.indexes = append(tc.indexes, comment{subID, cmt})
+				}
+			}
+		}
+	}
+
+	return tc
+}
 
 // ShowCreateView returns a valid SQL representation of the CREATE VIEW
 // statement used to create the given view. It is used in the implementation of
@@ -28,7 +78,11 @@ func ShowCreateView(
 	ctx context.Context, tn *tree.Name, desc *sqlbase.TableDescriptor,
 ) (string, error) {
 	f := tree.NewFmtCtx(tree.FmtSimple)
-	f.WriteString("CREATE VIEW ")
+	f.WriteString("CREATE ")
+	if desc.Temporary {
+		f.WriteString("TEMP ")
+	}
+	f.WriteString("VIEW ")
 	f.FormatNode(tn)
 	f.WriteString(" (")
 	for i := range desc.Columns {
@@ -40,6 +94,41 @@ func ShowCreateView(
 	f.WriteString(") AS ")
 	f.WriteString(desc.ViewQuery)
 	return f.CloseAndGetString(), nil
+}
+
+// showComments prints out the COMMENT statements sufficient to populate a
+// table's comments, including its index and column comments.
+func showComments(table *sqlbase.TableDescriptor, tc *tableComments, buf *bytes.Buffer) error {
+	if tc == nil {
+		return nil
+	}
+
+	if tc.comment != nil {
+		buf.WriteString(";\n")
+		buf.WriteString(fmt.Sprintf("COMMENT ON TABLE %s IS '%s'", table.Name, *tc.comment))
+	}
+
+	for _, columnComment := range tc.columns {
+		col, err := table.FindColumnByID(sqlbase.ColumnID(columnComment.subID))
+		if err != nil {
+			return err
+		}
+
+		buf.WriteString(";\n")
+		buf.WriteString(fmt.Sprintf("COMMENT ON COLUMN %s.%s IS '%s'", table.Name, col.Name, columnComment.comment))
+	}
+
+	for _, indexComment := range tc.indexes {
+		idx, err := table.FindIndexByID(sqlbase.IndexID(indexComment.subID))
+		if err != nil {
+			return err
+		}
+
+		buf.WriteString(";\n")
+		buf.WriteString(fmt.Sprintf("COMMENT ON INDEX %s IS '%s'", idx.Name, indexComment.comment))
+	}
+
+	return nil
 }
 
 // showForeignKeyConstraint returns a valid SQL representation of a FOREIGN KEY
@@ -110,7 +199,11 @@ func ShowCreateSequence(
 	ctx context.Context, tn *tree.Name, desc *sqlbase.TableDescriptor,
 ) (string, error) {
 	f := tree.NewFmtCtx(tree.FmtSimple)
-	f.WriteString("CREATE SEQUENCE ")
+	f.WriteString("CREATE ")
+	if desc.Temporary {
+		f.WriteString("TEMP ")
+	}
+	f.WriteString("SEQUENCE ")
 	f.FormatNode(tn)
 	opts := desc.SequenceOpts
 	f.Printf(" MINVALUE %d", opts.MinValue)
@@ -284,6 +377,9 @@ func ShowCreatePartitioning(
 // writing them to tree.FmtCtx f
 func showConstraintClause(desc *sqlbase.TableDescriptor, f *tree.FmtCtx) {
 	for _, e := range desc.AllActiveAndInactiveChecks() {
+		if e.Hidden {
+			continue
+		}
 		f.WriteString(",\n\t")
 		if len(e.Name) > 0 {
 			f.WriteString("CONSTRAINT ")

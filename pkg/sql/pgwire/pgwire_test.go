@@ -31,7 +31,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
@@ -42,10 +41,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 	"github.com/jackc/pgx"
 	"github.com/jackc/pgx/pgproto3"
 	"github.com/lib/pq"
-	"github.com/pkg/errors"
 )
 
 func wrongArgCountString(want, got int) string {
@@ -62,147 +61,6 @@ func trivialQuery(pgURL url.URL) error {
 		_, err := db.Exec("SELECT 1")
 		return err
 	}
-}
-
-func TestPGWire(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	certPath := filepath.Join(security.EmbeddedCertsDir, security.EmbeddedTestUserCert)
-	keyPath := filepath.Join(security.EmbeddedCertsDir, security.EmbeddedTestUserKey)
-
-	tempDir, err := ioutil.TempDir("", "TestPGWire")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	defer func() {
-		if err := os.RemoveAll(tempDir); err != nil {
-			// Not Fatal() because we might already be panicking.
-			t.Error(err)
-		}
-	}()
-
-	// Copy these assets to disk from embedded strings, so this test can
-	// run from a standalone binary.
-	tempCertPath := securitytest.RestrictedCopy(t, certPath, tempDir, "cert")
-	tempKeyPath := securitytest.RestrictedCopy(t, keyPath, tempDir, "key")
-
-	for _, insecure := range [...]bool{true, false} {
-		params := base.TestServerArgs{Insecure: insecure}
-		s, _, _ := serverutils.StartServer(t, params)
-		host, port, err := net.SplitHostPort(s.ServingSQLAddr())
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		pgBaseURL := url.URL{
-			Scheme: "postgres",
-			User:   url.User(security.RootUser),
-			Host:   net.JoinHostPort(host, port),
-		}
-
-		if err := trivialQuery(pgBaseURL); err != nil {
-			if insecure {
-				if err != pq.ErrSSLNotSupported {
-					t.Error(err)
-				}
-			} else {
-				// No certificates provided in secure mode defaults to password
-				// authentication. This is disallowed for security.RootUser.
-				if !testutils.IsError(err, fmt.Sprintf("pq: user %s must use certificate authentication instead of password authentication", security.RootUser)) {
-					t.Errorf("unexpected error: %v", err)
-				}
-			}
-		}
-
-		{
-			pgDisableURL := pgBaseURL
-			pgDisableURL.RawQuery = "sslmode=disable"
-			err := trivialQuery(pgDisableURL)
-			if insecure {
-				if err != nil {
-					t.Error(err)
-				}
-			} else {
-				if !testutils.IsError(err, pgwire.ErrSSLRequired) {
-					t.Error(err)
-				}
-			}
-		}
-
-		{
-			pgNoCertRequireURL := pgBaseURL
-			pgNoCertRequireURL.RawQuery = "sslmode=require"
-			err := trivialQuery(pgNoCertRequireURL)
-			if insecure {
-				if err != pq.ErrSSLNotSupported {
-					t.Error(err)
-				}
-			} else {
-				if !testutils.IsError(err, fmt.Sprintf("pq: user %s must use certificate authentication instead of password authentication", security.RootUser)) {
-					t.Errorf("unexpected error: %v", err)
-				}
-			}
-		}
-
-		{
-			for _, optUser := range []string{server.TestUser, security.RootUser} {
-				pgWithCertRequireURL := pgBaseURL
-				pgWithCertRequireURL.User = url.User(optUser)
-				pgWithCertRequireURL.RawQuery = fmt.Sprintf("sslmode=require&sslcert=%s&sslkey=%s",
-					url.QueryEscape(tempCertPath),
-					url.QueryEscape(tempKeyPath),
-				)
-				err := trivialQuery(pgWithCertRequireURL)
-				if insecure {
-					if err != pq.ErrSSLNotSupported {
-						t.Error(err)
-					}
-				} else {
-					if optUser == server.TestUser {
-						// The user TestUser has not been created so authentication
-						// will fail with a valid certificate.
-						if !testutils.IsError(err, fmt.Sprintf("pq: password authentication failed for user %s", server.TestUser)) {
-							t.Errorf("unexpected error: %v", err)
-						}
-					} else {
-						if !testutils.IsError(err, `requested user is \w+, but certificate is for \w+`) {
-							t.Error(err)
-						}
-					}
-				}
-			}
-		}
-
-		s.Stopper().Stop(context.TODO())
-	}
-}
-
-func TestPGWireNonexistentUser(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	testutils.RunTrueAndFalse(t, "insecure", func(t *testing.T, insecure bool) {
-		params := base.TestServerArgs{Insecure: insecure}
-		s, _, _ := serverutils.StartServer(t, params)
-		defer s.Stopper().Stop(context.TODO())
-
-		var pgURL url.URL
-		if insecure {
-			pgURL = url.URL{
-				Scheme:   "postgres",
-				User:     url.User(server.TestUser),
-				Host:     s.ServingSQLAddr(),
-				RawQuery: "sslmode=disable",
-			}
-		} else {
-			pgURL, _ = sqlutils.PGUrl(t, s.ServingSQLAddr(), "StartServer", url.User(server.TestUser))
-		}
-
-		err := trivialQuery(pgURL)
-		if !testutils.IsError(err, fmt.Sprintf("pq: password authentication failed for user %s", server.TestUser)) {
-			t.Errorf("unexpected error: %v", err)
-		}
-	})
 }
 
 // TestPGWireDrainClient makes sure that in draining mode, the server refuses
@@ -379,41 +237,6 @@ func TestPGWireDrainOngoingTxns(t *testing.T) {
 
 		pgServer.Undrain()
 	})
-}
-
-func TestPGWireDBName(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
-
-	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
-	pgURL.Path = "foo"
-	defer cleanupFn()
-	{
-		db, err := gosql.Open("postgres", pgURL.String())
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer db.Close()
-
-		if _, err := db.Exec(`CREATE DATABASE foo`); err != nil {
-			t.Fatal(err)
-		}
-
-		if _, err := db.Exec(`CREATE TABLE bar (i INT PRIMARY KEY)`); err != nil {
-			t.Fatal(err)
-		}
-	}
-	db, err := gosql.Open("postgres", pgURL.String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	if _, err := db.Exec(`INSERT INTO bar VALUES ($1)`, 1); err != nil {
-		t.Fatal(err)
-	}
 }
 
 // We want to ensure that despite use of errors.{Wrap,Wrapf}, we are surfacing a
@@ -733,7 +556,7 @@ func TestPGPreparedQuery(t *testing.T) {
 			baseTest.Results("users", "primary", false, 1, "username", "ASC", false, false),
 		}},
 		{"SHOW TABLES FROM system", []preparedQueryTest{
-			baseTest.Results("comments").Others(18),
+			baseTest.Results("comments").Others(21),
 		}},
 		{"SHOW SCHEMAS FROM system", []preparedQueryTest{
 			baseTest.Results("crdb_internal").Others(3),
@@ -842,6 +665,11 @@ func TestPGPreparedQuery(t *testing.T) {
 		// 	),
 		// }},
 		{"SELECT * FROM (VALUES (1), (2), (3), (4)) AS foo (a) LIMIT $1 OFFSET $2", []preparedQueryTest{
+			baseTest.SetArgs(1, 0).Results(1),
+			baseTest.SetArgs(1, 1).Results(2),
+			baseTest.SetArgs(1, 2).Results(3),
+		}},
+		{"SELECT * FROM (VALUES (1), (2), (3), (4)) AS foo (a) FETCH FIRST $1 ROWS ONLY OFFSET $2 ROWS", []preparedQueryTest{
 			baseTest.SetArgs(1, 0).Results(1),
 			baseTest.SetArgs(1, 1).Results(2),
 			baseTest.SetArgs(1, 2).Results(3),
@@ -1851,255 +1679,6 @@ func TestPGWireOverUnixSocket(t *testing.T) {
 	}
 	if err := trivialQuery(pgURL); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestPGWireAuth(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
-	{
-		unicodeUser := "Ὀδυσσεύς"
-
-		t.Run("RootUserAuth", func(t *testing.T) {
-			// Authenticate as root with certificate and expect success.
-			rootPgURL, cleanupFn := sqlutils.PGUrl(
-				t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
-			defer cleanupFn()
-			if err := trivialQuery(rootPgURL); err != nil {
-				t.Fatal(err)
-			}
-
-			// Create server.TestUser with a unicode password and a user with a
-			// unicode username for later tests.
-			// Only root is allowed to create users.
-			db, err := gosql.Open("postgres", rootPgURL.String())
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer db.Close()
-
-			if _, err := db.Exec(fmt.Sprintf("CREATE USER %s;", server.TestUser)); err != nil {
-				t.Fatal(err)
-			}
-
-			if _, err := db.Exec(fmt.Sprintf("CREATE USER %s WITH PASSWORD '蟑♫螂';", unicodeUser)); err != nil {
-				t.Fatal(err)
-			}
-		})
-		t.Run("UnicodeUserAuth", func(t *testing.T) {
-			// Try to perform authentication with unicodeUser and no password.
-			// This case is equivalent to supplying a wrong password.
-			host, port, err := net.SplitHostPort(s.ServingSQLAddr())
-			if err != nil {
-				t.Fatal(err)
-			}
-			unicodeUserPgURL := url.URL{
-				Scheme:   "postgres",
-				User:     url.User(unicodeUser),
-				Host:     net.JoinHostPort(host, port),
-				RawQuery: "sslmode=require",
-			}
-			if err := trivialQuery(unicodeUserPgURL); !testutils.IsError(err, "password authentication failed for user") {
-				t.Fatalf("expected \"password authentication failed for user\", got: %v", err)
-			}
-
-			// Supply correct password.
-			unicodeUserPgURL.User = url.UserPassword(unicodeUser, "蟑♫螂")
-			if err := trivialQuery(unicodeUserPgURL); err != nil {
-				t.Fatal(err)
-			}
-		})
-	}
-
-	t.Run("TestUserAuth", func(t *testing.T) {
-		testUserPgURL, cleanupFn := sqlutils.PGUrl(
-			t, s.ServingSQLAddr(), t.Name(), url.User(server.TestUser))
-		defer cleanupFn()
-		// No password supplied but valid certificate should result in
-		// successful authentication.
-		if err := trivialQuery(testUserPgURL); err != nil {
-			t.Fatal(err)
-		}
-
-		// Test case insensitivity for certificate and password authentication.
-		testUserPgURL.User = url.User("TesTUser")
-		if err := trivialQuery(testUserPgURL); err != nil {
-			t.Fatal(err)
-		}
-
-		// Remove certificates to default to password authentication.
-		testUserPgURL.RawQuery = "sslmode=require"
-
-		// Even though the correct password is supplied (empty string), this
-		// should fail because we do not support password authentication for
-		// users with empty passwords.
-		if err := trivialQuery(testUserPgURL); !testutils.IsError(err, "password authentication failed for user") {
-			t.Fatalf("expected \"password authentication failed for user\", got: %v", err)
-		}
-	})
-}
-
-func TestHBA(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.TODO())
-	db := sqlutils.MakeSQLRunner(conn)
-
-	const (
-		user = "passworduser"
-		pass = "pass"
-	)
-
-	db.Exec(t, fmt.Sprintf(`CREATE USER %s`, server.TestUser))
-	db.Exec(t, fmt.Sprintf(`CREATE USER %s WITH PASSWORD '%s'`, user, pass))
-
-	tests := []struct {
-		// The hba.conf file/setting.
-		conf string
-		// Error message when setting the config.
-		confErr string
-		// Error message of password login.
-		passErr string
-		// Error message of cert login.
-		certErr string
-	}{
-		{
-			conf:    `bad`,
-			confErr: "entry 1 invalid",
-		},
-		{
-			conf:    `#empty`,
-			confErr: "no entries",
-		},
-		{
-			conf:    `host all all 1.1.1/0 cert`,
-			confErr: "invalid CIDR address",
-		},
-		{
-			conf:    `host all all 0.0.0.0/0 invalid`,
-			confErr: "unknown auth method",
-		},
-		{
-			conf:    `host db all 0.0.0.0/0 cert`,
-			confErr: "database must be specified as all",
-		},
-		{
-			// quoted all isn't ok since it strips the special meaning
-			conf:    `host "all" all 0.0.0.0/0 cert`,
-			confErr: "database must be specified as all",
-		},
-		{
-			// only the all hostname is supported
-			conf:    `host all all hostname cert`,
-			confErr: "host addresses not supported",
-		},
-		{
-			// valid for both specified users
-			conf: `
-				host all testuser 0.0.0.0/0 cert
-				host all passworduser 0.0.0.0/0 password
-			`,
-		},
-		{
-			// valid for both specified users
-			conf: `
-				host all testuser,passworduser all cert-password
-			`,
-		},
-		{
-			// the "all" user means password never is checked
-			conf: `
-				host all testuser,all 0.0.0.0/0 cert
-				host all passworduser 0.0.0.0/0 password
-			`,
-			passErr: "no TLS peer certificates",
-		},
-		{
-			// but double quoting removes special meaning
-			conf: `
-				host all testuser,"all" 0.0.0.0/0 cert
-				host all passworduser 0.0.0.0/0 password
-			`,
-		},
-		{
-			// disallow passwords
-			conf:    "host all all 0.0.0.0/0 cert",
-			passErr: "no TLS peer certificates",
-		},
-		{
-			// disallow certs
-			conf:    "host all all 0.0.0.0/0 password",
-			certErr: "password authentication failed for user testuser",
-		},
-		{
-			// invalid user name
-			conf:    "host all invalid 0.0.0.0/0 cert",
-			certErr: "no .* entry",
-			passErr: "no .* entry",
-		},
-		{
-			// invalid IP
-			conf:    "host all all 0.0.0.0/32 cert",
-			certErr: "no .* entry",
-			passErr: "no .* entry",
-		},
-		{
-			// allow certs from 127.*.*.*
-			conf:    "host all all 127.0.0.0/8 cert",
-			passErr: "no TLS peer certificates",
-		},
-		{
-			// allow certs from 128.*.*.*, but connect from 127.0.0.0
-			conf:    "host all all 128.0.0.0/8 cert",
-			certErr: "no .* entry",
-			passErr: "no .* entry",
-		},
-	}
-	for i, tc := range tests {
-		t.Run(fmt.Sprint(i), func(t *testing.T) {
-			t.Log(tc.conf)
-			db.ExpectErr(t, tc.confErr, `SET CLUSTER SETTING server.host_based_authentication.configuration = $1`, tc.conf)
-
-			t.Run("root", func(t *testing.T) {
-				// Authenticate as root with certificate and expect success.
-				rootPgURL, cleanupFn := sqlutils.PGUrl(
-					t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
-				defer cleanupFn()
-				if err := trivialQuery(rootPgURL); err != nil {
-					t.Fatalf("could not auth as root: %v", err)
-				}
-			})
-
-			t.Run("cert", func(t *testing.T) {
-				testUserPgURL, cleanupFn := sqlutils.PGUrl(
-					t, s.ServingSQLAddr(), t.Name(), url.User(server.TestUser))
-				defer cleanupFn()
-				err := trivialQuery(testUserPgURL)
-				if !testutils.IsError(err, tc.certErr) {
-					t.Errorf("expected err %v, got %v", tc.certErr, err)
-				}
-			})
-
-			t.Run("password", func(t *testing.T) {
-				host, port, err := net.SplitHostPort(s.ServingSQLAddr())
-				if err != nil {
-					t.Fatal(err)
-				}
-				testURL := url.URL{
-					Scheme:   "postgres",
-					User:     url.UserPassword(user, pass),
-					Host:     net.JoinHostPort(host, port),
-					RawQuery: "sslmode=require",
-				}
-				err = trivialQuery(testURL)
-				if !testutils.IsError(err, tc.passErr) {
-					t.Errorf("expected err %v, got %v", tc.passErr, err)
-				}
-			})
-		})
 	}
 }
 

@@ -26,7 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optgen/exprgen"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -67,7 +67,6 @@ func TestIndexConstraints(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	datadriven.Walk(t, "testdata", func(t *testing.T, path string) {
-		ctx := context.Background()
 		semaCtx := tree.MakeSemaContext()
 		evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
@@ -77,11 +76,10 @@ func TestIndexConstraints(t *testing.T) {
 			var notNullCols opt.ColSet
 			var iVarHelper tree.IndexedVarHelper
 			var invertedIndex bool
-			var normalizeTypedExpr bool
 			var err error
 
 			var f norm.Factory
-			f.Init(&evalCtx)
+			f.Init(&evalCtx, nil /* catalog */)
 			md := f.Metadata()
 
 			for _, arg := range d.CmdArgs {
@@ -114,9 +112,6 @@ func TestIndexConstraints(t *testing.T) {
 				case "nonormalize":
 					f.DisableOptimizations()
 
-				case "semtree-normalize":
-					normalizeTypedExpr = true
-
 				default:
 					d.Fatalf(t, "unknown argument: %s", key)
 				}
@@ -124,36 +119,26 @@ func TestIndexConstraints(t *testing.T) {
 
 			switch d.Cmd {
 			case "index-constraints":
-				typedExpr, err := testutils.ParseScalarExpr(d.Input, iVarHelper.Container())
-				if err != nil {
-					d.Fatalf(t, "%v", err)
-				}
-
-				if normalizeTypedExpr {
-					typedExpr, err = evalCtx.NormalizeExpr(typedExpr)
+				// Allow specifying optional filters using the "optional:" delimiter.
+				var filters, optionalFilters memo.FiltersExpr
+				if idx := strings.Index(d.Input, "optional:"); idx >= 0 {
+					optional := d.Input[idx+len("optional:"):]
+					optionalFilters, err = buildFilters(optional, &semaCtx, &evalCtx, &f)
 					if err != nil {
 						d.Fatalf(t, "%v", err)
 					}
+					d.Input = d.Input[:idx]
+				}
+				if filters, err = buildFilters(d.Input, &semaCtx, &evalCtx, &f); err != nil {
+					d.Fatalf(t, "%v", err)
 				}
 
 				varNames := make([]string, len(varTypes))
 				for i := range varNames {
 					varNames[i] = fmt.Sprintf("@%d", i+1)
 				}
-				b := optbuilder.NewScalar(ctx, &semaCtx, &evalCtx, &f)
-				b.AllowUnsupportedExpr = true
-				err = b.Build(typedExpr)
-				if err != nil {
-					return fmt.Sprintf("error: %v\n", err)
-				}
-				root := f.Memo().RootExpr().(opt.ScalarExpr)
-				filters := memo.FiltersExpr{{Condition: root}}
-				if _, ok := root.(*memo.TrueExpr); ok {
-					filters = memo.TrueFilter
-				}
-
 				var ic idxconstraint.Instance
-				ic.Init(filters, indexCols, notNullCols, invertedIndex, &evalCtx, &f)
+				ic.Init(filters, optionalFilters, indexCols, notNullCols, invertedIndex, &evalCtx, &f)
 				result := ic.Constraint()
 				var buf bytes.Buffer
 				for i := 0; i < result.Spans.Count(); i++ {
@@ -232,6 +217,7 @@ func BenchmarkIndexConstraints(b *testing.B) {
 		testCases = append(testCases, tc)
 	}
 
+	semaCtx := tree.MakeSemaContext()
 	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 	for _, tc := range testCases {
@@ -241,34 +227,22 @@ func BenchmarkIndexConstraints(b *testing.B) {
 				b.Fatal(err)
 			}
 			var f norm.Factory
-			f.Init(&evalCtx)
+			f.Init(&evalCtx, nil /* catalog */)
 			md := f.Metadata()
 			for i, typ := range varTypes {
 				md.AddColumn(fmt.Sprintf("@%d", i+1), typ)
 			}
 			indexCols, notNullCols := parseIndexColumns(b, md, strings.Split(tc.indexInfo, ", "))
 
-			iVarHelper := tree.MakeTypesOnlyIndexedVarHelper(varTypes)
-			typedExpr, err := testutils.ParseScalarExpr(tc.expr, iVarHelper.Container())
+			filters, err := buildFilters(tc.expr, &semaCtx, &evalCtx, &f)
 			if err != nil {
 				b.Fatal(err)
 			}
-
-			semaCtx := tree.MakeSemaContext()
-			evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
-			bld := optbuilder.NewScalar(context.Background(), &semaCtx, &evalCtx, &f)
-
-			err = bld.Build(typedExpr)
-			if err != nil {
-				b.Fatal(err)
-			}
-			nd := f.Memo().RootExpr()
-			filters := memo.FiltersExpr{{Condition: nd.(opt.ScalarExpr)}}
 
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				var ic idxconstraint.Instance
-				ic.Init(filters, indexCols, notNullCols, false /*isInverted */, &evalCtx, &f)
+				ic.Init(filters, nil /* optionalFilters */, indexCols, notNullCols, false /*isInverted */, &evalCtx, &f)
 				_ = ic.Constraint()
 				_ = ic.RemainingFilters()
 			}
@@ -315,4 +289,26 @@ func parseIndexColumns(
 		}
 	}
 	return columns, notNullCols
+}
+
+func buildFilters(
+	input string, semaCtx *tree.SemaContext, evalCtx *tree.EvalContext, f *norm.Factory,
+) (memo.FiltersExpr, error) {
+	if input == "" {
+		return memo.TrueFilter, nil
+	}
+	expr, err := parser.ParseExpr(input)
+	if err != nil {
+		return memo.FiltersExpr{}, err
+	}
+	b := optbuilder.NewScalar(context.Background(), semaCtx, evalCtx, f)
+	b.AllowUnsupportedExpr = true
+	if err := b.Build(expr); err != nil {
+		return memo.FiltersExpr{}, err
+	}
+	root := f.Memo().RootExpr().(opt.ScalarExpr)
+	if _, ok := root.(*memo.TrueExpr); ok {
+		return memo.TrueFilter, nil
+	}
+	return memo.FiltersExpr{f.ConstructFiltersItem(root)}, nil
 }

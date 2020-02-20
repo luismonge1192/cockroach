@@ -99,19 +99,19 @@ func TestDetachMemoRace(t *testing.T) {
 		go func() {
 			var o xform.Optimizer
 			evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
-			o.Init(&evalCtx)
+			o.Init(&evalCtx, catalog)
 			f := o.Factory()
 			var replaceFn norm.ReplaceFunc
 			replaceFn = func(e opt.Expr) opt.Expr {
 				if sel, ok := e.(*memo.SelectExpr); ok {
 					return f.ConstructSelect(
 						f.CopyAndReplaceDefault(sel.Input, replaceFn).(memo.RelExpr),
-						memo.FiltersExpr{{
-							Condition: f.ConstructEq(
+						memo.FiltersExpr{f.ConstructFiltersItem(
+							f.ConstructEq(
 								f.ConstructVariable(col),
 								f.ConstructConst(tree.NewDInt(10)),
 							),
-						}},
+						)},
 					)
 				}
 				return f.CopyAndReplaceDefault(e, replaceFn)
@@ -146,9 +146,7 @@ func TestPhysicalProps(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	runDataDrivenTest(
 		t, "testdata/physprops/",
-		memo.ExprFmtHideMiscProps|
-			memo.ExprFmtHideConstraints|
-			memo.ExprFmtHideFuncDeps|
+		memo.ExprFmtHideConstraints|
 			memo.ExprFmtHideRuleProps|
 			memo.ExprFmtHideStats|
 			memo.ExprFmtHideCost|

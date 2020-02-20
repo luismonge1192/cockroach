@@ -564,10 +564,6 @@ func (r *Replica) leaseStatus(
 		expiration = hlc.Timestamp(status.Liveness.Expiration)
 	}
 	maxOffset := r.store.Clock().MaxOffset()
-	if maxOffset == timeutil.ClocklessMaxOffset {
-		// No stasis when using clockless reads.
-		maxOffset = 0
-	}
 	stasis := expiration.Add(-int64(maxOffset), 0)
 	if timestamp.Less(stasis) {
 		status.State = storagepb.LeaseState_VALID
@@ -585,18 +581,10 @@ func (r *Replica) leaseStatus(
 	return status
 }
 
-// requiresExpiringLease returns whether this range uses an expiration-based
-// lease; false if epoch-based. Ranges located before or including the node
-// liveness table must use expiration leases to avoid circular dependencies on
-// the node liveness table.
-func (r *Replica) requiresExpiringLease() bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.requiresExpiringLeaseRLocked()
-}
-
-// requiresExpiringLeaseRLocked is like requiresExpiringLease, but requires that
-// the replica mutex be held.
+// requiresExpiringLeaseRLocked returns whether this range uses an
+// expiration-based lease; false if epoch-based. Ranges located before or
+// including the node liveness table must use expiration leases to avoid
+// circular dependencies on the node liveness table.
 func (r *Replica) requiresExpiringLeaseRLocked() bool {
 	return r.store.cfg.NodeLiveness == nil || !r.store.cfg.EnableEpochRangeLeases ||
 		r.mu.state.Desc.StartKey.Less(roachpb.RKey(keys.NodeLivenessKeyMax))
@@ -797,7 +785,9 @@ func newNotLeaseHolderError(
 	err := &roachpb.NotLeaseHolderError{
 		RangeID: rangeDesc.RangeID,
 	}
-	err.Replica, _ = rangeDesc.GetReplicaDescriptor(proposerStoreID)
+	if proposerStoreID != 0 {
+		err.Replica, _ = rangeDesc.GetReplicaDescriptor(proposerStoreID)
+	}
 	if l != nil {
 		// Normally, we return the lease-holding Replica here. However, in the
 		// case in which a leader removes itself, we want the followers to
@@ -890,10 +880,10 @@ func (r *Replica) redirectOnOrAcquireLease(
 						// but the lease can change hands and so the situation in which a follower
 						// coordinates a replica removal of the (new) lease holder is possible (if
 						// unlikely) in practice. In this situation, the new lease holder would at
-						// some point be asked to propose the replica change's EndTransaction to
-						// Raft. A check has been added that prevents proposals that amount to the
-						// removal of the proposer's (and hence lease holder's) Replica, preventing
-						// this scenario.
+						// some point be asked to propose the replica change's EndTxn to Raft. A
+						// check has been added that prevents proposals that amount to the removal
+						// of the proposer's (and hence lease holder's) Replica, preventing this
+						// scenario.
 						//
 						// 2. A lease is accepted for a Replica that has been removed. Without
 						// precautions, this could happen because lease requests are special in
@@ -952,7 +942,7 @@ func (r *Replica) redirectOnOrAcquireLease(
 				_, requestPending := r.mu.pendingLeaseRequest.RequestPending()
 				if !requestPending && r.requiresExpiringLeaseRLocked() {
 					renewal := status.Lease.Expiration.Add(-r.store.cfg.RangeLeaseRenewalDuration().Nanoseconds(), 0)
-					if !timestamp.Less(renewal) {
+					if renewal.LessEq(timestamp) {
 						if log.V(2) {
 							log.Infof(ctx, "extending lease %s at %s", status.Lease, timestamp)
 						}

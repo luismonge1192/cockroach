@@ -179,7 +179,6 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 		}
 	}
 
-	// Handle read-only operators which never write data or modify schema.
 	switch t := e.(type) {
 	case *memo.ValuesExpr:
 		ep, err = b.buildValues(t)
@@ -296,19 +295,19 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 		ep, err = b.buildExport(t)
 
 	default:
-		if opt.IsSetOp(e) {
+		switch {
+		case opt.IsSetOp(e):
 			ep, err = b.buildSetOp(e)
-			break
-		}
-		if opt.IsJoinNonApplyOp(e) {
+
+		case opt.IsJoinNonApplyOp(e):
 			ep, err = b.buildHashJoin(e)
-			break
-		}
-		if opt.IsJoinApplyOp(e) {
+
+		case opt.IsJoinApplyOp(e):
 			ep, err = b.buildApplyJoin(e)
-			break
+
+		default:
+			err = errors.AssertionFailedf("no execbuild for %T", t)
 		}
-		return execPlan{}, errors.AssertionFailedf("no execbuild for %T", t)
 	}
 	if err != nil {
 		return execPlan{}, err
@@ -343,6 +342,14 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 }
 
 func (b *Builder) buildValues(values *memo.ValuesExpr) (execPlan, error) {
+	rows, err := b.buildValuesRows(values)
+	if err != nil {
+		return execPlan{}, err
+	}
+	return b.constructValues(rows, values.Cols)
+}
+
+func (b *Builder) buildValuesRows(values *memo.ValuesExpr) ([][]tree.TypedExpr, error) {
 	numCols := len(values.Cols)
 
 	rows := make([][]tree.TypedExpr, len(values.Rows))
@@ -351,7 +358,7 @@ func (b *Builder) buildValues(values *memo.ValuesExpr) (execPlan, error) {
 	for i := range rows {
 		tup := values.Rows[i].(*memo.TupleExpr)
 		if len(tup.Elems) != numCols {
-			return execPlan{}, fmt.Errorf("inconsistent row length %d vs %d", len(tup.Elems), numCols)
+			return nil, fmt.Errorf("inconsistent row length %d vs %d", len(tup.Elems), numCols)
 		}
 		// Chop off prefix of rowBuf and limit its capacity.
 		rows[i] = rowBuf[:numCols:numCols]
@@ -360,11 +367,11 @@ func (b *Builder) buildValues(values *memo.ValuesExpr) (execPlan, error) {
 		for j := 0; j < numCols; j++ {
 			rows[i][j], err = b.buildScalar(&scalarCtx, tup.Elems[j])
 			if err != nil {
-				return execPlan{}, err
+				return nil, err
 			}
 		}
 	}
-	return b.constructValues(rows, values.Cols)
+	return rows, nil
 }
 
 func (b *Builder) constructValues(rows [][]tree.TypedExpr, cols opt.ColList) (execPlan, error) {
@@ -494,6 +501,7 @@ func (b *Builder) buildScan(scan *memo.ScanExpr) (execPlan, error) {
 		b.indexConstraintMaxResults(scan),
 		res.reqOrdering(scan),
 		rowCount,
+		scan.Locking,
 	)
 	if err != nil {
 		return execPlan{}, err
@@ -638,7 +646,7 @@ func (b *Builder) buildApplyJoin(join memo.RelExpr) (execPlan, error) {
 	// outer columns, so that we can figure out the output columns and various
 	// other attributes.
 	var f norm.Factory
-	f.Init(b.evalCtx)
+	f.Init(b.evalCtx, b.catalog)
 	fakeBindings := make(map[opt.ColumnID]tree.Datum)
 	rightExpr.Relational().OuterCols.ForEach(func(k opt.ColumnID) {
 		fakeBindings[k] = tree.DNull
@@ -725,9 +733,11 @@ func (b *Builder) buildApplyJoin(join memo.RelExpr) (execPlan, error) {
 }
 
 func (b *Builder) buildHashJoin(join memo.RelExpr) (execPlan, error) {
-	if f := join.Private().(*memo.JoinPrivate).Flags; f.DisallowHashJoin {
+	if f := join.Private().(*memo.JoinPrivate).Flags; !f.Has(memo.AllowHashJoinStoreRight) {
+		// We need to do a bit of reverse engineering here to determine what the
+		// hint was.
 		hint := tree.AstLookup
-		if !f.DisallowMergeJoin {
+		if f.Has(memo.AllowMergeJoin) {
 			hint = tree.AstMerge
 		}
 
@@ -903,43 +913,51 @@ func (b *Builder) buildGroupBy(groupBy memo.RelExpr) (execPlan, error) {
 	aggInfos := make([]exec.AggInfo, len(aggregations))
 	for i := range aggregations {
 		item := &aggregations[i]
-		name, overload := memo.FindAggregateOverload(item.Agg)
+		agg := item.Agg
 
-		distinct := false
-		var argIdx []exec.ColumnOrdinal
 		var filterOrd exec.ColumnOrdinal = -1
-
-		if item.Agg.ChildCount() > 0 {
-			child := item.Agg.Child(0)
-
-			if aggFilter, ok := child.(*memo.AggFilterExpr); ok {
-				filter, ok := aggFilter.Filter.(*memo.VariableExpr)
-				if !ok {
-					return execPlan{}, errors.Errorf("only VariableOp args supported")
-				}
-				filterOrd = input.getColumnOrdinal(filter.Col)
-				child = aggFilter.Input
-			}
-
-			if aggDistinct, ok := child.(*memo.AggDistinctExpr); ok {
-				distinct = true
-				child = aggDistinct.Input
-			}
-			v, ok := child.(*memo.VariableExpr)
+		if aggFilter, ok := agg.(*memo.AggFilterExpr); ok {
+			filter, ok := aggFilter.Filter.(*memo.VariableExpr)
 			if !ok {
-				return execPlan{}, errors.Errorf("only VariableOp args supported")
+				return execPlan{}, errors.AssertionFailedf("only VariableOp args supported")
 			}
-			argIdx = []exec.ColumnOrdinal{input.getColumnOrdinal(v.Col)}
+			filterOrd = input.getColumnOrdinal(filter.Col)
+			agg = aggFilter.Input
 		}
 
-		constArgs := b.extractAggregateConstArgs(item.Agg)
+		distinct := false
+		if aggDistinct, ok := agg.(*memo.AggDistinctExpr); ok {
+			distinct = true
+			agg = aggDistinct.Input
+		}
+
+		name, overload := memo.FindAggregateOverload(agg)
+
+		// Accumulate variable arguments in argCols and constant arguments in
+		// constArgs. Constant arguments must follow variable arguments.
+		var argCols []exec.ColumnOrdinal
+		var constArgs tree.Datums
+		for j, n := 0, agg.ChildCount(); j < n; j++ {
+			child := agg.Child(j)
+			if variable, ok := child.(*memo.VariableExpr); ok {
+				if len(constArgs) != 0 {
+					return execPlan{}, errors.Errorf("constant args must come after variable args")
+				}
+				argCols = append(argCols, input.getColumnOrdinal(variable.Col))
+			} else {
+				if len(argCols) == 0 {
+					return execPlan{}, errors.Errorf("a constant arg requires at least one variable arg")
+				}
+				constArgs = append(constArgs, memo.ExtractConstDatum(child))
+			}
+		}
 
 		aggInfos[i] = exec.AggInfo{
 			FuncName:   name,
 			Builtin:    overload,
 			Distinct:   distinct,
 			ResultType: item.Agg.DataType(),
-			ArgCols:    argIdx,
+			ArgCols:    argCols,
 			ConstArgs:  constArgs,
 			Filter:     filterOrd,
 		}
@@ -962,17 +980,6 @@ func (b *Builder) buildGroupBy(groupBy memo.RelExpr) (execPlan, error) {
 		return execPlan{}, err
 	}
 	return ep, nil
-}
-
-// extractAggregateConstArgs returns the list of constant arguments associated with a given aggregate
-// expression.
-func (b *Builder) extractAggregateConstArgs(agg opt.ScalarExpr) tree.Datums {
-	switch agg.Op() {
-	case opt.StringAggOp:
-		return tree.Datums{memo.ExtractConstDatum(agg.Child(1))}
-	default:
-		return nil
-	}
 }
 
 func (b *Builder) buildDistinct(distinct *memo.DistinctOnExpr) (execPlan, error) {
@@ -1287,8 +1294,6 @@ func (b *Builder) buildLookupJoin(join *memo.LookupJoinExpr) (execPlan, error) {
 	for i := range join.KeyCols {
 		eqCols.Add(join.Table.ColumnID(idx.Column(i).Ordinal))
 	}
-	tableFDs := memo.MakeTableFuncDep(md, join.Table)
-	eqColsAreKey := tableFDs.ColsAreStrictKey(eqCols)
 
 	res.root, err = b.factory.ConstructLookupJoin(
 		joinOpToJoinType(join.JoinType),
@@ -1296,7 +1301,7 @@ func (b *Builder) buildLookupJoin(join *memo.LookupJoinExpr) (execPlan, error) {
 		tab,
 		idx,
 		keyCols,
-		eqColsAreKey,
+		join.LookupColsAreTableKey,
 		lookupOrdinals,
 		onExpr,
 		res.reqOrdering(join),
@@ -1505,20 +1510,20 @@ func (b *Builder) buildRecursiveCTE(rec *memo.RecursiveCTEExpr) (execPlan, error
 }
 
 func (b *Builder) buildWithScan(withScan *memo.WithScanExpr) (execPlan, error) {
-	id := withScan.ID
+	withID := withScan.With
 	var e *builtWithExpr
 	for i := range b.withExprs {
-		if b.withExprs[i].id == id {
+		if b.withExprs[i].id == withID {
 			e = &b.withExprs[i]
 			break
 		}
 	}
 	if e == nil {
-		panic(errors.AssertionFailedf("couldn't find With expression with ID %d", id))
+		panic(errors.AssertionFailedf("couldn't find With expression with ID %d", withID))
 	}
 
 	var label bytes.Buffer
-	fmt.Fprintf(&label, "buffer %d", withScan.ID)
+	fmt.Fprintf(&label, "buffer %d", withScan.With)
 	if withScan.Name != "" {
 		fmt.Fprintf(&label, " (%s)", withScan.Name)
 	}
@@ -1580,7 +1585,7 @@ func (b *Builder) buildProjectSet(projectSet *memo.ProjectSetExpr) (execPlan, er
 
 	for i := range zip {
 		item := &zip[i]
-		exprs[i], err = b.buildScalar(&scalarCtx, item.Func)
+		exprs[i], err = b.buildScalar(&scalarCtx, item.Fn)
 		if err != nil {
 			return execPlan{}, err
 		}

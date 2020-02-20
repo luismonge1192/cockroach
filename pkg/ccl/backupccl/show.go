@@ -12,6 +12,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -22,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/errors"
 )
 
 // showBackupPlanHook implements PlanHookFn.
@@ -48,6 +50,12 @@ func showBackupPlanHook(
 		return nil, nil, nil, false, err
 	}
 
+	expected := map[string]sql.KVStringOptValidate{backupOptEncPassphrase: sql.KVStringOptRequireValue}
+	optsFn, err := p.TypeAsStringOpts(backup.Options, expected)
+	if err != nil {
+		return nil, nil, nil, false, err
+	}
+
 	var shower backupShower
 	switch backup.Details {
 	case tree.BackupRangeDetails:
@@ -55,7 +63,7 @@ func showBackupPlanHook(
 	case tree.BackupFileDetails:
 		shower = backupShowerFiles
 	default:
-		shower = backupShowerDefault(ctx, backup.ShouldIncludeSchemas)
+		shower = backupShowerDefault(ctx, p, backup.ShouldIncludeSchemas)
 	}
 
 	fn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
@@ -67,7 +75,30 @@ func showBackupPlanHook(
 		if err != nil {
 			return err
 		}
-		desc, err := ReadBackupDescriptorFromURI(ctx, str, p.ExecCfg().DistSQLSrv.ExternalStorageFromURI)
+
+		opts, err := optsFn()
+		if err != nil {
+			return err
+		}
+
+		var encryption *roachpb.FileEncryptionOptions
+		if passphrase, ok := opts[backupOptEncPassphrase]; ok {
+			store, err := p.ExecCfg().DistSQLSrv.ExternalStorageFromURI(ctx, str)
+			if err != nil {
+				return errors.Wrapf(err, "make storage")
+			}
+			defer store.Close()
+			opts, err := readEncryptionOptions(ctx, store)
+			if err != nil {
+				return err
+			}
+			encryptionKey := storageccl.GenerateKey([]byte(passphrase), opts.Salt)
+			encryption = &roachpb.FileEncryptionOptions{Key: encryptionKey}
+		}
+
+		desc, err := ReadBackupManifestFromURI(
+			ctx, str, p.ExecCfg().DistSQLSrv.ExternalStorageFromURI, encryption,
+		)
 		if err != nil {
 			return err
 		}
@@ -75,7 +106,7 @@ func showBackupPlanHook(
 		// FKs for which we can't resolve the cross-table references. We can't
 		// display them anyway, because we don't have the referenced table names,
 		// etc.
-		if err := maybeUpgradeTableDescsInBackupDescriptors(ctx, []BackupDescriptor{desc}, true /*skipFKsWithNoMatchingTable*/); err != nil {
+		if err := maybeUpgradeTableDescsInBackupManifests(ctx, []BackupManifest{desc}, true /*skipFKsWithNoMatchingTable*/); err != nil {
 			return err
 		}
 
@@ -94,7 +125,7 @@ func showBackupPlanHook(
 
 type backupShower struct {
 	header sqlbase.ResultColumns
-	fn     func(BackupDescriptor) []tree.Datums
+	fn     func(BackupManifest) []tree.Datums
 }
 
 func backupShowerHeaders(showSchemas bool) sqlbase.ResultColumns {
@@ -112,10 +143,10 @@ func backupShowerHeaders(showSchemas bool) sqlbase.ResultColumns {
 	return baseHeaders
 }
 
-func backupShowerDefault(ctx context.Context, showSchemas bool) backupShower {
+func backupShowerDefault(ctx context.Context, p sql.PlanHookState, showSchemas bool) backupShower {
 	return backupShower{
 		header: backupShowerHeaders(showSchemas),
-		fn: func(desc BackupDescriptor) []tree.Datums {
+		fn: func(desc BackupManifest) []tree.Datums {
 			descs := make(map[sqlbase.ID]string)
 			for _, descriptor := range desc.Descriptors {
 				if database := descriptor.GetDatabase(); database != nil {
@@ -157,7 +188,7 @@ func backupShowerDefault(ctx context.Context, showSchemas bool) backupShower {
 						tree.NewDInt(tree.DInt(descSizes[table.ID].Rows)),
 					}
 					if showSchemas {
-						schema, err := sql.ShowCreate(ctx, dbName, desc.Descriptors, table, sql.OmitMissingFKClausesFromCreate)
+						schema, err := p.ShowCreate(ctx, dbName, desc.Descriptors, table, sql.OmitMissingFKClausesFromCreate)
 						if err != nil {
 							continue
 						}
@@ -179,7 +210,7 @@ var backupShowerRanges = backupShower{
 		{Name: "end_key", Typ: types.Bytes},
 	},
 
-	fn: func(desc BackupDescriptor) (rows []tree.Datums) {
+	fn: func(desc BackupManifest) (rows []tree.Datums) {
 		for _, span := range desc.Spans {
 			rows = append(rows, tree.Datums{
 				tree.NewDString(span.Key.String()),
@@ -203,7 +234,7 @@ var backupShowerFiles = backupShower{
 		{Name: "rows", Typ: types.Int},
 	},
 
-	fn: func(desc BackupDescriptor) (rows []tree.Datums) {
+	fn: func(desc BackupManifest) (rows []tree.Datums) {
 		for _, file := range desc.Files {
 			rows = append(rows, tree.Datums{
 				tree.NewDString(file.Path),

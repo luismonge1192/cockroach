@@ -10,7 +10,54 @@
 
 package timeutil
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestTimeZoneStringToLocation(t *testing.T) {
+	aus, err := time.LoadLocation("Australia/Sydney")
+	require.NoError(t, err)
+
+	testCases := []struct {
+		tz             string
+		std            TimeZoneStringToLocationStandard
+		loc            *time.Location
+		expectedResult bool
+	}{
+		{"UTC", TimeZoneStringToLocationISO8601Standard, time.UTC, true},
+		{"Australia/Sydney", TimeZoneStringToLocationISO8601Standard, aus, true},
+		{"fixed offset:3600 (3600)", TimeZoneStringToLocationISO8601Standard, FixedOffsetTimeZoneToLocation(3600, "3600"), true},
+		{`GMT-3:00`, TimeZoneStringToLocationISO8601Standard, FixedOffsetTimeZoneToLocation(-3*60*60, "GMT-3:00"), true},
+		{"+10", TimeZoneStringToLocationISO8601Standard, FixedOffsetTimeZoneToLocation(10*60*60, "+10"), true},
+		{"-10:30", TimeZoneStringToLocationISO8601Standard, FixedOffsetTimeZoneToLocation(-(10*60*60 + 30*60), "-10:30"), true},
+		{"asdf", TimeZoneStringToLocationISO8601Standard, nil, false},
+
+		{"UTC", TimeZoneStringToLocationPOSIXStandard, time.UTC, true},
+		{"Australia/Sydney", TimeZoneStringToLocationPOSIXStandard, aus, true},
+		{"fixed offset:3600 (3600)", TimeZoneStringToLocationPOSIXStandard, FixedOffsetTimeZoneToLocation(3600, "3600"), true},
+		{`GMT-3:00`, TimeZoneStringToLocationPOSIXStandard, FixedOffsetTimeZoneToLocation(3*60*60, "GMT-3:00"), true},
+		{"+10", TimeZoneStringToLocationPOSIXStandard, FixedOffsetTimeZoneToLocation(-10*60*60, "+10"), true},
+		{"-10:30", TimeZoneStringToLocationPOSIXStandard, FixedOffsetTimeZoneToLocation((10*60*60 + 30*60), "-10:30"), true},
+		{"asdf", TimeZoneStringToLocationPOSIXStandard, nil, false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(fmt.Sprintf("%s_%d", tc.tz, tc.std), func(t *testing.T) {
+			loc, err := TimeZoneStringToLocation(tc.tz, tc.std)
+			if tc.expectedResult {
+				assert.NoError(t, err)
+				assert.Equal(t, tc.loc, loc)
+			} else {
+				assert.Error(t, err)
+			}
+		})
+	}
+}
 
 func TestTimeZoneOffsetStringConversion(t *testing.T) {
 	testCases := []struct {
@@ -18,6 +65,9 @@ func TestTimeZoneOffsetStringConversion(t *testing.T) {
 		offsetSecs int64
 		ok         bool
 	}{
+		{`10`, 10 * 60 * 60, true},
+		{`10:15`, 10*60*60 + 15*60, true},
+		{`-10:15`, -(10*60*60 + 15*60), true},
 		{`GMT+00:00`, 0, true},
 		{`UTC-1:00:00`, -3600, true},
 		{`UTC-1:0:00`, -3600, true},
@@ -39,7 +89,7 @@ func TestTimeZoneOffsetStringConversion(t *testing.T) {
 	}
 
 	for i, testCase := range testCases {
-		offset, ok := TimeZoneOffsetStringConversion(testCase.timezone)
+		offset, ok := timeZoneOffsetStringConversion(testCase.timezone)
 		if offset != testCase.offsetSecs || ok != testCase.ok {
 			t.Errorf("%d: Expected offset: %d, success: %v for time %s, but got offset: %d, success: %v",
 				i, testCase.offsetSecs, testCase.ok, testCase.timezone, offset, ok)

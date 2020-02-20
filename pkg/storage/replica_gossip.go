@@ -59,8 +59,7 @@ func (r *Replica) shouldGossip() bool {
 }
 
 // MaybeGossipSystemConfig scans the entire SystemConfig span and gossips it.
-// Further calls come from the trigger on EndTransaction or range lease
-// acquisition.
+// Further calls come from the trigger on EndTxn or range lease acquisition.
 //
 // Note that MaybeGossipSystemConfig gossips information only when the
 // lease is actually held. The method does not request a range lease
@@ -134,13 +133,16 @@ func (r *Replica) MaybeGossipNodeLiveness(ctx context.Context, span roachpb.Span
 	ba.Add(&roachpb.ScanRequest{RequestHeader: roachpb.RequestHeaderFromSpan(span)})
 	// Call evaluateBatch instead of Send to avoid reacquiring latches.
 	rec := NewReplicaEvalContext(r, todoSpanSet)
+	rw := r.Engine().NewReadOnly()
+	defer rw.Close()
+
 	br, result, pErr :=
-		evaluateBatch(ctx, storagebase.CmdIDKey(""), r.store.Engine(), rec, nil, &ba, true /* readOnly */)
+		evaluateBatch(ctx, storagebase.CmdIDKey(""), rw, rec, nil, &ba, true /* readOnly */)
 	if pErr != nil {
 		return errors.Wrapf(pErr.GoError(), "couldn't scan node liveness records in span %s", span)
 	}
-	if result.Local.Intents != nil && len(*result.Local.Intents) > 0 {
-		return errors.Errorf("unexpected intents on node liveness span %s: %+v", span, *result.Local.Intents)
+	if len(result.Local.EncounteredIntents) > 0 {
+		return errors.Errorf("unexpected intents on node liveness span %s: %+v", span, result.Local.EncounteredIntents)
 	}
 	kvs := br.Responses[0].GetInner().(*roachpb.ScanResponse).Rows
 	log.VEventf(ctx, 2, "gossiping %d node liveness record(s) from span %s", len(kvs), span)
@@ -174,19 +176,22 @@ func (r *Replica) loadSystemConfig(ctx context.Context) (*config.SystemConfigEnt
 	ba.Add(&roachpb.ScanRequest{RequestHeader: roachpb.RequestHeaderFromSpan(keys.SystemConfigSpan)})
 	// Call evaluateBatch instead of Send to avoid reacquiring latches.
 	rec := NewReplicaEvalContext(r, todoSpanSet)
+	rw := r.Engine().NewReadOnly()
+	defer rw.Close()
+
 	br, result, pErr := evaluateBatch(
-		ctx, storagebase.CmdIDKey(""), r.store.Engine(), rec, nil, &ba, true, /* readOnly */
+		ctx, storagebase.CmdIDKey(""), rw, rec, nil, &ba, true, /* readOnly */
 	)
 	if pErr != nil {
 		return nil, pErr.GoError()
 	}
-	if intents := result.Local.DetachIntents(); len(intents) > 0 {
+	if intents := result.Local.DetachEncounteredIntents(); len(intents) > 0 {
 		// There were intents, so what we read may not be consistent. Attempt
 		// to nudge the intents in case they're expired; next time around we'll
 		// hopefully have more luck.
-		// This is called from handleLocalEvalResult (with raftMu locked),
-		// so disallow synchronous processing (which blocks that mutex for
-		// too long and is a potential deadlock).
+		// This is called from handleReadWriteLocalEvalResult (with raftMu
+		// locked), so disallow synchronous processing (which blocks that mutex
+		// for too long and is a potential deadlock).
 		if err := r.store.intentResolver.CleanupIntentsAsync(ctx, intents, false /* allowSync */); err != nil {
 			log.Warning(ctx, err)
 		}

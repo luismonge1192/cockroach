@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/pkg/errors"
 )
 
@@ -39,6 +40,9 @@ var _ apd.Decimal
 
 // Dummy import to pull in "time" package.
 var _ time.Time
+
+// Dummy import to pull in "duration" package.
+var _ duration.Duration
 
 // _TYPES_T is the template type variable for coltypes.T. It will be replaced by
 // coltypes.Foo for each type Foo in the coltypes.T type.
@@ -93,15 +97,13 @@ func (c const_TYPEOp) Init() {
 func (c const_TYPEOp) Next(ctx context.Context) coldata.Batch {
 	batch := c.input.Next(ctx)
 	n := batch.Length()
-	if batch.Width() == c.outputIdx {
-		c.allocator.AppendColumn(batch, c.typ)
-	}
 	if n == 0 {
-		return batch
+		return coldata.ZeroBatch
 	}
+	c.allocator.MaybeAddColumn(batch, c.typ, c.outputIdx)
 	vec := batch.ColVec(c.outputIdx)
 	col := vec._TemplateType()
-	c.allocator.performOperation(
+	c.allocator.PerformOperation(
 		[]coldata.Vec{vec},
 		func() {
 			if sel := batch.Selection(); sel != nil {
@@ -110,7 +112,7 @@ func (c const_TYPEOp) Next(ctx context.Context) coldata.Batch {
 				}
 			} else {
 				col = execgen.SLICE(col, 0, int(n))
-				for execgen.RANGE(i, col) {
+				for execgen.RANGE(i, col, 0, int(n)) {
 					execgen.SET(col, i, c.constVal)
 				}
 			}
@@ -148,14 +150,10 @@ func (c constNullOp) Init() {
 func (c constNullOp) Next(ctx context.Context) coldata.Batch {
 	batch := c.input.Next(ctx)
 	n := batch.Length()
-
-	if batch.Width() == c.outputIdx {
-		c.allocator.AppendColumn(batch, c.typ)
-	}
-
 	if n == 0 {
-		return batch
+		return coldata.ZeroBatch
 	}
+	c.allocator.MaybeAddColumn(batch, c.typ, c.outputIdx)
 
 	col := batch.ColVec(c.outputIdx)
 	nulls := col.Nulls()

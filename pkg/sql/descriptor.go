@@ -19,6 +19,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -38,6 +40,16 @@ var (
 	errNoTable           = pgerror.New(pgcode.InvalidName, "no table specified")
 	errNoMatch           = pgerror.New(pgcode.UndefinedObject, "no object matched")
 )
+
+// DefaultUserDBs is a set of the databases which are present in a new cluster.
+var DefaultUserDBs = map[string]struct{}{
+	sessiondata.DefaultDatabaseName: {},
+	sessiondata.PgDatabaseName:      {},
+}
+
+// MaxDefaultDescriptorID is the maximum ID of a descriptor that exists in a
+// new cluster.
+var MaxDefaultDescriptorID = keys.MaxReservedDescID + sqlbase.ID(len(DefaultUserDBs))
 
 // GenerateUniqueDescID returns the next available Descriptor ID and increments
 // the counter. The incrementing is non-transactional, and the counter could be
@@ -60,15 +72,21 @@ func GenerateUniqueDescID(ctx context.Context, db *client.DB) (sqlbase.ID, error
 func (p *planner) createDatabase(
 	ctx context.Context, desc *sqlbase.DatabaseDescriptor, ifNotExists bool,
 ) (bool, error) {
-	plainKey := sqlbase.NewDatabaseKey(desc.Name)
-	idKey := plainKey.Key()
+	shouldCreatePublicSchema := true
+	dKey := sqlbase.MakeDatabaseNameKey(ctx, p.ExecCfg().Settings, desc.Name)
+	// TODO(solon): This conditional can be removed in 20.2. Every database
+	// is created with a public schema for cluster version >= 20.1, so we can remove
+	// the `shouldCreatePublicSchema` logic as well.
+	if !cluster.Version.IsActive(ctx, p.ExecCfg().Settings, cluster.VersionNamespaceTableWithSchemas) {
+		shouldCreatePublicSchema = false
+	}
 
-	if exists, err := descExists(ctx, p.txn, idKey); err == nil && exists {
+	if exists, _, err := sqlbase.LookupDatabaseID(ctx, p.txn, desc.Name); err == nil && exists {
 		if ifNotExists {
 			// Noop.
 			return false, nil
 		}
-		return false, sqlbase.NewDatabaseAlreadyExistsError(plainKey.Name())
+		return false, sqlbase.NewDatabaseAlreadyExistsError(desc.Name)
 	} else if err != nil {
 		return false, err
 	}
@@ -78,16 +96,20 @@ func (p *planner) createDatabase(
 		return false, err
 	}
 
-	return true, p.createDescriptorWithID(ctx, idKey, id, desc, nil)
-}
-
-func descExists(ctx context.Context, txn *client.Txn, idKey roachpb.Key) (bool, error) {
-	// Check whether idKey exists.
-	gr, err := txn.Get(ctx, idKey)
-	if err != nil {
-		return false, err
+	if err := p.createDescriptorWithID(ctx, dKey.Key(), id, desc, nil); err != nil {
+		return true, err
 	}
-	return gr.Exists(), nil
+
+	// TODO(solon): This check should be removed and a public schema should
+	// be created in every database in >= 20.2.
+	if shouldCreatePublicSchema {
+		// Every database must be initialized with the public schema.
+		if err := p.createSchemaWithID(ctx, sqlbase.NewPublicSchemaKey(id).Key(), keys.PublicSchemaID); err != nil {
+			return true, err
+		}
+	}
+
+	return true, nil
 }
 
 func (p *planner) createDescriptorWithID(
@@ -154,6 +176,54 @@ func getDescriptorID(
 	return sqlbase.ID(gr.ValueInt()), nil
 }
 
+// resolveSchemaID resolves a schema's ID based on db and name.
+func resolveSchemaID(
+	ctx context.Context, txn *client.Txn, dbID sqlbase.ID, scName string,
+) (bool, sqlbase.ID, error) {
+	// Try to use the system name resolution bypass. Avoids a hotspot by explicitly
+	// checking for public schema.
+	if scName == tree.PublicSchema {
+		return true, keys.PublicSchemaID, nil
+	}
+
+	sKey := sqlbase.NewSchemaKey(dbID, scName)
+	schemaID, err := getDescriptorID(ctx, txn, sKey)
+	if err != nil || schemaID == sqlbase.InvalidID {
+		return false, sqlbase.InvalidID, err
+	}
+
+	return true, schemaID, nil
+}
+
+// lookupDescriptorByID looks up the descriptor for `id` and returns it.
+// It can be a table or database descriptor.
+// Returns the descriptor (if found), a bool representing whether the
+// descriptor was found and an error if any.
+func lookupDescriptorByID(
+	ctx context.Context, txn *client.Txn, id sqlbase.ID,
+) (sqlbase.DescriptorProto, bool, error) {
+	var desc sqlbase.DescriptorProto
+	for _, lookupFn := range []func() (sqlbase.DescriptorProto, error){
+		func() (sqlbase.DescriptorProto, error) {
+			return sqlbase.GetTableDescFromID(ctx, txn, id)
+		},
+		func() (sqlbase.DescriptorProto, error) {
+			return sqlbase.GetDatabaseDescFromID(ctx, txn, id)
+		},
+	} {
+		var err error
+		desc, err = lookupFn()
+		if err != nil {
+			if err == sqlbase.ErrDescriptorNotFound {
+				continue
+			}
+			return nil, false, err
+		}
+		return desc, true, nil
+	}
+	return nil, false, nil
+}
+
 // getDescriptorByID looks up the descriptor for `id`, validates it,
 // and unmarshals it into `descriptor`.
 //
@@ -177,7 +247,7 @@ func getDescriptorByID(
 				"%q is not a table", desc.String())
 		}
 		if err := table.MaybeFillInDescriptor(ctx, txn); err != nil {
-			return nil
+			return err
 		}
 
 		if err := table.Validate(ctx, txn); err != nil {
@@ -197,6 +267,30 @@ func getDescriptorByID(
 		*t = *database
 	}
 	return nil
+}
+
+// IsDefaultCreatedDescriptor returns whether or not a given descriptor ID is
+// present at the time of starting a cluster.
+func IsDefaultCreatedDescriptor(descID sqlbase.ID) bool {
+	return descID <= MaxDefaultDescriptorID
+}
+
+// CountUserDescriptors returns the number of descriptors present that were
+// created by the user (i.e. not present when the cluster started).
+func CountUserDescriptors(ctx context.Context, txn *client.Txn) (int, error) {
+	allDescs, err := GetAllDescriptors(ctx, txn)
+	if err != nil {
+		return 0, err
+	}
+
+	count := 0
+	for _, desc := range allDescs {
+		if !IsDefaultCreatedDescriptor(desc.GetID()) {
+			count++
+		}
+	}
+
+	return count, nil
 }
 
 // GetAllDescriptors looks up and returns all available descriptors.
@@ -239,10 +333,26 @@ func GetAllDatabaseDescriptorIDs(ctx context.Context, txn *client.Txn) ([]sqlbas
 	if err != nil {
 		return nil, err
 	}
+	// See the comment in physical_schema_accessors.go,
+	// func (a UncachedPhysicalAccessor) GetObjectNames. Same concept
+	// applies here.
+	// TODO(solon): This complexity can be removed in 20.2.
+	nameKey = sqlbase.NewDeprecatedDatabaseKey("" /* name */).Key()
+	dkvs, err := txn.Scan(ctx, nameKey, nameKey.PrefixEnd(), 0 /* maxRows */)
+	if err != nil {
+		return nil, err
+	}
+	kvs = append(kvs, dkvs...)
 
 	descIDs := make([]sqlbase.ID, 0, len(kvs))
+	alreadySeen := make(map[sqlbase.ID]bool)
 	for _, kv := range kvs {
-		descIDs = append(descIDs, sqlbase.ID(kv.ValueInt()))
+		ID := sqlbase.ID(kv.ValueInt())
+		if alreadySeen[ID] {
+			continue
+		}
+		alreadySeen[ID] = true
+		descIDs = append(descIDs, ID)
 	}
 	return descIDs, nil
 }
@@ -258,25 +368,6 @@ func writeDescToBatch(
 	descID sqlbase.ID,
 	desc sqlbase.DescriptorProto,
 ) (err error) {
-	var tableToDowngrade *TableDescriptor
-	switch d := desc.(type) {
-	case *TableDescriptor:
-		tableToDowngrade = d
-	case *MutableTableDescriptor:
-		tableToDowngrade = d.TableDesc()
-	case *DatabaseDescriptor:
-	default:
-		return errors.AssertionFailedf("unexpected proto type %T", desc)
-	}
-	if tableToDowngrade != nil {
-		didDowngrade, downgraded, err := tableToDowngrade.MaybeDowngradeForeignKeyRepresentation(ctx, s)
-		if err != nil {
-			return err
-		}
-		if didDowngrade {
-			desc = downgraded
-		}
-	}
 	descKey := sqlbase.MakeDescMetadataKey(descID)
 	descDesc := sqlbase.WrapDescriptor(desc)
 	if kvTrace {
@@ -298,25 +389,6 @@ func WriteNewDescToBatch(
 	tableID sqlbase.ID,
 	desc sqlbase.DescriptorProto,
 ) (err error) {
-	var tableToDowngrade *TableDescriptor
-	switch d := desc.(type) {
-	case *TableDescriptor:
-		tableToDowngrade = d
-	case *MutableTableDescriptor:
-		tableToDowngrade = d.TableDesc()
-	case *DatabaseDescriptor:
-	default:
-		return errors.AssertionFailedf("unexpected proto type %T", desc)
-	}
-	if tableToDowngrade != nil {
-		didDowngrade, downgraded, err := tableToDowngrade.MaybeDowngradeForeignKeyRepresentation(ctx, s)
-		if err != nil {
-			return err
-		}
-		if didDowngrade {
-			desc = downgraded
-		}
-	}
 	descKey := sqlbase.MakeDescMetadataKey(tableID)
 	descDesc := sqlbase.WrapDescriptor(desc)
 	if kvTrace {

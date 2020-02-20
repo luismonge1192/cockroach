@@ -50,7 +50,7 @@ func TestHashJoiner(t *testing.T) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	tempEngine, err := engine.NewTempEngine(engine.DefaultStorageEngine, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+	tempEngine, _, err := engine.NewTempEngine(ctx, engine.DefaultStorageEngine, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,7 @@ func TestHashJoiner(t *testing.T) {
 		// optionally be provided to modify the hashJoiner after instantiation but
 		// before Run().
 		testFunc := func(t *testing.T, flowCtxSetup func(f *execinfra.FlowCtx), hjSetup func(h *hashJoiner)) error {
-			side := execinfra.RightSide
+			side := rightSide
 			for i := 0; i < 2; i++ {
 				leftInput := distsqlutils.NewRowBuffer(c.leftTypes, c.leftInput, distsqlutils.RowBufferArgs{})
 				rightInput := distsqlutils.NewRowBuffer(c.rightTypes, c.rightInput, distsqlutils.RowBufferArgs{})
@@ -114,7 +114,7 @@ func TestHashJoiner(t *testing.T) {
 					h.forcedStoredSide = &side
 				}
 				h.Run(context.Background())
-				side = execinfra.OtherSide(h.storedSide)
+				side = otherSide(h.storedSide)
 
 				if !out.ProducerClosed() {
 					return errors.New("output RowReceiver not closed")
@@ -163,7 +163,7 @@ func TestHashJoinerError(t *testing.T) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	tempEngine, err := engine.NewTempEngine(engine.DefaultStorageEngine, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+	tempEngine, _, err := engine.NewTempEngine(ctx, engine.DefaultStorageEngine, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -514,7 +514,7 @@ func BenchmarkHashJoiner(b *testing.B) {
 			DiskMonitor: diskMonitor,
 		},
 	}
-	tempEngine, err := engine.NewTempEngine(engine.DefaultStorageEngine, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+	tempEngine, _, err := engine.NewTempEngine(ctx, engine.DefaultStorageEngine, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -531,10 +531,7 @@ func BenchmarkHashJoiner(b *testing.B) {
 
 	const numCols = 1
 	for _, spill := range []bool{true, false} {
-		flowCtx.Cfg.TestingKnobs.MemoryLimitBytes = 0
-		if spill {
-			flowCtx.Cfg.TestingKnobs.MemoryLimitBytes = 1
-		}
+		flowCtx.Cfg.TestingKnobs.ForceDiskSpill = spill
 		b.Run(fmt.Sprintf("spill=%t", spill), func(b *testing.B) {
 			for _, numRows := range []int{0, 1 << 2, 1 << 4, 1 << 8, 1 << 12, 1 << 16} {
 				if spill && numRows < 1<<8 {

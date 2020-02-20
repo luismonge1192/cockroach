@@ -26,7 +26,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -193,7 +193,7 @@ func TestStoreRangeMergeMetadataCleanup(t *testing.T) {
 		delete(postKeys, k)
 	}
 
-	tombstoneKey := string(keys.RaftTombstoneKey(rhsDesc.RangeID))
+	tombstoneKey := string(keys.RangeTombstoneKey(rhsDesc.RangeID))
 	if _, ok := postKeys[tombstoneKey]; !ok {
 		t.Errorf("tombstone key (%s) missing after merge", roachpb.Key(tombstoneKey))
 	}
@@ -237,9 +237,9 @@ func mergeWithData(t *testing.T, retries int64) {
 
 	// Maybe inject some retryable errors when the merge transaction commits.
 	var mtc *multiTestContext
-	storeCfg.TestingKnobs.TestingRequestFilter = func(ba roachpb.BatchRequest) *roachpb.Error {
+	storeCfg.TestingKnobs.TestingRequestFilter = func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
 		for _, req := range ba.Requests {
-			if et := req.GetEndTransaction(); et != nil && et.InternalCommitTrigger.GetMergeTrigger() != nil {
+			if et := req.GetEndTxn(); et != nil && et.InternalCommitTrigger.GetMergeTrigger() != nil {
 				if atomic.AddInt64(&retries, -1) >= 0 {
 					return roachpb.NewError(
 						roachpb.NewTransactionRetryError(roachpb.RETRY_SERIALIZABLE, "filter err"))
@@ -472,11 +472,11 @@ func mergeCheckingTimestampCaches(t *testing.T, disjointLeaseholders bool) {
 
 	// Simulate a txn abort on the RHS from a node with a newer clock. Because
 	// the transaction record for the pushee was not yet written, this will bump
-	// the write timestamp cache to record the abort.
+	// the timestamp cache to record the abort.
 	pushee := roachpb.MakeTransaction("pushee", rhsKey, roachpb.MinUserPriority, readTS, 0)
 	pusher := roachpb.MakeTransaction("pusher", rhsKey, roachpb.MaxUserPriority, readTS, 0)
 	ba = roachpb.BatchRequest{}
-	ba.Timestamp = readTS
+	ba.Timestamp = mtc.clock.Now()
 	ba.RangeID = rhsDesc.RangeID
 	ba.Add(pushTxnArgs(&pusher, &pushee, roachpb.PUSH_ABORT))
 	if br, pErr := rhsStore.Send(ctx, ba); pErr != nil {
@@ -499,7 +499,7 @@ func mergeCheckingTimestampCaches(t *testing.T, disjointLeaseholders bool) {
 	ba.Add(incrementArgs(rhsKey, 1))
 	if br, pErr := lhsStore.Send(ctx, ba); pErr != nil {
 		t.Fatal(pErr)
-	} else if !readTS.Less(br.Timestamp) {
+	} else if br.Timestamp.LessEq(readTS) {
 		t.Fatalf("expected write to execute after %v, but executed at %v", readTS, br.Timestamp)
 	}
 
@@ -516,7 +516,7 @@ func mergeCheckingTimestampCaches(t *testing.T, disjointLeaseholders bool) {
 	ba.Add(hb)
 	var expReason roachpb.TransactionAbortedReason
 	if disjointLeaseholders {
-		expReason = roachpb.ABORT_REASON_TIMESTAMP_CACHE_REJECTED_POSSIBLE_REPLAY
+		expReason = roachpb.ABORT_REASON_TIMESTAMP_CACHE_REJECTED
 	} else {
 		expReason = roachpb.ABORT_REASON_ABORTED_RECORD_FOUND
 	}
@@ -573,7 +573,7 @@ func TestStoreRangeMergeTimestampCacheCausality(t *testing.T) {
 	mtc := &multiTestContext{storeConfig: &storeCfg}
 	var readTS hlc.Timestamp
 	rhsKey := roachpb.Key("c")
-	mtc.storeConfig.TestingKnobs.TestingRequestFilter = func(ba roachpb.BatchRequest) *roachpb.Error {
+	mtc.storeConfig.TestingKnobs.TestingRequestFilter = func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
 		if ba.IsSingleSubsumeRequest() {
 			// Before we execute a Subsume request, execute a read on the same store
 			// at a much higher timestamp.
@@ -662,7 +662,7 @@ func TestStoreRangeMergeTimestampCacheCausality(t *testing.T) {
 	ba.Add(incrementArgs(rhsKey, 1))
 	if br, pErr := mtc.Store(1).Send(ctx, ba); pErr != nil {
 		t.Fatal(pErr)
-	} else if !readTS.Less(br.Timestamp) {
+	} else if br.Timestamp.LessEq(readTS) {
 		t.Fatalf("expected write to execute after %v, but executed at %v", readTS, br.Timestamp)
 	}
 }
@@ -700,9 +700,9 @@ func TestStoreRangeMergeTxnFailure(t *testing.T) {
 	// Install a store filter that maybe injects retryable errors into a merge
 	// transaction before ultimately aborting the merge.
 	var retriesBeforeFailure int64
-	storeCfg.TestingKnobs.TestingRequestFilter = func(ba roachpb.BatchRequest) *roachpb.Error {
+	storeCfg.TestingKnobs.TestingRequestFilter = func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
 		for _, req := range ba.Requests {
-			if et := req.GetEndTransaction(); et != nil && et.InternalCommitTrigger.GetMergeTrigger() != nil {
+			if et := req.GetEndTxn(); et != nil && et.InternalCommitTrigger.GetMergeTrigger() != nil {
 				if atomic.AddInt64(&retriesBeforeFailure, -1) >= 0 {
 					return roachpb.NewError(
 						roachpb.NewTransactionRetryError(roachpb.RETRY_SERIALIZABLE, "filter err"))
@@ -890,23 +890,23 @@ func TestStoreRangeMergeStats(t *testing.T) {
 	// will leave a record on the RHS, and txn3 will leave a record on both. This
 	// tests whether the merge code properly accounts for merging abort span
 	// records for the same transaction.
-	txn1 := client.NewTxn(ctx, store.DB(), 0 /* gatewayNodeID */, client.RootTxn)
+	txn1 := client.NewTxn(ctx, store.DB(), 0 /* gatewayNodeID */)
 	if err := txn1.Put(ctx, "a-txn1", "val"); err != nil {
 		t.Fatal(err)
 	}
-	txn2 := client.NewTxn(ctx, store.DB(), 0 /* gatewayNodeID */, client.RootTxn)
+	txn2 := client.NewTxn(ctx, store.DB(), 0 /* gatewayNodeID */)
 	if err := txn2.Put(ctx, "c-txn2", "val"); err != nil {
 		t.Fatal(err)
 	}
-	txn3 := client.NewTxn(ctx, store.DB(), 0 /* gatewayNodeID */, client.RootTxn)
+	txn3 := client.NewTxn(ctx, store.DB(), 0 /* gatewayNodeID */)
 	if err := txn3.Put(ctx, "a-txn3", "val"); err != nil {
 		t.Fatal(err)
 	}
 	if err := txn3.Put(ctx, "c-txn3", "val"); err != nil {
 		t.Fatal(err)
 	}
-	hiPriTxn := client.NewTxn(ctx, store.DB(), 0 /* gatewayNodeID */, client.RootTxn)
-	hiPriTxn.InternalSetPriority(enginepb.MaxTxnPriority)
+	hiPriTxn := client.NewTxn(ctx, store.DB(), 0 /* gatewayNodeID */)
+	hiPriTxn.TestingSetPriority(enginepb.MaxTxnPriority)
 	for _, key := range []string{"a-txn1", "c-txn2", "a-txn3", "c-txn3"} {
 		if err := hiPriTxn.Put(ctx, key, "val"); err != nil {
 			t.Fatal(err)
@@ -992,7 +992,7 @@ func TestStoreRangeMergeInFlightTxns(t *testing.T) {
 		}
 		lhsKey, rhsKey := roachpb.Key("aa"), roachpb.Key("cc")
 
-		txn := client.NewTxn(ctx, store.DB(), 0 /* gatewayNodeID */, client.RootTxn)
+		txn := client.NewTxn(ctx, store.DB(), 0 /* gatewayNodeID */)
 		// Put the key on the RHS side first so ownership of the transaction record
 		// will need to transfer to the LHS range during the merge.
 		if err := txn.Put(ctx, rhsKey, t.Name()); err != nil {
@@ -1030,7 +1030,7 @@ func TestStoreRangeMergeInFlightTxns(t *testing.T) {
 
 		// Create a transaction that will be aborted before the merge but won't
 		// realize until after the merge.
-		txn1 := client.NewTxn(ctx, store.DB(), 0 /* gatewayNodeID */, client.RootTxn)
+		txn1 := client.NewTxn(ctx, store.DB(), 0 /* gatewayNodeID */)
 		// Put the key on the RHS side so ownership of the transaction record and
 		// abort span records will need to transfer to the LHS during the merge.
 		if err := txn1.Put(ctx, rhsKey, t.Name()); err != nil {
@@ -1038,8 +1038,8 @@ func TestStoreRangeMergeInFlightTxns(t *testing.T) {
 		}
 
 		// Create and commit a txn that aborts txn1.
-		txn2 := client.NewTxn(ctx, store.DB(), 0 /* gatewayNodeID */, client.RootTxn)
-		txn2.InternalSetPriority(enginepb.MaxTxnPriority)
+		txn2 := client.NewTxn(ctx, store.DB(), 0 /* gatewayNodeID */)
+		txn2.TestingSetPriority(enginepb.MaxTxnPriority)
 		if err := txn2.Put(ctx, rhsKey, "muhahahah"); err != nil {
 			t.Fatal(err)
 		}
@@ -1077,7 +1077,7 @@ func TestStoreRangeMergeInFlightTxns(t *testing.T) {
 		defer txnwait.TestingOverrideTxnLivenessThreshold(2 * testutils.DefaultSucceedsSoonDuration)
 
 		// Create a transaction that won't complete until after the merge.
-		txn1 := client.NewTxn(ctx, store.DB(), 0 /* gatewayNodeID */, client.RootTxn)
+		txn1 := client.NewTxn(ctx, store.DB(), 0 /* gatewayNodeID */)
 		// Put the key on the RHS side so ownership of the transaction record and
 		// abort span records will need to transfer to the LHS during the merge.
 		if err := txn1.Put(ctx, rhsKey, t.Name()); err != nil {
@@ -1085,7 +1085,7 @@ func TestStoreRangeMergeInFlightTxns(t *testing.T) {
 		}
 
 		// Create a txn that will conflict with txn1.
-		txn2 := client.NewTxn(ctx, store.DB(), 0 /* gatewayNodeID */, client.RootTxn)
+		txn2 := client.NewTxn(ctx, store.DB(), 0 /* gatewayNodeID */)
 		txn2ErrCh := make(chan error)
 		go func() {
 			// Get should block on txn1's intent until txn1 commits.
@@ -1207,8 +1207,7 @@ func TestStoreRangeMergeSplitRace_MergeWins(t *testing.T) {
 	}()
 
 	mergeArgs := adminMergeArgs(lhsDesc.StartKey.AsRawKey())
-	_, pErr := client.SendWrapped(ctx, distSender, mergeArgs)
-	if pErr != nil && !testutils.IsPError(pErr, "range changed during merge") {
+	if _, pErr := client.SendWrapped(ctx, distSender, mergeArgs); pErr != nil {
 		t.Fatal(pErr)
 	}
 
@@ -1224,9 +1223,9 @@ func TestStoreRangeMergeSplitRace_MergeWins(t *testing.T) {
 //
 // The bug works like this. A merge of adjacent ranges P and Q and a split of Q
 // execute concurrently, though the merge executes with an earlier timestamp.
-// First, the merge transaction writes an intent to update P's local range
-// descriptor. Then it reads Q's local range descriptor to verify that Q hasn't
-// changed since the decision to merge was made.
+// First, the merge transaction reads Q's local range descriptor to determine
+// the combined range's range descriptor. Then it writes an intent to update P's
+// local range descriptor.
 //
 // Next, the split transaction runs from start to finish, updating Q's local
 // descriptor and its associated meta2 record. Notably, the split transaction
@@ -1273,24 +1272,22 @@ func TestStoreRangeMergeSplitRace_SplitWins(t *testing.T) {
 	storeCfg.TestingKnobs.DisableReplicateQueue = true
 
 	var distSender *kv.DistSender
+	var lhsDescKey atomic.Value
 	var launchSplit int64
-	done := make(chan struct{})
-	storeCfg.TestingKnobs.TestingRequestFilter = func(ba roachpb.BatchRequest) *roachpb.Error {
+	var mergeRetries int64
+	storeCfg.TestingKnobs.TestingRequestFilter = func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
 		for _, req := range ba.Requests {
-			if bt := req.GetBeginTransaction(); bt != nil &&
-				bt.Key.Equal(keys.RangeDescriptorKey(roachpb.RKeyMin)) &&
-				atomic.CompareAndSwapInt64(&launchSplit, 1, 0) {
-				_, pErr := client.SendWrapped(ctx, distSender, adminSplitArgs(roachpb.Key("c")))
-				return pErr
-			}
-			if ri := req.GetResolveIntent(); ri != nil &&
-				ri.Key.Equal(keys.RangeMetaKey(roachpb.RKey("c")).AsRawKey()) &&
-				ri.Status == roachpb.COMMITTED {
-				// Don't allow resolution of the split transaction's meta2 intent until
-				// the test finishes. This ensures that the merge watcher goroutine
-				// sees a nil value when it performs its meta2 lookup, as described in
-				// the comment on this test.
-				<-done
+			if cput := req.GetConditionalPut(); cput != nil {
+				if v := lhsDescKey.Load(); v != nil && v.(roachpb.Key).Equal(cput.Key) {
+					// If this is the first merge attempt, launch the split
+					// before the merge's first write succeeds.
+					if atomic.CompareAndSwapInt64(&launchSplit, 1, 0) {
+						_, pErr := client.SendWrapped(ctx, distSender, adminSplitArgs(roachpb.Key("c")))
+						return pErr
+					}
+					// Otherwise, record that the merge retried and proceed.
+					atomic.AddInt64(&mergeRetries, 1)
+				}
 			}
 		}
 		return nil
@@ -1299,19 +1296,21 @@ func TestStoreRangeMergeSplitRace_SplitWins(t *testing.T) {
 	mtc := &multiTestContext{storeConfig: &storeCfg}
 	mtc.Start(t, 1)
 	defer mtc.Stop()
-	defer close(done)
 	distSender = mtc.distSenders[0]
 
 	lhsDesc, _, err := createSplitRanges(ctx, mtc.Store(0))
 	if err != nil {
 		t.Fatal(err)
 	}
-
+	lhsDescKey.Store(keys.RangeDescriptorKey(lhsDesc.StartKey))
 	atomic.StoreInt64(&launchSplit, 1)
+
 	mergeArgs := adminMergeArgs(lhsDesc.StartKey.AsRawKey())
-	_, pErr := client.SendWrapped(ctx, distSender, mergeArgs)
-	if pErr != nil && !testutils.IsPError(pErr, "range changed during merge") {
+	if _, pErr := client.SendWrapped(ctx, distSender, mergeArgs); pErr != nil {
 		t.Fatal(pErr)
+	}
+	if atomic.LoadInt64(&mergeRetries) == 0 {
+		t.Fatal("expected merge to retry at least once due to concurrent split")
 	}
 }
 
@@ -1336,9 +1335,9 @@ func TestStoreRangeMergeRHSLeaseExpiration(t *testing.T) {
 	// Install a hook to control when the merge transaction commits.
 	mergeEndTxnReceived := make(chan *roachpb.Transaction, 10) // headroom in case the merge transaction retries
 	finishMerge := make(chan struct{})
-	storeCfg.TestingKnobs.TestingRequestFilter = func(ba roachpb.BatchRequest) *roachpb.Error {
+	storeCfg.TestingKnobs.TestingRequestFilter = func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
 		for _, r := range ba.Requests {
-			if et := r.GetEndTransaction(); et != nil && et.InternalCommitTrigger.GetMergeTrigger() != nil {
+			if et := r.GetEndTxn(); et != nil && et.InternalCommitTrigger.GetMergeTrigger() != nil {
 				mergeEndTxnReceived <- ba.Txn
 				<-finishMerge
 			}
@@ -1346,15 +1345,19 @@ func TestStoreRangeMergeRHSLeaseExpiration(t *testing.T) {
 		return nil
 	}
 
-	// Install a hook to observe when a get request for a special key,
+	// Install a hook to observe when a get or a put request for a special key,
 	// rhsSentinel, acquires latches and begins evaluating.
-	const getConcurrency = 10
+	const reqConcurrency = 10
 	rhsSentinel := roachpb.Key("rhs-sentinel")
-	getAcquiredLatch := make(chan struct{}, getConcurrency)
-	storeCfg.TestingKnobs.TestingLatchFilter = func(ba roachpb.BatchRequest) *roachpb.Error {
+	reqAcquiredLatch := make(chan struct{}, reqConcurrency)
+	storeCfg.TestingKnobs.TestingLatchFilter = func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
 		for _, r := range ba.Requests {
-			if get := r.GetGet(); get != nil && get.RequestHeader.Key.Equal(rhsSentinel) {
-				getAcquiredLatch <- struct{}{}
+			req := r.GetInner()
+			switch req.Method() {
+			case roachpb.Get, roachpb.Put:
+				if req.Header().Key.Equal(rhsSentinel) {
+					reqAcquiredLatch <- struct{}{}
+				}
 			}
 		}
 		return nil
@@ -1391,7 +1394,7 @@ func TestStoreRangeMergeRHSLeaseExpiration(t *testing.T) {
 		mergeErr <- pErr.GoError()
 	}()
 
-	// Wait for the merge transaction to send its EndTransaction request. It won't
+	// Wait for the merge transaction to send its EndTxn request. It won't
 	// be able to complete just yet, thanks to the hook we installed above.
 	mergeTxn := <-mergeEndTxnReceived
 
@@ -1423,10 +1426,10 @@ func TestStoreRangeMergeRHSLeaseExpiration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Send several get requests to the the RHS. The first of these to arrive will
-	// acquire the lease; the remaining requests will wait for that lease
-	// acquisition to complete. Then all requests should block waiting for the
-	// Subsume request to complete. By sending several of these requests in
+	// Send several get and put requests to the the RHS. The first of these to
+	// arrive will acquire the lease; the remaining requests will wait for that
+	// lease acquisition to complete. Then all requests should block waiting for
+	// the Subsume request to complete. By sending several of these requests in
 	// parallel, we attempt to trigger a race where a request could slip through
 	// on the replica between when the new lease is installed and when the
 	// mergeComplete channel is installed.
@@ -1441,8 +1444,8 @@ func TestStoreRangeMergeRHSLeaseExpiration(t *testing.T) {
 	//
 	// This race has since been fixed by installing the mergeComplete channel
 	// before the new lease.
-	getErrs := make(chan error)
-	for i := 0; i < getConcurrency; i++ {
+	reqErrs := make(chan error)
+	for i := 0; i < reqConcurrency; i++ {
 		go func(i int) {
 			// For this test to have a shot at triggering a race, this log message
 			// must be interleaved with the "new range lease" message, like so:
@@ -1454,21 +1457,28 @@ func TestStoreRangeMergeRHSLeaseExpiration(t *testing.T) {
 			// When this test was written, it would always produce the above
 			// interleaving, and successfully trigger the race when run with the race
 			// detector enabled about 50% of the time.
-			log.Infof(ctx, "starting get %d", i)
+			log.Infof(ctx, "starting req %d", i)
+			var req roachpb.Request
+			if i%2 == 0 {
+				req = getArgs(rhsSentinel)
+			} else {
+				req = putArgs(rhsSentinel, []byte(fmt.Sprintf("val%d", i)))
+			}
 			_, pErr := client.SendWrappedWith(ctx, mtc.stores[0].TestSender(), roachpb.Header{
 				RangeID: rhsDesc.RangeID,
-			}, getArgs(rhsSentinel))
-			getErrs <- pErr.GoError()
+			}, req)
+			reqErrs <- pErr.GoError()
 		}(i)
 		time.Sleep(time.Millisecond)
 	}
 
-	// Wait for the get requests to acquire latches, which is as far as they can
-	// get while the merge is in progress. Then wait a little bit longer. This
-	// tests that the requests really do get stuck waiting for the merge to
-	// complete without depending too heavily on implementation details.
-	for i := 0; i < getConcurrency; i++ {
-		<-getAcquiredLatch
+	// Wait for the get and put requests to acquire latches, which is as far as
+	// they can get while the merge is in progress. Then wait a little bit
+	// longer. This tests that the requests really do get stuck waiting for the
+	// merge to complete without depending too heavily on implementation
+	// details.
+	for i := 0; i < reqConcurrency; i++ {
+		<-reqAcquiredLatch
 	}
 	time.Sleep(50 * time.Millisecond)
 
@@ -1479,11 +1489,12 @@ func TestStoreRangeMergeRHSLeaseExpiration(t *testing.T) {
 	}
 
 	// Because the merge completed successfully, r2 has ceased to exist. We
-	// therefore *must* see a RangeNotFound error from every pending get request.
-	// Anything else is a consistency error (or a bug in the test).
-	for i := 0; i < getConcurrency; i++ {
-		if err := <-getErrs; !testutils.IsError(err, "r2 was not found") {
-			t.Fatalf("expected RangeNotFound error from get during merge, but got %v", err)
+	// therefore *must* see either a RangeNotFound or a NotLeaseHolderError
+	// error from every pending get and put request. Anything else is a
+	// consistency error (or a bug in the test).
+	for i := 0; i < reqConcurrency; i++ {
+		if err := <-reqErrs; !testutils.IsError(err, "(r2 was not found|not lease holder)") {
+			t.Fatalf("expected error from req during merge, but got %v", err)
 		}
 	}
 }
@@ -1754,14 +1765,14 @@ func TestStoreReplicaGCAfterMerge(t *testing.T) {
 
 	// Be extra paranoid and verify the exact value of the replica tombstone.
 	checkTombstone := func(eng engine.Engine) {
-		var rhsTombstone roachpb.RaftTombstone
-		rhsTombstoneKey := keys.RaftTombstoneKey(rhsDesc.RangeID)
+		var rhsTombstone roachpb.RangeTombstone
+		rhsTombstoneKey := keys.RangeTombstoneKey(rhsDesc.RangeID)
 		ok, err = engine.MVCCGetProto(ctx, eng, rhsTombstoneKey, hlc.Timestamp{},
 			&rhsTombstone, engine.MVCCGetOptions{})
 		if err != nil {
 			t.Fatal(err)
 		} else if !ok {
-			t.Fatalf("missing raft tombstone at key %s", rhsTombstoneKey)
+			t.Fatalf("missing range tombstone at key %s", rhsTombstoneKey)
 		}
 		if e, a := roachpb.ReplicaID(math.MaxInt32), rhsTombstone.NextReplicaID; e != a {
 			t.Fatalf("expected next replica ID to be %d, but got %d", e, a)
@@ -2271,7 +2282,7 @@ func TestStoreRangeMergeDeadFollowerDuringTxn(t *testing.T) {
 	var mtc *multiTestContext
 	storeCfg := storage.TestStoreConfig(nil)
 	storeCfg.TestingKnobs.DisableMergeQueue = true
-	storeCfg.TestingKnobs.TestingRequestFilter = func(ba roachpb.BatchRequest) *roachpb.Error {
+	storeCfg.TestingKnobs.TestingRequestFilter = func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
 		if ba.IsSingleSubsumeRequest() && mtc.Store(2) != nil {
 			mtc.stopStore(2)
 		}
@@ -2594,9 +2605,9 @@ func testMergeWatcher(t *testing.T, injectFailures bool) {
 
 	// Maybe inject some retryable errors when the merge transaction commits.
 	var mtc *multiTestContext
-	storeCfg.TestingKnobs.TestingRequestFilter = func(ba roachpb.BatchRequest) *roachpb.Error {
+	storeCfg.TestingKnobs.TestingRequestFilter = func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
 		for _, req := range ba.Requests {
-			if et := req.GetEndTransaction(); et != nil && et.InternalCommitTrigger.GetMergeTrigger() != nil {
+			if et := req.GetEndTxn(); et != nil && et.InternalCommitTrigger.GetMergeTrigger() != nil {
 				if atomic.AddInt64(&mergeTxnRetries, -1) >= 0 {
 					return roachpb.NewError(
 						roachpb.NewTransactionRetryError(roachpb.RETRY_SERIALIZABLE, "filter err"))
@@ -2724,7 +2735,7 @@ func TestStoreRangeMergeSlowWatcher(t *testing.T) {
 	// about the status of the A <- B merge.
 	var syn syncutil.Mutex
 	cond := sync.NewCond(&syn)
-	storeCfg.TestingKnobs.TestingRequestFilter = func(ba roachpb.BatchRequest) *roachpb.Error {
+	storeCfg.TestingKnobs.TestingRequestFilter = func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
 		syn.Lock()
 		defer syn.Unlock()
 		for _, req := range ba.Requests {
@@ -2736,7 +2747,7 @@ func TestStoreRangeMergeSlowWatcher(t *testing.T) {
 				ba.GatewayNodeID == store1.Ident.NodeID {
 				cond.Wait()
 			}
-			if et := req.GetEndTransaction(); et != nil && !et.Commit && ba.Txn.Name == "merge" {
+			if et := req.GetEndTxn(); et != nil && !et.Commit && ba.Txn.Name == "merge" {
 				// The merge transaction needed to restart for some reason. To avoid
 				// deadlocking, we need to allow the watcher goroutine's PushTxn request
 				// through so that it allows traffic on the range again. We'll try again
@@ -2897,8 +2908,8 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 			if err := sst.ClearRange(r.Start, r.End); err != nil {
 				return err
 			}
-			tombstoneKey := keys.RaftTombstoneKey(rangeID)
-			tombstoneValue := &roachpb.RaftTombstone{NextReplicaID: math.MaxInt32}
+			tombstoneKey := keys.RangeTombstoneKey(rangeID)
+			tombstoneValue := &roachpb.RangeTombstone{NextReplicaID: math.MaxInt32}
 			if err := engine.MVCCBlindPutProto(context.TODO(), &sst, nil, tombstoneKey, hlc.Timestamp{}, tombstoneValue, nil); err != nil {
 				return err
 			}
@@ -3144,7 +3155,7 @@ func TestStoreRangeMergeDuringShutdown(t *testing.T) {
 
 	// Simulate a merge transaction by launching a transaction that lays down
 	// intents on the two copies of the RHS range descriptor.
-	txn := client.NewTxn(ctx, store.DB(), 0 /* gatewayNodeID */, client.RootTxn)
+	txn := client.NewTxn(ctx, store.DB(), 0 /* gatewayNodeID */)
 	if err := txn.Del(ctx, keys.RangeDescriptorKey(rhsDesc.StartKey)); err != nil {
 		t.Fatal(err)
 	}
@@ -3230,7 +3241,7 @@ func TestMergeQueue(t *testing.T) {
 
 	// setThresholds simulates a zone config update that updates the ranges'
 	// minimum and maximum sizes.
-	setZones := func(zone config.ZoneConfig) {
+	setZones := func(zone zonepb.ZoneConfig) {
 		lhs().SetZoneConfig(&zone)
 		rhs().SetZoneConfig(&zone)
 	}
@@ -3286,7 +3297,7 @@ func TestMergeQueue(t *testing.T) {
 
 	t.Run("lhs-undersize", func(t *testing.T) {
 		reset(t)
-		zone := protoutil.Clone(storeCfg.DefaultZoneConfig).(*config.ZoneConfig)
+		zone := protoutil.Clone(storeCfg.DefaultZoneConfig).(*zonepb.ZoneConfig)
 		*zone.RangeMinBytes *= 2
 		lhs().SetZoneConfig(zone)
 		store.MustForceMergeScanAndProcess()
@@ -3298,7 +3309,7 @@ func TestMergeQueue(t *testing.T) {
 
 		// The ranges are individually beneath the minimum size threshold, but
 		// together they'll exceed the maximum size threshold.
-		zone := protoutil.Clone(storeCfg.DefaultZoneConfig).(*config.ZoneConfig)
+		zone := protoutil.Clone(storeCfg.DefaultZoneConfig).(*zonepb.ZoneConfig)
 		zone.RangeMinBytes = proto.Int64(lhs().GetMVCCStats().Total() + 1)
 		zone.RangeMaxBytes = proto.Int64(lhs().GetMVCCStats().Total()*2 - 1)
 		setZones(*zone)
@@ -3400,7 +3411,7 @@ func TestInvalidSubsumeRequest(t *testing.T) {
 	getSnapArgs := roachpb.SubsumeRequest{
 		RequestHeader: roachpb.RequestHeader{Key: rhsDesc.StartKey.AsRawKey()},
 		LeftDesc:      *lhsDesc,
-		RightDesc:     rhsDesc,
+		RightDesc:     *rhsDesc,
 	}
 
 	// Subsume with an incorrect RightDesc should fail.
@@ -3408,7 +3419,7 @@ func TestInvalidSubsumeRequest(t *testing.T) {
 		badRHSDesc := *rhsDesc
 		badRHSDesc.EndKey = badRHSDesc.EndKey.Next()
 		badArgs := getSnapArgs
-		badArgs.RightDesc = &badRHSDesc
+		badArgs.RightDesc = badRHSDesc
 		_, pErr := client.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{
 			RangeID: rhsDesc.RangeID,
 		}, &badArgs)

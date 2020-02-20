@@ -112,8 +112,12 @@ type optTableUpserter struct {
 	tabColIdxToRetIdx []int
 }
 
+var _ tableWriter = &optTableUpserter{}
+
 // init is part of the tableWriter interface.
-func (tu *optTableUpserter) init(txn *client.Txn, evalCtx *tree.EvalContext) error {
+func (tu *optTableUpserter) init(
+	ctx context.Context, txn *client.Txn, evalCtx *tree.EvalContext,
+) error {
 	tu.tableWriterBase.init(txn)
 	tableDesc := tu.tableDesc()
 
@@ -169,6 +173,7 @@ func (tu *optTableUpserter) init(txn *client.Txn, evalCtx *tree.EvalContext) err
 
 	var err error
 	tu.ru, err = row.MakeUpdater(
+		ctx,
 		txn,
 		tu.tableDesc(),
 		tu.fkTables,
@@ -182,7 +187,7 @@ func (tu *optTableUpserter) init(txn *client.Txn, evalCtx *tree.EvalContext) err
 	return err
 }
 
-// flushAndStartNewBatch is part of the extendedTableWriter interface.
+// flushAndStartNewBatch is part of the tableWriter interface.
 func (tu *optTableUpserter) flushAndStartNewBatch(ctx context.Context) error {
 	tu.insertRows.Clear(ctx)
 	if tu.collectRows {
@@ -293,7 +298,7 @@ func (tu *optTableUpserter) row(ctx context.Context, row tree.Datums, traceKV bo
 	)
 }
 
-// atBatchEnd is part of the extendedTableWriter interface.
+// atBatchEnd is part of the tableWriter interface.
 func (tu *optTableUpserter) atBatchEnd(ctx context.Context, traceKV bool) error {
 	// Nothing to do, because the row method does everything.
 	return nil

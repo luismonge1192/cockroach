@@ -31,7 +31,7 @@ type StoreTestingKnobs struct {
 	TxnWaitKnobs            txnwait.TestingKnobs
 	ConsistencyTestingKnobs ConsistencyTestingKnobs
 
-	// TestingRequestFilter is called before evaluating each command on a
+	// TestingRequestFilter is called before evaluating each request on a
 	// replica. The filter is run before the request acquires latches, so
 	// blocking in the filter will not block interfering requests. If it
 	// returns an error, the command will not be evaluated.
@@ -171,6 +171,10 @@ type StoreTestingKnobs struct {
 	SystemLogsGCPeriod time.Duration
 	// SystemLogsGCGCDone is used to notify when system logs GC is done.
 	SystemLogsGCGCDone chan<- struct{}
+	// DontPushOnWriteIntentError will propagate a write intent error immediately
+	// instead of utilizing the intent resolver to try to push the corresponding
+	// transaction.
+	DontPushOnWriteIntentError bool
 	// DontRetryPushTxnFailures will propagate a push txn failure immediately
 	// instead of utilizing the txn wait queue to wait for the transaction to
 	// finish or be pushed by a higher priority contender.
@@ -221,11 +225,16 @@ type StoreTestingKnobs struct {
 	// BeforeRelocateOne intercepts the return values of s.relocateOne before
 	// they're being put into effect.
 	BeforeRelocateOne func(_ []roachpb.ReplicationChange, leaseTarget *roachpb.ReplicationTarget, _ error)
-
 	// MaxApplicationBatchSize enforces a maximum size on application batches.
 	// This can be useful for testing conditions which require commands to be
 	// applied in separate batches.
 	MaxApplicationBatchSize int
+	// RangeFeedPushTxnsInterval overrides the default value for
+	// rangefeed.Config.PushTxnsInterval.
+	RangeFeedPushTxnsInterval time.Duration
+	// RangeFeedPushTxnsAge overrides the default value for
+	// rangefeed.Config.PushTxnsAge.
+	RangeFeedPushTxnsAge time.Duration
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.

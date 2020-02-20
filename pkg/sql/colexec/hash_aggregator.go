@@ -12,14 +12,12 @@ package colexec
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/errors"
 )
 
 // HashAggregator is an operator chain that performs an aggregation based on
@@ -99,37 +97,29 @@ func NewHashAggregator(
 		}
 	}
 
-	ht := makeHashTable(
+	ht := newHashTable(
 		allocator,
-		hashTableBucketSize,
+		hashTableNumBuckets,
 		colTypes,
 		groupCols,
 		outCols,
 		true, /* allowNullEquality */
 	)
 
-	builder := makeHashJoinBuilder(
-		ht,
-		hashJoinerSourceSpec{
-			source:      input,
-			eqCols:      groupCols,
-			outCols:     outCols,
-			sourceTypes: colTypes,
-		},
-	)
-
 	funcs, outTyps, err := makeAggregateFuncs(allocator, aggTyps, aggFns)
 	if err != nil {
-		return nil, err
+		return nil, errors.AssertionFailedf(
+			"this error should have been checked in isAggregateSupported\n%+v", err,
+		)
 	}
 
 	distinctCol := make([]bool, coldata.BatchSize())
 
 	grouper := &hashGrouper{
-		builder:     builder,
-		ht:          ht,
-		distinctCol: distinctCol,
-		batch:       allocator.NewMemBatch(ht.outTypes),
+		OneInputNode: NewOneInputNode(input),
+		ht:           ht,
+		distinctCol:  distinctCol,
+		batch:        allocator.NewMemBatch(ht.outTypes),
 	}
 
 	orderedAgg := &orderedAggregator{
@@ -152,8 +142,9 @@ func NewHashAggregator(
 // to the orderedAggregator based on the results of the pre-built hashTable.
 // See the description at the top of this file for more information.
 type hashGrouper struct {
-	builder *hashJoinBuilder
-	ht      *hashTable
+	OneInputNode
+
+	ht *hashTable
 
 	// sel is an ordered list of indices to select representing the input rows.
 	// This selection vector is much bigger than coldata.BatchSize() and should be
@@ -173,23 +164,10 @@ type hashGrouper struct {
 	buildFinished bool
 }
 
-var _ execinfra.OpNode = &hashGrouper{}
-
-func (op *hashGrouper) ChildCount() int {
-	return 1
-}
-
-func (op *hashGrouper) Child(nth int) execinfra.OpNode {
-	if nth == 0 {
-		return op.builder.spec.source
-	}
-	execerror.VectorizedInternalPanic(fmt.Sprintf("invalid index %d", nth))
-	// This code is unreachable, but the compiler cannot infer that.
-	return nil
-}
+var _ Operator = &hashGrouper{}
 
 func (op *hashGrouper) Init() {
-	op.builder.spec.source.Init()
+	op.input.Init()
 }
 
 func (op *hashGrouper) Next(ctx context.Context) coldata.Batch {
@@ -197,7 +175,8 @@ func (op *hashGrouper) Next(ctx context.Context) coldata.Batch {
 	// First, build the hash table.
 	if !op.buildFinished {
 		op.buildFinished = true
-		op.builder.exec(ctx)
+		op.ht.build(ctx, op.input)
+		op.ht.findSameTuples(ctx)
 	}
 
 	// The selection vector needs to be populated before any batching can be
@@ -207,8 +186,6 @@ func (op *hashGrouper) Next(ctx context.Context) coldata.Batch {
 		// vector. This vector would be an ordered list of indices indicating the
 		// ordering of the bucket-grouped rows of input. The same linked list is
 		// traversed from each head to form this ordered list.
-		headID := uint64(0)
-		curID := uint64(0)
 
 		// Since next is no longer useful and pre-allocated to the appropriate size,
 		// we can use it as the selection vector. This way we don't have to
@@ -218,15 +195,25 @@ func (op *hashGrouper) Next(ctx context.Context) coldata.Batch {
 		// size, we can use it for the distinct vector.
 		op.distinct = op.ht.visited
 
-		for i := uint64(0); i < op.ht.size; i++ {
-			op.distinct[i] = false
-			for !op.ht.head[headID] || curID == 0 {
-				op.distinct[i] = true
-				headID++
-				curID = headID
+		var selIdx uint64
+		// We calculate keyID for tuple at index i as "i+1," so we start from
+		// position 1.
+		for i, isHead := range op.ht.head[1:] {
+			if isHead {
+				// The tuple at index i is the "head" of the linked list of tuples that
+				// are the same on the grouping columns, so we will include the "head"
+				// as the first tuple of the group and then will include all other
+				// tuples that are the "same."
+				op.sel[selIdx] = uint64(i)
+				op.distinct[selIdx] = true
+				selIdx++
+				// curID value of 0 indicates the end of the linked list.
+				for curID := op.ht.same[i+1]; curID != 0; curID = op.ht.same[curID] {
+					op.sel[selIdx] = curID - 1
+					op.distinct[selIdx] = false
+					selIdx++
+				}
 			}
-			op.sel[i] = curID - 1
-			curID = op.ht.same[curID]
 		}
 	}
 
@@ -236,29 +223,30 @@ func (op *hashGrouper) Next(ctx context.Context) coldata.Batch {
 	nSelected := uint16(0)
 
 	batchEnd := op.batchStart + uint64(coldata.BatchSize())
-	if batchEnd > op.ht.size {
-		batchEnd = op.ht.size
+	if batchEnd > op.ht.vals.length {
+		batchEnd = op.ht.vals.length
 	}
 	nSelected = uint16(batchEnd - op.batchStart)
 
 	copy(op.distinctCol, op.distinct[op.batchStart:batchEnd])
 
-	for i, colIdx := range op.ht.outCols {
-		toCol := op.batch.ColVec(i)
-		fromCol := op.ht.vals[colIdx]
-		op.ht.allocator.Copy(
-			toCol,
-			coldata.CopySliceArgs{
-				SliceArgs: coldata.SliceArgs{
-					ColType:     op.ht.valTypes[op.ht.outCols[i]],
-					Src:         fromCol,
-					SrcStartIdx: op.batchStart,
-					SrcEndIdx:   batchEnd,
+	op.ht.allocator.PerformOperation(op.batch.ColVecs(), func() {
+		for i, colIdx := range op.ht.outCols {
+			toCol := op.batch.ColVec(i)
+			fromCol := op.ht.vals.colVecs[colIdx]
+			toCol.Copy(
+				coldata.CopySliceArgs{
+					SliceArgs: coldata.SliceArgs{
+						ColType:     op.ht.valTypes[op.ht.outCols[i]],
+						Src:         fromCol,
+						SrcStartIdx: op.batchStart,
+						SrcEndIdx:   batchEnd,
+					},
+					Sel64: op.sel,
 				},
-				Sel64: op.sel,
-			},
-		)
-	}
+			)
+		}
+	})
 
 	op.batchStart = batchEnd
 
@@ -270,7 +258,7 @@ func (op *hashGrouper) Next(ctx context.Context) coldata.Batch {
 // benchmarks.
 func (op *hashGrouper) reset() {
 	op.batchStart = 0
-	op.ht.size = 0
+	op.ht.vals.reset()
 	op.buildFinished = false
 }
 

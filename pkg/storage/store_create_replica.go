@@ -37,6 +37,9 @@ func (s *Store) getOrCreateReplica(
 	creatingReplica *roachpb.ReplicaDescriptor,
 	isLearner bool,
 ) (_ *Replica, created bool, _ error) {
+	if replicaID == 0 {
+		log.Fatalf(ctx, "cannot construct a Replica for range %d with 0 id", rangeID)
+	}
 	// We need a retry loop as the replica we find in the map may be in the
 	// process of being removed or may need to be removed. Retries in the loop
 	// imply that a removal is actually being carried out, not that we're waiting
@@ -85,13 +88,6 @@ func (s *Store) tryGetOrCreateReplica(
 		repl.raftMu.Lock() // not unlocked on success
 		repl.mu.Lock()
 
-		// Drop messages from replicas we know to be too old.
-		if fromReplicaIsTooOld(repl, creatingReplica) {
-			repl.mu.Unlock()
-			repl.raftMu.Unlock()
-			return nil, false, roachpb.NewReplicaTooOldError(creatingReplica.ReplicaID)
-		}
-
 		// The current replica is removed, go back around.
 		if repl.mu.destroyStatus.Removed() {
 			repl.mu.Unlock()
@@ -99,23 +95,18 @@ func (s *Store) tryGetOrCreateReplica(
 			return nil, false, errRetry
 		}
 
-		toTooOld := toReplicaIsTooOld(repl, replicaID)
-		isPreemptiveSnapshot := repl.mu.replicaID == 0 && repl.isInitializedRLocked()
-		// We need to remove preemptive snapshots when we determine that we're now a
-		// learner. Otherwise we risk appending and applying log entries while we're
-		// not a member of the range and potentially applying a merge which would be
-		// unsafe. See the comment in Replica.acquireMergeLock().
-		removePreemptiveSnapshot := isPreemptiveSnapshot && isLearner
-		// The current replica needs to be removed, remove it and go back around.
-		if toTooOld || removePreemptiveSnapshot {
+		// Drop messages from replicas we know to be too old.
+		if fromReplicaIsTooOld(repl, creatingReplica) {
+			repl.mu.Unlock()
+			repl.raftMu.Unlock()
+			return nil, false, roachpb.NewReplicaTooOldError(creatingReplica.ReplicaID)
+		}
 
-			if shouldLog := log.V(1); shouldLog && toTooOld {
+		// The current replica needs to be removed, remove it and go back around.
+		if toTooOld := repl.mu.replicaID < replicaID; toTooOld {
+			if shouldLog := log.V(1); shouldLog {
 				log.Infof(ctx, "found message for replica ID %d which is newer than %v",
 					replicaID, repl)
-			} else if shouldLog && removePreemptiveSnapshot {
-				log.Infof(ctx, "found message for replica ID %v as non-voter but "+
-					"currently not part of the range, destroying preemptive snapshot",
-					replicaID)
 			}
 
 			repl.mu.Unlock()
@@ -129,29 +120,17 @@ func (s *Store) tryGetOrCreateReplica(
 		}
 		defer repl.mu.Unlock()
 
-		// If this is intended for replicaID 0 then it's either a preemptive
-		// snapshot or a split/merge lock in which case we'll let it go through.
-		if replicaID == 0 {
-			return repl, false, nil
-		}
-		var err error
-		if repl.mu.replicaID == 0 {
-			// This message is telling us about our replica ID.
-			// This is a common case when dealing with preemptive snapshots.
-			err = repl.setReplicaIDRaftMuLockedMuLocked(repl.AnnotateCtx(ctx), replicaID)
-		} else if repl.mu.replicaID > replicaID {
+		if repl.mu.replicaID > replicaID {
 			// The sender is behind and is sending to an old replica.
 			// We could silently drop this message but this way we'll inform the
 			// sender that they may no longer exist.
-			err = roachpb.NewRangeNotFoundError(rangeID, s.StoreID())
-		} else if repl.mu.replicaID != replicaID {
+			repl.raftMu.Unlock()
+			return nil, false, &roachpb.RaftGroupDeletedError{}
+		}
+		if repl.mu.replicaID != replicaID {
 			// This case should have been caught by handleToReplicaTooOld.
 			log.Fatalf(ctx, "intended replica id %d unexpectedly does not match the current replica %v",
 				replicaID, repl)
-		}
-		if err != nil {
-			repl.raftMu.Unlock()
-			return nil, false, err
 		}
 		return repl, false, nil
 	}
@@ -163,8 +142,8 @@ func (s *Store) tryGetOrCreateReplica(
 	// Store's Range map even though we must check it again after to avoid race
 	// conditions. This double-checked locking is an optimization to avoid this
 	// work when we know the Replica should not be created ahead of time.
-	tombstoneKey := keys.RaftTombstoneKey(rangeID)
-	var tombstone roachpb.RaftTombstone
+	tombstoneKey := keys.RangeTombstoneKey(rangeID)
+	var tombstone roachpb.RangeTombstone
 	if ok, err := engine.MVCCGetProto(
 		ctx, s.Engine(), tombstoneKey, hlc.Timestamp{}, &tombstone, engine.MVCCGetOptions{},
 	); err != nil {
@@ -174,7 +153,12 @@ func (s *Store) tryGetOrCreateReplica(
 	}
 
 	// Create a new replica and lock it for raft processing.
-	repl := newReplica(rangeID, s)
+	uninitializedDesc := &roachpb.RangeDescriptor{
+		RangeID: rangeID,
+		// NB: other fields are unknown; need to populate them from
+		// snapshot.
+	}
+	repl := newUnloadedReplica(ctx, uninitializedDesc, s, replicaID)
 	repl.creatingReplica = creatingReplica
 	repl.raftMu.Lock() // not unlocked
 
@@ -187,6 +171,18 @@ func (s *Store) tryGetOrCreateReplica(
 	// Store.mu to maintain lock ordering invariant.
 	repl.mu.Lock()
 	repl.mu.tombstoneMinReplicaID = tombstone.NextReplicaID
+
+	// NB: A Replica should never be in the store's replicas map with a nil
+	// descriptor. Assign it directly here. In the case that the Replica should
+	// exist (which we confirm with another check of the Tombstone below), we'll
+	// re-initialize the replica with the same uninitializedDesc.
+	//
+	// During short window between here and call to s.unlinkReplicaByRangeIDLocked()
+	// in the failure branch below, the Replica used to have a nil descriptor and
+	// was present in the map. While it was the case that the destroy status had
+	// been set, not every code path which inspects the descriptor checks the
+	// destroy status.
+	repl.mu.state.Desc = uninitializedDesc
 	// Add the range to range map, but not replicasByKey since the range's start
 	// key is unknown. The range will be added to replicasByKey later when a
 	// snapshot is applied. After unlocking Store.mu above, another goroutine
@@ -212,7 +208,7 @@ func (s *Store) tryGetOrCreateReplica(
 			ctx, s.Engine(), tombstoneKey, hlc.Timestamp{}, &tombstone, engine.MVCCGetOptions{},
 		); err != nil {
 			return err
-		} else if ok && replicaID != 0 && replicaID < tombstone.NextReplicaID {
+		} else if ok && replicaID < tombstone.NextReplicaID {
 			return &roachpb.RaftGroupDeletedError{}
 		}
 
@@ -224,16 +220,10 @@ func (s *Store) tryGetOrCreateReplica(
 		} else if hs.Commit != 0 {
 			log.Fatalf(ctx, "found non-zero HardState.Commit on uninitialized replica %s. HS=%+v", repl, hs)
 		}
-
-		desc := &roachpb.RangeDescriptor{
-			RangeID: rangeID,
-			// NB: other fields are unknown; need to populate them from
-			// snapshot.
-		}
-		return repl.initRaftMuLockedReplicaMuLocked(desc, s.Clock(), replicaID)
+		return repl.loadRaftMuLockedReplicaMuLocked(uninitializedDesc)
 	}(); err != nil {
 		// Mark the replica as destroyed and remove it from the replicas maps to
-		// ensure nobody tries to use it
+		// ensure nobody tries to use it.
 		repl.mu.destroyStatus.Set(errors.Wrapf(err, "%s: failed to initialize", repl), destroyReasonRemoved)
 		repl.mu.Unlock()
 		s.mu.Lock()
@@ -257,15 +247,6 @@ func fromReplicaIsTooOld(toReplica *Replica, fromReplica *roachpb.ReplicaDescrip
 	desc := toReplica.mu.state.Desc
 	_, found := desc.GetReplicaDescriptorByID(fromReplica.ReplicaID)
 	return !found && fromReplica.ReplicaID < desc.NextReplicaID
-}
-
-// toReplicaIsTooOld returns true if replicaID is newer than toReplica
-// indicating that the Replica needs to be removed.
-// Assumes toReplica.mu is held.
-func toReplicaIsTooOld(toReplica *Replica, replicaID roachpb.ReplicaID) bool {
-	toReplica.mu.AssertHeld()
-	return replicaID != 0 && toReplica.mu.replicaID != 0 &&
-		toReplica.mu.replicaID < replicaID
 }
 
 // addReplicaInternalLocked adds the replica to the replicas map and the

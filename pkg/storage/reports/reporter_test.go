@@ -18,11 +18,14 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/keysutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -33,7 +36,15 @@ import (
 // Test the constraint conformance report in a real cluster.
 func TestConstraintConformanceReportIntegration(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	t.Skip("#40919")
+	if testing.Short() {
+		// This test takes seconds because of replication vagaries.
+		t.Skip("short flag")
+	}
+	if testutils.NightlyStress() && util.RaceEnabled {
+		// Under stressrace, replication changes seem to hit 1m deadline errors and
+		// don't make progress.
+		t.Skip("test too slow for stressrace")
+	}
 
 	ctx := context.Background()
 	tc := serverutils.StartTestCluster(t, 5, base.TestClusterArgs{
@@ -85,6 +96,14 @@ func TestConstraintConformanceReportIntegration(t *testing.T) {
 
 	// Wait for the violation to clear.
 	testutils.SucceedsSoon(t, func() error {
+		// Kick the replication queues, given that our rebalancing is finicky.
+		for i := 0; i < tc.NumServers(); i++ {
+			if err := tc.Server(i).GetStores().(*storage.Stores).VisitStores(func(s *storage.Store) error {
+				return s.ForceReplicationScanAndProcess()
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
 		r := db.QueryRow(
 			"select violating_ranges from system.replication_constraint_stats where zone_id = $1",
 			zoneID)
@@ -154,14 +173,14 @@ func TestCriticalLocalitiesReportIntegration(t *testing.T) {
 
 	// Collect all the zones that exist at cluster bootstrap.
 	systemZoneIDs := make([]int, 0, 10)
-	systemZones := make([]config.ZoneConfig, 0, 10)
+	systemZones := make([]zonepb.ZoneConfig, 0, 10)
 	{
 		rows, err := db.Query("select id, config from system.zones")
 		require.NoError(t, err)
 		for rows.Next() {
 			var zoneID int
 			var buf []byte
-			cfg := config.ZoneConfig{}
+			cfg := zonepb.ZoneConfig{}
 			require.NoError(t, rows.Scan(&zoneID, &buf))
 			require.NoError(t, protoutil.Unmarshal(buf, &cfg))
 			systemZoneIDs = append(systemZoneIDs, zoneID)
@@ -169,7 +188,7 @@ func TestCriticalLocalitiesReportIntegration(t *testing.T) {
 		}
 		require.NoError(t, rows.Err())
 	}
-	require.True(t, len(systemZoneIDs) > 0, "expected some system zones, got none")
+	require.Greater(t, len(systemZoneIDs), 0, "expected some system zones, got none")
 	// Remove the entries in systemZoneIDs that don't get critical locality reports.
 	i := 0
 	for j, zid := range systemZoneIDs {
@@ -376,7 +395,7 @@ func TestMeta2RangeIter(t *testing.T) {
 		}
 		numRanges++
 	}
-	require.True(t, numRanges > 20, "expected over 20 ranges, got: %d", numRanges)
+	require.Greater(t, numRanges, 20, "expected over 20 ranges, got: %d", numRanges)
 
 	// Now make an interator with a small page size and check that we get just as many ranges.
 	iter = makeMeta2RangeIter(db, 2 /* batch size */)
@@ -408,7 +427,7 @@ func TestRetriableErrorWhenGenerationReport(t *testing.T) {
 	realIter := makeMeta2RangeIter(db, 10000 /* batchSize */)
 	require.NoError(t, visitRanges(ctx, &realIter, cfg, &v))
 	expReport := v.report
-	require.True(t, len(expReport.stats) > 0, "unexpected empty report")
+	require.Greater(t, len(expReport.stats), 0, "unexpected empty report")
 
 	realIter = makeMeta2RangeIter(db, 10000 /* batchSize */)
 	errorIter := erroryRangeIterator{
@@ -417,7 +436,7 @@ func TestRetriableErrorWhenGenerationReport(t *testing.T) {
 	}
 	v = makeReplicationStatsVisitor(ctx, cfg, func(id roachpb.NodeID) bool { return true }, &saver)
 	require.NoError(t, visitRanges(ctx, &errorIter, cfg, &v))
-	require.True(t, len(v.report.stats) > 0, "unexpected empty report")
+	require.Greater(t, len(v.report.stats), 0, "unexpected empty report")
 	require.Equal(t, expReport, v.report)
 }
 
@@ -484,7 +503,7 @@ func TestZoneChecker(t *testing.T) {
 	type tc struct {
 		split          string
 		newZone        bool
-		newRootZoneCfg *config.ZoneConfig
+		newRootZoneCfg *zonepb.ZoneConfig
 		newZoneKey     ZoneKey
 	}
 	// NB: IDs need to be beyond MaxSystemConfigDescID, otherwise special logic

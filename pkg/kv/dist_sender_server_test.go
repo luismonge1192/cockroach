@@ -11,6 +11,7 @@
 package kv_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"regexp"
@@ -144,12 +145,6 @@ const (
 type checkOptions struct {
 	mode     checkResultsMode
 	expCount int
-	// If set, this represents the point where scanning stopped because
-	// StopAtRangeBoundary was set on the BatchRequest and the scanned range was
-	// exhausted (ResumeReason == RESUME_RANGE_BOUNDARY) as opposed to the scan
-	// being interrupted by MaxSpanRequestKeys).
-	// Ignored if all scans are supposed to have been satisfied.
-	nextRangeStart string
 }
 
 // checks the keys returned from a Scan/ReverseScan.
@@ -222,44 +217,24 @@ func checkResumeSpanScanResults(
 		}
 
 		// The scan is not expected to be satisfied, so there must be a resume span.
-		// If opt.nextRangeStart is set (and so the scan is supposed to have been
-		// interrupted by a range boundary), then the resume span should start there
-		// or further. If it's not set (and so the scan was interrupted because of
-		// MaxSpanRequestKeys), then the resume span should be identical to
-		// the original request if no results have been produced, or should continue
-		// after the last result otherwise.
+		// The resume span should be identical to the original request if no
+		// results have been produced, or should continue after the last result
+		// otherwise.
 		resumeKey := string(res.ResumeSpan.Key)
-		if opt.nextRangeStart != "" {
-			if res.ResumeReason != roachpb.RESUME_RANGE_BOUNDARY {
-				t.Fatalf("%s: scan %d (%s): expected resume reason RANGE_BOUNDARY but got: %s",
-					errInfo(), i, spans[i], res.ResumeReason)
-			}
-			var expResume string
-			if opt.nextRangeStart < spans[i][0] {
-				expResume = spans[i][0]
-			} else {
-				expResume = opt.nextRangeStart
-			}
-			if resumeKey != expResume {
-				t.Fatalf("%s: scan %d (%s): expected resume %q, got: %q",
-					errInfo(), i, spans[i], expResume, resumeKey)
+		if res.ResumeReason != roachpb.RESUME_KEY_LIMIT {
+			t.Fatalf("%s: scan %d (%s): unexpected resume reason %s",
+				errInfo(), i, spans[i], res.ResumeReason)
+		}
+		if rowLen == 0 {
+			if resumeKey != spans[i][0] {
+				t.Fatalf("%s: scan %d: expected resume %s, got: %s",
+					errInfo(), i, spans[i][0], resumeKey)
 			}
 		} else {
-			if res.ResumeReason != roachpb.RESUME_KEY_LIMIT {
-				t.Fatalf("%s: scan %d (%s): expected resume reason RANGE_BOUNDARY but got: %s",
-					errInfo(), i, spans[i], res.ResumeReason)
-			}
-			if rowLen == 0 {
-				if resumeKey != spans[i][0] {
-					t.Fatalf("%s: scan %d: expected resume %s, got: %s",
-						errInfo(), i, spans[i][0], resumeKey)
-				}
-			} else {
-				lastRes := expResults[i][rowLen-1]
-				if resumeKey <= lastRes {
-					t.Fatalf("%s: scan %d: expected resume %s to be above last result %s",
-						errInfo(), i, resumeKey, lastRes)
-				}
+			lastRes := expResults[i][rowLen-1]
+			if resumeKey <= lastRes {
+				t.Fatalf("%s: scan %d: expected resume %s to be above last result %s",
+					errInfo(), i, resumeKey, lastRes)
 			}
 		}
 
@@ -290,44 +265,24 @@ func checkResumeSpanReverseScanResults(
 		}
 
 		// The scan is not expected to be satisfied, so there must be a resume span.
-		// If opt.nextRangeStart is set (and so the scan is supposed to have been
-		// interrupted by a range boundary), then the resume span should start there
-		// or further. If it's not set (and so the scan was interrupted because of
-		// MaxSpanRequestKeys), then the resume span should be identical to
-		// the original request if no results have been produced, or should continue
-		// after the last result otherwise.
+		// The resume span should be identical to the original request if no
+		// results have been produced, or should continue after the last result
+		// otherwise.
 		resumeKey := string(res.ResumeSpan.EndKey)
-		if opt.nextRangeStart != "" {
-			if res.ResumeReason != roachpb.RESUME_RANGE_BOUNDARY {
-				t.Fatalf("%s: scan %d (%s): expected resume reason RANGE_BOUNDARY but got: %s",
-					errInfo(), i, spans[i], res.ResumeReason)
-			}
-			var expResume string
-			if opt.nextRangeStart > spans[i][1] {
-				expResume = spans[i][1]
-			} else {
-				expResume = opt.nextRangeStart
-			}
-			if resumeKey != expResume {
-				t.Fatalf("%s: scan %d (%s): expected resume %q, got: %q",
-					errInfo(), i, spans[i], expResume, resumeKey)
+		if res.ResumeReason != roachpb.RESUME_KEY_LIMIT {
+			t.Fatalf("%s: scan %d (%s): unexpected resume reason %s",
+				errInfo(), i, spans[i], res.ResumeReason)
+		}
+		if rowLen == 0 {
+			if resumeKey != spans[i][1] {
+				t.Fatalf("%s: scan %d (%s) expected resume %s, got: %s",
+					errInfo(), i, spans[i], spans[i][1], resumeKey)
 			}
 		} else {
-			if res.ResumeReason != roachpb.RESUME_KEY_LIMIT {
-				t.Fatalf("%s: scan %d (%s): expected resume reason RANGE_BOUNDARY but got: %s",
-					errInfo(), i, spans[i], res.ResumeReason)
-			}
-			if rowLen == 0 {
-				if resumeKey != spans[i][1] {
-					t.Fatalf("%s: scan %d (%s) expected resume %s, got: %s",
-						errInfo(), i, spans[i], spans[i][1], resumeKey)
-				}
-			} else {
-				lastRes := expResults[i][rowLen-1]
-				if resumeKey >= lastRes {
-					t.Fatalf("%s: scan %d: expected resume %s to be below last result %s",
-						errInfo(), i, resumeKey, lastRes)
-				}
+			lastRes := expResults[i][rowLen-1]
+			if resumeKey >= lastRes {
+				t.Fatalf("%s: scan %d: expected resume %s to be below last result %s",
+					errInfo(), i, resumeKey, lastRes)
 			}
 		}
 
@@ -1181,347 +1136,6 @@ func TestMultiRangeReverseScan(t *testing.T) {
 	}
 }
 
-func TestStopAtRangeBoundary(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	s, _ := startNoSplitMergeServer(t)
-	ctx := context.TODO()
-	defer s.Stopper().Stop(ctx)
-
-	db := s.DB()
-	if err := setupMultipleRanges(ctx, db, "a", "b", "c", "d", "e", "f"); err != nil {
-		t.Fatal(err)
-	}
-	for _, key := range []string{"a1", "a2", "a3", "b1", "b2", "c1", "c2", "e1", "f1", "f2", "f3"} {
-		if err := db.Put(ctx, key, "value"); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	scans := [][]string{
-		{"a", "c"},
-		{"a", "b11"},
-		// An empty span that will always be satisfied by the first scan.
-		{"a00", "a01"},
-		{"d", "g"},
-	}
-
-	type iterationExpRes struct {
-		// expResults is a map of scan index to expected results. The indexes are
-		// relative to the original scans that the test started with; an iteration
-		// might contain less scans than that if some of the original scans have
-		// been satisfied by previous iterations.
-		expResults map[int][]string
-		// satisfied contains the indexes of scans that have been satisfied by the
-		// current iteration.
-		satisfied []int
-		// expResume is set when the scan is expected to have been stopped because a
-		// range boundary was hit (i.e. ResumeReason == RESUME_RANGE_BOUNDARY) and
-		// it represents the expected resume key.
-		expResume string
-	}
-
-	testCases := []struct {
-		name       string
-		reverse    bool
-		limit      int64
-		minResults int64
-		// expResults has an entry per scans iteration (i.e. per range if minResults
-		// is not set).
-		iterResults []iterationExpRes
-	}{
-		// No limit, no minResults.
-		{
-			name:       "reverse=false,limit=0,minResults=0",
-			limit:      0,
-			minResults: 0,
-			iterResults: []iterationExpRes{
-				// scanning [a,b)
-				{
-					expResults: map[int][]string{
-						0: {"a1", "a2", "a3"},
-						1: {"a1", "a2", "a3"},
-						2: {},
-						3: {},
-					},
-					satisfied: []int{2},
-					expResume: "b",
-				},
-				// scanning [b,c)
-				{
-					expResults: map[int][]string{
-						0: {"b1", "b2"},
-						1: {"b1"},
-						3: {},
-					},
-					satisfied: []int{0, 1},
-					expResume: "c",
-				},
-				// scanning [d,e). Notice that [c,d) is expected to be skipped since no
-				// Scan needs it.
-				{
-					expResults: map[int][]string{
-						3: {},
-					},
-					expResume: "e",
-				},
-				// scanning [e,f)
-				{
-					expResults: map[int][]string{
-						3: {"e1"},
-					},
-					expResume: "f",
-				},
-				// scanning [f,g)
-				{
-					expResults: map[int][]string{
-						3: {"f1", "f2", "f3"},
-					},
-					satisfied: []int{3},
-				},
-			},
-		},
-		// No limit, minResults = 7.
-		{
-			name:       "reverse=false,limit=0,minResults=7",
-			limit:      0,
-			minResults: 7,
-			iterResults: []iterationExpRes{
-				// scanning [a,c)
-				{
-					expResults: map[int][]string{
-						0: {"a1", "a2", "a3", "b1", "b2"},
-						1: {"a1", "a2", "a3", "b1"},
-						2: {},
-						3: {},
-					},
-					satisfied: []int{0, 1, 2},
-					expResume: "c",
-				},
-				// scanning [c,inf)
-				{
-					expResults: map[int][]string{
-						3: {"e1", "f1", "f2", "f3"},
-					},
-					satisfied: []int{3},
-				},
-			},
-		},
-		// limit = 8, minResults = 7.
-		{
-			name:       "reverse=false,limit=8,minResults=7",
-			limit:      8,
-			minResults: 7,
-			iterResults: []iterationExpRes{
-				// scanning [a, <somewhere in between b anc c>)
-				{
-					expResults: map[int][]string{
-						0: {"a1", "a2", "a3", "b1", "b2"},
-						1: {"a1", "a2", "a3"},
-						2: {},
-						3: {},
-					},
-					satisfied: []int{0, 2},
-				},
-				// scanning [<where we left off>,inf)
-				{
-					expResults: map[int][]string{
-						1: {"b1"},
-						3: {"e1", "f1", "f2", "f3"},
-					},
-					satisfied: []int{1, 3},
-				},
-			},
-		},
-		// Reverse; no limit, no minResults.
-		{
-			name:       "reverse=true,limit=0,minResults=0",
-			reverse:    true,
-			limit:      0,
-			minResults: 0,
-			iterResults: []iterationExpRes{
-				// scanning [f,g)
-				{
-					expResults: map[int][]string{
-						3: {"f3", "f2", "f1"},
-					},
-					expResume: "f",
-				},
-				// scanning [e,f)
-				{
-					expResults: map[int][]string{
-						3: {"e1"},
-					},
-					expResume: "e",
-				},
-				// scanning [d,e).
-				{
-					expResults: map[int][]string{
-						3: {},
-					},
-					satisfied: []int{3},
-					expResume: "d",
-				},
-				// scanning [b,c). Notice that [c,d) is expected to be skipped.
-				{
-					expResults: map[int][]string{
-						0: {"b2", "b1"},
-						1: {"b1"},
-					},
-					expResume: "b",
-				},
-				// scanning [a,b)
-				{
-					expResults: map[int][]string{
-						0: {"a3", "a2", "a1"},
-						1: {"a3", "a2", "a1"},
-						2: {},
-					},
-					satisfied: []int{0, 1, 2},
-				},
-			},
-		},
-		// Reverse; no limit, minResults=4.
-		{
-			name:       "reverse=true,limit=0,minResults=4",
-			reverse:    true,
-			limit:      0,
-			minResults: 4,
-			iterResults: []iterationExpRes{
-				// scanning [e,f)
-				{
-					expResults: map[int][]string{
-						3: {"f3", "f2", "f1", "e1"},
-					},
-					expResume: "e",
-				},
-				// scanning [a,e).
-				{
-					expResults: map[int][]string{
-						0: {"b2", "b1", "a3", "a2", "a1"},
-						1: {"b1", "a3", "a2", "a1"},
-						2: {},
-						3: {},
-					},
-					satisfied: []int{0, 1, 2, 3},
-				},
-			},
-		},
-		// Reverse; limit=5, minResults=4.
-		{
-			name:       "reverse=true,limit=5,minResults=4",
-			reverse:    true,
-			limit:      5,
-			minResults: 4,
-			iterResults: []iterationExpRes{
-				// scanning [e,f)
-				{
-					expResults: map[int][]string{
-						3: {"f3", "f2", "f1", "e1"},
-					},
-					expResume: "e",
-				},
-				// scanning [<somewhere between a and b>,e).
-				{
-					expResults: map[int][]string{
-						0: {"b2", "b1", "a3", "a2"},
-						1: {"b1"},
-					},
-					satisfied: []int{3},
-				},
-				// scanning [a,b).
-				{
-					expResults: map[int][]string{
-						0: {"a1"},
-						1: {"a3", "a2", "a1"},
-						2: {},
-					},
-					satisfied: []int{0, 1, 2},
-				},
-			},
-		},
-	}
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			remaining := make(map[int]roachpb.Span)
-			for i, span := range scans {
-				remaining[i] = roachpb.Span{
-					Key:    roachpb.Key(span[0]),
-					EndKey: roachpb.Key(span[1]),
-				}
-			}
-
-			// Iterate until all scans are satisfied.
-			for iterIdx, iter := range tc.iterResults {
-				log.Infof(context.TODO(), "iteration: %d", iterIdx)
-				if len(remaining) == 0 {
-					t.Fatalf("scans were satisfied prematurely. Expected results: %+v", iter)
-				}
-
-				b := &client.Batch{}
-				b.Header.ScanOptions = &roachpb.ScanOptions{
-					StopAtRangeBoundary: true,
-					MinResults:          tc.minResults,
-				}
-				b.Header.MaxSpanRequestKeys = tc.limit
-
-				// Map indexes of scans in the current batch to indexes of original
-				// scans.
-				batchToOrig := make(map[int]int)
-				origToBatch := make(map[int]int)
-				var batchIdx int
-				var curScans [][]string
-				for i := 0; i < len(scans); i++ {
-					if _, ok := remaining[i]; !ok {
-						continue
-					}
-					span := remaining[i]
-					if !tc.reverse {
-						b.Scan(span.Key, span.EndKey)
-					} else {
-						b.ReverseScan(span.Key, span.EndKey)
-					}
-					curScans = append(curScans, []string{string(span.Key), string(span.EndKey)})
-					batchToOrig[batchIdx] = i
-					origToBatch[i] = batchIdx
-					batchIdx++
-				}
-				if err := db.Run(ctx, b); err != nil {
-					t.Fatal(err)
-				}
-
-				// Build the expected results.
-				var expResults [][]string
-				for i := 0; i < batchIdx; i++ {
-					expResults = append(expResults, iter.expResults[batchToOrig[i]])
-				}
-				expSatisfied := make(map[int]struct{})
-				for _, origIdx := range iter.satisfied {
-					expSatisfied[origToBatch[origIdx]] = struct{}{}
-				}
-				if !tc.reverse {
-					checkScanResults(t, curScans, b.Results, expResults, expSatisfied,
-						checkOptions{mode: Strict, nextRangeStart: iter.expResume})
-				} else {
-					checkReverseScanResults(t, curScans, b.Results, expResults, expSatisfied,
-						checkOptions{mode: Strict, nextRangeStart: iter.expResume})
-				}
-
-				// Update remaining for the next iteration; remove satisfied scans.
-				for batchIdx, res := range b.Results {
-					if res.ResumeSpan == nil {
-						delete(remaining, batchToOrig[batchIdx])
-					} else {
-						remaining[batchToOrig[batchIdx]] = *res.ResumeSpan
-					}
-				}
-			}
-			if len(remaining) != 0 {
-				t.Fatalf("not all scans were satisfied. Remaining: %+v", remaining)
-			}
-		})
-	}
-}
-
 // TestBatchPutWithConcurrentSplit creates a batch with a series of put
 // requests and splits the middle of the range in order to trigger
 // reentrant invocation of DistSender.divideAndSendBatchToRanges. See
@@ -1727,7 +1341,7 @@ func TestPropagateTxnOnError(t *testing.T) {
 		_ = txn.CommitTimestamp()
 
 		epoch++
-		proto := txn.Serialize()
+		proto := txn.TestingCloneTxn()
 		if epoch >= 2 {
 			// ObservedTimestamps must contain the timestamp returned from the
 			// Put operation.
@@ -1823,8 +1437,8 @@ func TestTxnStarvation(t *testing.T) {
 }
 
 // Test that, if the TxnCoordSender gets a TransactionAbortedError, it sends an
-// EndTransaction with Poison=true (the poisoning is so that concurrent readers
-// don't miss their writes).
+// EndTxn with Poison=true (the poisoning is so that concurrent readers don't
+// miss their writes).
 func TestAsyncAbortPoisons(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -1833,15 +1447,15 @@ func TestAsyncAbortPoisons(t *testing.T) {
 	var storeKnobs storage.StoreTestingKnobs
 	keyA, keyB := roachpb.Key("a"), roachpb.Key("b")
 	commitCh := make(chan error, 1)
-	storeKnobs.TestingRequestFilter = func(ba roachpb.BatchRequest) *roachpb.Error {
+	storeKnobs.TestingRequestFilter = func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
 		for _, req := range ba.Requests {
 			switch r := req.GetInner().(type) {
-			case *roachpb.EndTransactionRequest:
+			case *roachpb.EndTxnRequest:
 				if r.Key.Equal(keyA) {
 					if r.Poison {
 						close(commitCh)
 					} else {
-						commitCh <- fmt.Errorf("EndTransaction didn't have expected Poison flag")
+						commitCh <- fmt.Errorf("EndTxn didn't have expected Poison flag")
 					}
 				}
 			}
@@ -1857,7 +1471,7 @@ func TestAsyncAbortPoisons(t *testing.T) {
 	db := s.DB()
 
 	// Write values to key "a".
-	txn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */, client.RootTxn)
+	txn := client.NewTxn(ctx, db, 0 /* gatewayNodeID */)
 	b := txn.NewBatch()
 	b.Put(keyA, []byte("value"))
 	if err := txn.Run(ctx, b); err != nil {
@@ -1923,22 +1537,6 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 				}
 				err := roachpb.NewReadWithinUncertaintyIntervalError(
 					fArgs.Hdr.Timestamp, s.Clock().Now(), fArgs.Hdr.Txn)
-				return roachpb.NewErrorWithTxn(err, fArgs.Hdr.Txn)
-			}
-			return nil
-		}
-	}
-
-	newRetryFilter := func(
-		key roachpb.Key, reason roachpb.TransactionRetryReason,
-	) func(storagebase.FilterArgs) *roachpb.Error {
-		var count int32
-		return func(fArgs storagebase.FilterArgs) *roachpb.Error {
-			if fArgs.Req.Header().Key.Equal(key) {
-				if atomic.AddInt32(&count, 1) > 1 {
-					return nil
-				}
-				err := roachpb.NewTransactionRetryError(reason, "filter err")
 				return roachpb.NewErrorWithTxn(err, fArgs.Hdr.Txn)
 			}
 			return nil
@@ -2072,36 +1670,6 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 			// No retries, 1pc commit.
 		},
 		{
-			name: "require1PC commit with injected possible replay error",
-			retryable: func(ctx context.Context, txn *client.Txn) error {
-				b := txn.NewBatch()
-				b.Put("a", "put")
-				b.AddRawRequest(&roachpb.EndTransactionRequest{
-					Commit:     true,
-					Require1PC: true,
-				})
-				return txn.Run(ctx, b)
-			},
-			filter: newRetryFilter(roachpb.Key([]byte("a")), roachpb.RETRY_POSSIBLE_REPLAY),
-			// Expect a client retry, which should succeed.
-			clientRetry: true,
-		},
-		{
-			name: "require1PC commit with injected serializable error",
-			retryable: func(ctx context.Context, txn *client.Txn) error {
-				b := txn.NewBatch()
-				b.Put("a", "put")
-				b.AddRawRequest(&roachpb.EndTransactionRequest{
-					Commit:     true,
-					Require1PC: true,
-				})
-				return txn.Run(ctx, b)
-			},
-			filter: newRetryFilter(roachpb.Key([]byte("a")), roachpb.RETRY_SERIALIZABLE),
-			// Expect a transaction coord retry, which should succeed.
-			txnCoordRetry: true,
-		},
-		{
 			// If we've exhausted the limit for tracking refresh spans but we
 			// already refreshed, keep running the txn.
 			name: "forwarded timestamp with too many refreshes, read only",
@@ -2206,19 +1774,6 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 			txnCoordRetry: true,
 		},
 		{
-			name: "deferred write too old with put",
-			afterTxnStart: func(ctx context.Context, db *client.DB) error {
-				return db.Put(ctx, "a", "put")
-			},
-			retryable: func(ctx context.Context, txn *client.Txn) error {
-				b := txn.NewBatch()
-				b.Header.DeferWriteTooOldError = true
-				b.Put("a", "put")
-				return txn.Run(ctx, b)
-			},
-			// This trivially succeeds as there are no refresh spans.
-		},
-		{
 			name: "write too old with put timestamp leaked",
 			afterTxnStart: func(ctx context.Context, db *client.DB) error {
 				return db.Put(ctx, "a", "put")
@@ -2236,7 +1791,7 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 			},
 			retryable: func(ctx context.Context, txn *client.Txn) error {
 				if _, err := txn.Get(ctx, "b"); err != nil {
-					return nil
+					return err
 				}
 				return txn.Put(ctx, "a", "put")
 			},
@@ -2249,7 +1804,7 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 			},
 			retryable: func(ctx context.Context, txn *client.Txn) error {
 				if _, err := txn.Get(ctx, "a"); err != nil {
-					return nil
+					return err
 				}
 				return txn.Put(ctx, "a", "put")
 			},
@@ -2263,7 +1818,7 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 			retryable: func(ctx context.Context, txn *client.Txn) error {
 				// Get so we must refresh when txn timestamp moves forward.
 				if _, err := txn.Get(ctx, "a"); err != nil {
-					return nil
+					return err
 				}
 				// Now, Put a new value to "a" out of band from the txn.
 				if err := txn.DB().Put(ctx, "a", "value2"); err != nil {
@@ -2427,6 +1982,9 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 			expFailure:    "unexpected value", // condition failed error when failing on tombstones
 		},
 		{
+			// This test sends a 1PC batch with Put+EndTxn.
+			// The Put gets a write too old error but, since there's no refresh spans,
+			// the commit succeeds.
 			name: "write too old with put in batch commit",
 			afterTxnStart: func(ctx context.Context, db *client.DB) error {
 				return db.Put(ctx, "a", "put")
@@ -2437,6 +1995,31 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 				return txn.CommitInBatch(ctx, b) // will be a 1PC, won't get auto retry
 			},
 			// No retries, 1pc commit.
+		},
+		{
+			// This test is like the previous one in that the commit batch succeeds at
+			// an updated timestamp, but this time the EndTxn puts the
+			// transaction in the STAGING state instead of COMMITTED because there had
+			// been previous write in a different batch. Like above, the commit is
+			// successful since there are no refresh spans (the request will succeed
+			// after a server-side refresh).
+			name: "write too old in staging commit",
+			beforeTxnStart: func(ctx context.Context, db *client.DB) error {
+				return db.Put(ctx, "a", "orig")
+			},
+			afterTxnStart: func(ctx context.Context, db *client.DB) error {
+				return db.Put(ctx, "a", "put")
+			},
+			retryable: func(ctx context.Context, txn *client.Txn) error {
+				if err := txn.Put(ctx, "another", "another put"); err != nil {
+					return err
+				}
+				b := txn.NewBatch()
+				b.Put("a", "final value")
+				return txn.CommitInBatch(ctx, b)
+			},
+			// The request will succeed after a server-side refresh.
+			txnCoordRetry: false,
 		},
 		{
 			name: "write too old with cput in batch commit",
@@ -2451,7 +2034,28 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 				b.CPut("a", "cput", strToValue("put"))
 				return txn.CommitInBatch(ctx, b) // will be a 1PC, won't get auto retry
 			},
-			// No retries, 1pc commit.
+			// No client-side retries, 1PC commit. On the server-side, the batch is
+			// evaluated twice: once at the original timestamp, where it gets a
+			// WriteTooOldError, and then once at the pushed timestamp. The
+			// server-side retry is enabled by the fact that there have not been any
+			// previous reads and so the transaction can commit at a pushed timestamp.
+		},
+		{
+			// This test is like the previous one, except the 1PC batch cannot commit
+			// at the updated timestamp.
+			name: "write too old with failed cput in batch commit",
+			beforeTxnStart: func(ctx context.Context, db *client.DB) error {
+				return db.Put(ctx, "a", "orig")
+			},
+			afterTxnStart: func(ctx context.Context, db *client.DB) error {
+				return db.Put(ctx, "a", "put")
+			},
+			retryable: func(ctx context.Context, txn *client.Txn) error {
+				b := txn.NewBatch()
+				b.CPut("a", "cput", strToValue("orig"))
+				return txn.CommitInBatch(ctx, b) // will be a 1PC, won't get auto retry
+			},
+			expFailure: "unexpected value", // The CPut cannot succeed.
 		},
 		{
 			name: "multi-range batch with forwarded timestamp",
@@ -2534,20 +2138,6 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 			txnCoordRetry: true,
 		},
 		{
-			name: "multi-range batch with deferred write too old",
-			afterTxnStart: func(ctx context.Context, db *client.DB) error {
-				return db.Put(ctx, "c", "value")
-			},
-			retryable: func(ctx context.Context, txn *client.Txn) error {
-				b := txn.NewBatch()
-				b.Header.DeferWriteTooOldError = true
-				b.Put("a", "put")
-				b.Put("c", "put")
-				return txn.CommitInBatch(ctx, b) // both puts will succeed, et will retry
-			},
-			txnCoordRetry: true,
-		},
-		{
 			name: "multi-range batch with write too old and failed cput",
 			beforeTxnStart: func(ctx context.Context, db *client.DB) error {
 				return db.Put(ctx, "a", "orig")
@@ -2578,42 +2168,45 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 				b.Put("c", "put")
 				return txn.CommitInBatch(ctx, b)
 			},
-			txnCoordRetry: true,
+			// We expect the request to succeed after a server-side retry.
+			txnCoordRetry: false,
 		},
 		{
-			name: "multi-range batch with deferred write too old and failed cput",
-			beforeTxnStart: func(ctx context.Context, db *client.DB) error {
-				return db.Put(ctx, "a", "orig")
-			},
+			// This test checks the behavior of batches that were split by the
+			// DistSender. We'll check that the whole batch is retried after a
+			// successful refresh, and that previously-successful prefix sub-batches
+			// are not refreshed (but are retried instead).
+			name: "multi-range with scan getting updated results after refresh",
 			afterTxnStart: func(ctx context.Context, db *client.DB) error {
-				return db.Put(ctx, "a", "value")
+				// Write to "a". This value will not be seen by the Get the first time
+				// it's evaluated, but it will be see when it's retried at a bumped
+				// timestamp. In particular, this verifies that the get is not
+				// refreshed, for this would fail (and lead to a client-side retry
+				// instead of one at the txn coord sender).
+				if err := db.Put(ctx, "a", "newval"); err != nil {
+					return err
+				}
+				// "b" is on a different range, so this put will cause a
+				// WriteTooOldError on the 2nd sub-batch. The error will cause a
+				// refresh.
+				return db.Put(ctx, "b", "newval2")
 			},
 			retryable: func(ctx context.Context, txn *client.Txn) error {
 				b := txn.NewBatch()
-				b.Header.DeferWriteTooOldError = true
-				b.CPut("a", "cput", strToValue("orig"))
-				b.Put("c", "put")
-				return txn.CommitInBatch(ctx, b)
+				b.Get("a")
+				b.Put("b", "put2")
+				err := txn.Run(ctx, b)
+				if err != nil {
+					return err
+				}
+				gr := b.RawResponse().Responses[0].GetGet()
+				if b, err := gr.Value.GetBytes(); err != nil {
+					return err
+				} else if !bytes.Equal(b, []byte("newval")) {
+					return fmt.Errorf("expected \"newval\", got: %v", b)
+				}
+				return txn.Commit(ctx)
 			},
-			txnCoordRetry: false,              // non-matching value means we fail txn coord retry
-			expFailure:    "unexpected value", // the failure we get is a condition failed error
-		},
-		{
-			name: "multi-range batch with deferred write too old and successful cput",
-			beforeTxnStart: func(ctx context.Context, db *client.DB) error {
-				return db.Put(ctx, "a", "orig")
-			},
-			afterTxnStart: func(ctx context.Context, db *client.DB) error {
-				return db.Put(ctx, "a", "orig")
-			},
-			retryable: func(ctx context.Context, txn *client.Txn) error {
-				b := txn.NewBatch()
-				b.Header.DeferWriteTooOldError = true
-				b.CPut("a", "cput", strToValue("orig"))
-				b.Put("c", "put")
-				return txn.CommitInBatch(ctx, b)
-			},
-			// Expect a transaction coord retry, which should succeed.
 			txnCoordRetry: true,
 		},
 		{
@@ -2769,7 +2362,7 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 					RequestHeader: roachpb.RequestHeader{
 						Key: roachpb.Key("a"),
 					},
-					IntentTxn: txn.Serialize().TxnMeta,
+					IntentTxn: txn.TestingCloneTxn().TxnMeta,
 					Status:    roachpb.ABORTED,
 				})
 				if _, pErr := txn.DB().NonTransactionalSender().Send(ctx, ba); pErr != nil {
@@ -2795,7 +2388,7 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 					RequestHeader: roachpb.RequestHeader{
 						Key: roachpb.Key("a"),
 					},
-					IntentTxn: txn.Serialize().TxnMeta,
+					IntentTxn: txn.TestingCloneTxn().TxnMeta,
 					Status:    roachpb.ABORTED,
 				})
 				if _, pErr := txn.DB().NonTransactionalSender().Send(ctx, ba); pErr != nil {

@@ -10,6 +10,7 @@ package importccl
 
 import (
 	"context"
+	"io/ioutil"
 	"math"
 	"sort"
 	"strconv"
@@ -29,7 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
@@ -63,7 +63,20 @@ const (
 	pgCopyDelimiter = "delimiter"
 	pgCopyNull      = "nullif"
 
-	pgMaxRowSize = "max_row_size"
+	optMaxRowSize = "max_row_size"
+
+	// Turn on strict validation when importing avro records.
+	avroStrict = "strict_validation"
+	// Default input format is assumed to be OCF (object container file).
+	// This default can be changed by specified either of these options.
+	avroBinRecords  = "data_as_binary_records"
+	avroJSONRecords = "data_as_json_records"
+	// Record separator; default "\n"
+	avroRecordsSeparatedBy = "records_terminated_by"
+	// If we are importing avro records (binary or JSON), we must specify schema
+	// as either an inline JSON schema, or an external schema URI.
+	avroSchema    = "schema"
+	avroSchemaURI = "schema_uri"
 )
 
 var importOptionExpectValues = map[string]sql.KVStringOptValidate{
@@ -86,7 +99,14 @@ var importOptionExpectValues = map[string]sql.KVStringOptValidate{
 	importOptionSkipFKs:          sql.KVStringOptRequireNoValue,
 	importOptionDisableGlobMatch: sql.KVStringOptRequireNoValue,
 
-	pgMaxRowSize: sql.KVStringOptRequireValue,
+	optMaxRowSize: sql.KVStringOptRequireValue,
+
+	avroStrict:             sql.KVStringOptRequireNoValue,
+	avroSchema:             sql.KVStringOptRequireValue,
+	avroSchemaURI:          sql.KVStringOptRequireValue,
+	avroRecordsSeparatedBy: sql.KVStringOptRequireValue,
+	avroBinRecords:         sql.KVStringOptRequireNoValue,
+	avroJSONRecords:        sql.KVStringOptRequireNoValue,
 }
 
 func importJobDescription(
@@ -101,7 +121,7 @@ func importJobDescription(
 	stmt.CreateDefs = defs
 	stmt.Files = nil
 	for _, file := range files {
-		clean, err := cloud.SanitizeExternalStorageURI(file)
+		clean, err := cloud.SanitizeExternalStorageURI(file, nil /* extraParams */)
 		if err != nil {
 			return "", err
 		}
@@ -187,7 +207,7 @@ func importPlanHook(
 					if err != nil {
 						return err
 					}
-					expandedFiles, err := s.ListFiles(ctx)
+					expandedFiles, err := s.ListFiles(ctx, "")
 					if err != nil {
 						return err
 					}
@@ -218,7 +238,15 @@ func importPlanHook(
 				return pgerror.Newf(pgcode.UndefinedObject,
 					"database does not exist: %q", table)
 			}
-			parentID = descI.(*sqlbase.DatabaseDescriptor).ID
+			dbDesc := descI.(*sqlbase.DatabaseDescriptor)
+			// If this is a non-INTO import that will thus be making a new table, we
+			// need the CREATE priv in the target DB.
+			if !importStmt.Into {
+				if err := p.CheckPrivilege(ctx, dbDesc, privilege.CREATE); err != nil {
+					return err
+				}
+			}
+			parentID = dbDesc.ID
 		} else {
 			// No target table means we're importing whatever we find into the session
 			// database, so it must exist.
@@ -226,6 +254,13 @@ func importPlanHook(
 			if err != nil {
 				return pgerror.Wrap(err, pgcode.UndefinedObject,
 					"could not resolve current database")
+			}
+			// If this is a non-INTO import that will thus be making a new table, we
+			// need the CREATE priv in the target DB.
+			if !importStmt.Into {
+				if err := p.CheckPrivilege(ctx, dbDesc, privilege.CREATE); err != nil {
+					return err
+				}
 			}
 			parentID = dbDesc.ID
 		}
@@ -351,13 +386,13 @@ func importPlanHook(
 				format.PgCopy.Null = override
 			}
 			maxRowSize := int32(defaultScanBuffer)
-			if override, ok := opts[pgMaxRowSize]; ok {
+			if override, ok := opts[optMaxRowSize]; ok {
 				sz, err := humanizeutil.ParseBytes(override)
 				if err != nil {
 					return err
 				}
 				if sz < 1 || sz > math.MaxInt32 {
-					return errors.Errorf("%s out of range: %d", pgMaxRowSize, sz)
+					return errors.Errorf("%d out of range: %d", maxRowSize, sz)
 				}
 				maxRowSize = int32(sz)
 			}
@@ -366,17 +401,22 @@ func importPlanHook(
 			telemetry.Count("import.format.pgdump")
 			format.Format = roachpb.IOFileFormat_PgDump
 			maxRowSize := int32(defaultScanBuffer)
-			if override, ok := opts[pgMaxRowSize]; ok {
+			if override, ok := opts[optMaxRowSize]; ok {
 				sz, err := humanizeutil.ParseBytes(override)
 				if err != nil {
 					return err
 				}
 				if sz < 1 || sz > math.MaxInt32 {
-					return errors.Errorf("%s out of range: %d", pgMaxRowSize, sz)
+					return errors.Errorf("%d out of range: %d", maxRowSize, sz)
 				}
 				maxRowSize = int32(sz)
 			}
 			format.PgDump.MaxRowSize = maxRowSize
+		case "AVRO":
+			err := parseAvroOptions(ctx, opts, p, &format)
+			if err != nil {
+				return err
+			}
 		default:
 			return unimplemented.Newf("import.format", "unsupported import format: %q", importStmt.FileFormat)
 		}
@@ -445,6 +485,11 @@ func importPlanHook(
 			// - Write _a lot_ of tests.
 			found, err := p.ResolveMutableTableDescriptor(ctx, table, true, sql.ResolveRequireTableDesc)
 			if err != nil {
+				return err
+			}
+
+			// TODO(dt): checking *CREATE* on an *existing table* is weird.
+			if err := p.CheckPrivilege(ctx, found, privilege.CREATE); err != nil {
 				return err
 			}
 
@@ -596,14 +641,93 @@ func importPlanHook(
 	return fn, backupccl.RestoreHeader, nil, false, nil
 }
 
+func parseAvroOptions(
+	ctx context.Context, opts map[string]string, p sql.PlanHookState, format *roachpb.IOFileFormat,
+) error {
+	telemetry.Count("import.format.avro")
+	format.Format = roachpb.IOFileFormat_Avro
+
+	// Default input format is OCF.
+	format.Avro.Format = roachpb.AvroOptions_OCF
+	_, format.Avro.StrictMode = opts[avroStrict]
+
+	_, haveBinRecs := opts[avroBinRecords]
+	_, haveJSONRecs := opts[avroJSONRecords]
+
+	if haveBinRecs && haveJSONRecs {
+		return errors.Errorf("only one of the %s or %s options can be set", avroBinRecords, avroJSONRecords)
+	}
+
+	if haveBinRecs || haveJSONRecs {
+		// Input is a "records" format.
+		if haveBinRecs {
+			format.Avro.Format = roachpb.AvroOptions_BIN_RECORDS
+		} else {
+			format.Avro.Format = roachpb.AvroOptions_JSON_RECORDS
+		}
+
+		// Set record separator.
+		format.Avro.RecordSeparator = '\n'
+		if override, ok := opts[avroRecordsSeparatedBy]; ok {
+			c, err := util.GetSingleRune(override)
+			if err != nil {
+				return pgerror.Wrapf(err, pgcode.Syntax,
+					"invalid %q value", avroRecordsSeparatedBy)
+			}
+			format.Avro.RecordSeparator = c
+		}
+
+		// See if inline schema is specified.
+		format.Avro.SchemaJSON = opts[avroSchema]
+
+		if len(format.Avro.SchemaJSON) == 0 {
+			// Inline schema not set; We must have external schema.
+			uri, ok := opts[avroSchemaURI]
+			if !ok {
+				return errors.Errorf(
+					"either %s or %s option must be set when importing avro record files", avroSchema, avroSchemaURI)
+			}
+
+			store, err := p.ExecCfg().DistSQLSrv.ExternalStorageFromURI(ctx, uri)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+
+			raw, err := store.ReadFile(ctx, "")
+			if err != nil {
+				return err
+			}
+			defer raw.Close()
+			schemaBytes, err := ioutil.ReadAll(raw)
+			if err != nil {
+				return err
+			}
+			format.Avro.SchemaJSON = string(schemaBytes)
+		}
+
+		if override, ok := opts[optMaxRowSize]; ok {
+			sz, err := humanizeutil.ParseBytes(override)
+			if err != nil {
+				return err
+			}
+			if sz < 1 || sz > math.MaxInt32 {
+				return errors.Errorf("%s out of range: %d", override, sz)
+			}
+			format.Avro.MaxRecordSize = int32(sz)
+		}
+	}
+	return nil
+}
+
 type importResumer struct {
-	job            *jobs.Job
-	settings       *cluster.Settings
-	res            roachpb.BulkOpSummary
-	statsRefresher *stats.Refresher
+	job      *jobs.Job
+	settings *cluster.Settings
+	res      roachpb.BulkOpSummary
 
 	testingKnobs struct {
-		afterImport func() error
+		afterImport            func(summary roachpb.BulkOpSummary) error
+		alwaysFlushJobProgress bool
 	}
 }
 
@@ -667,7 +791,7 @@ func prepareNewTableDescsForIngestion(
 	// Write the new TableDescriptors and flip the namespace entries over to
 	// them. After this call, any queries on a table will be served by the newly
 	// imported data.
-	if err := backupccl.WriteTableDescs(ctx, txn, nil, tableDescs, p.User(), p.ExecCfg().Settings, seqValKVs); err != nil {
+	if err := backupccl.WriteTableDescs(ctx, txn, nil /* databases */, tableDescs, tree.RequestedDescriptors, p.User(), p.ExecCfg().Settings, seqValKVs); err != nil {
 		return nil, errors.Wrapf(err, "creating tables")
 	}
 
@@ -680,10 +804,6 @@ func prepareExistingTableDescForIngestion(
 ) (*sqlbase.TableDescriptor, error) {
 	if len(desc.Mutations) > 0 {
 		return nil, errors.Errorf("cannot IMPORT INTO a table with schema changes in progress -- try again later (pending mutation %s)", desc.Mutations[0].String())
-	}
-
-	if err := p.CheckPrivilege(ctx, desc, privilege.CREATE); err != nil {
-		return nil, err
 	}
 
 	// TODO(dt): Ensure no other schema changes can start during ingest.
@@ -731,6 +851,7 @@ func (r *importResumer) prepareTableDescsForIngestion(
 	ctx context.Context, p sql.PlanHookState, details jobspb.ImportDetails,
 ) error {
 	err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+
 		importDetails := details
 		importDetails.Tables = make([]jobspb.ImportDetails_Table, len(details.Tables))
 
@@ -849,18 +970,108 @@ func (r *importResumer) Resume(
 	files := details.URIs
 	format := details.Format
 
-	res, err := sql.DistIngest(ctx, p, r.job, tables, files, format, walltime)
+	res, err := sql.DistIngest(ctx, p, r.job, tables, files, format, walltime, r.testingKnobs.alwaysFlushJobProgress)
 	if err != nil {
 		return err
 	}
 	if r.testingKnobs.afterImport != nil {
-		if err := r.testingKnobs.afterImport(); err != nil {
+		if err := r.testingKnobs.afterImport(res); err != nil {
 			return err
 		}
 	}
-
 	r.res = res
-	r.statsRefresher = p.ExecCfg().StatsRefresher
+
+	if err := r.publishTables(ctx, p.ExecCfg()); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// publishTables updates the status of imported tables from OFFLINE to PUBLIC.
+func (r *importResumer) publishTables(ctx context.Context, execCfg *sql.ExecutorConfig) error {
+	details := r.job.Details().(jobspb.ImportDetails)
+	// Tables should only be published once.
+	if details.TablesPublished {
+		return nil
+	}
+	log.Event(ctx, "making tables live")
+
+	// Needed to trigger the schema change manager.
+	err := execCfg.DB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+		if err := txn.SetSystemConfigTrigger(); err != nil {
+			return err
+		}
+		b := txn.NewBatch()
+		for _, tbl := range details.Tables {
+			tableDesc := *tbl.Desc
+			tableDesc.Version++
+			tableDesc.State = sqlbase.TableDescriptor_PUBLIC
+
+			if !tbl.IsNew {
+				// NB: This is not using AllNonDropIndexes or directly mutating the
+				// constraints returned by the other usual helpers because we need to
+				// replace the `OutboundFKs` and `Checks` slices of tableDesc with copies
+				// that we can mutate. We need to do that because tableDesc is a shallow
+				// copy of tbl.Desc that we'll be asserting is the current version when we
+				// CPut below.
+				//
+				// Set FK constraints to unvalidated before publishing the table imported
+				// into.
+				tableDesc.OutboundFKs = make([]sqlbase.ForeignKeyConstraint, len(tableDesc.OutboundFKs))
+				copy(tableDesc.OutboundFKs, tbl.Desc.OutboundFKs)
+				for i := range tableDesc.OutboundFKs {
+					tableDesc.OutboundFKs[i].Validity = sqlbase.ConstraintValidity_Unvalidated
+				}
+
+				// Set CHECK constraints to unvalidated before publishing the table imported into.
+				tableDesc.Checks = make([]*sqlbase.TableDescriptor_CheckConstraint, len(tbl.Desc.Checks))
+				for i, c := range tbl.Desc.AllActiveAndInactiveChecks() {
+					ck := *c
+					ck.Validity = sqlbase.ConstraintValidity_Unvalidated
+					tableDesc.Checks[i] = &ck
+				}
+			}
+
+			// TODO(dt): re-validate any FKs?
+			// Note that this CPut is safe with respect to mixed-version descriptor
+			// upgrade and downgrade, because IMPORT does not operate in mixed-version
+			// states.
+			// TODO(jordan,lucy): remove this comment once 19.2 is released.
+			existingDesc, err := sqlbase.ConditionalGetTableDescFromTxn(ctx, txn, tbl.Desc)
+			if err != nil {
+				return errors.Wrap(err, "publishing tables")
+			}
+			b.CPut(
+				sqlbase.MakeDescMetadataKey(tableDesc.ID),
+				sqlbase.WrapDescriptor(&tableDesc),
+				existingDesc)
+		}
+		if err := txn.Run(ctx, b); err != nil {
+			return errors.Wrap(err, "publishing tables")
+		}
+
+		// Update job record to mark tables published state as complete.
+		details.TablesPublished = true
+		err := r.job.WithTxn(txn).SetDetails(ctx, details)
+		if err != nil {
+			return errors.Wrap(err, "updating job details after publishing tables")
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return err
+	}
+
+	// Initiate a run of CREATE STATISTICS. We don't know the actual number of
+	// rows affected per table, so we use a large number because we want to make
+	// sure that stats always get created/refreshed here.
+	for i := range details.Tables {
+		execCfg.StatsRefresher.NotifyMutation(details.Tables[i].Desc.ID, math.MaxInt32 /* rowsAffected */)
+	}
+
 	return nil
 }
 
@@ -868,7 +1079,12 @@ func (r *importResumer) Resume(
 // been committed from a import that has failed or been canceled. It does this
 // by adding the table descriptors in DROP state, which causes the schema change
 // stuff to delete the keys in the background.
-func (r *importResumer) OnFailOrCancel(ctx context.Context, txn *client.Txn) error {
+func (r *importResumer) OnFailOrCancel(ctx context.Context, phs interface{}) error {
+	return phs.(sql.PlanHookState).ExecCfg().DB.Txn(ctx, r.dropTables)
+}
+
+// dropTables implements the OnFailOrCancel logic.
+func (r *importResumer) dropTables(ctx context.Context, txn *client.Txn) error {
 	details := r.job.Details().(jobspb.ImportDetails)
 
 	// Needed to trigger the schema change manager.
@@ -922,10 +1138,10 @@ func (r *importResumer) OnFailOrCancel(ctx context.Context, txn *client.Txn) err
 			// possible. This is safe since the table data was never visible to users,
 			// and so we don't need to preserve MVCC semantics.
 			tableDesc.DropTime = 1
-			var existingIDVal roachpb.Value
-			existingIDVal.SetInt(int64(tableDesc.ID))
-			tKey := sqlbase.NewTableKey(tableDesc.ParentID, tableDesc.Name)
-			b.CPut(tKey.Key(), nil, &existingIDVal)
+			err := sqlbase.RemovePublicTableNamespaceEntry(ctx, txn, tableDesc.ParentID, tableDesc.Name)
+			if err != nil {
+				return err
+			}
 		} else {
 			// IMPORT did not create this table, so we should not drop it.
 			tableDesc.State = sqlbase.TableDescriptor_PUBLIC
@@ -948,69 +1164,6 @@ func (r *importResumer) OnFailOrCancel(ctx context.Context, txn *client.Txn) err
 
 // OnSuccess is part of the jobs.Resumer interface.
 func (r *importResumer) OnSuccess(ctx context.Context, txn *client.Txn) error {
-	log.Event(ctx, "making tables live")
-	details := r.job.Details().(jobspb.ImportDetails)
-
-	// Needed to trigger the schema change manager.
-	if err := txn.SetSystemConfigTrigger(); err != nil {
-		return err
-	}
-	b := txn.NewBatch()
-	for _, tbl := range details.Tables {
-		tableDesc := *tbl.Desc
-		tableDesc.Version++
-		tableDesc.State = sqlbase.TableDescriptor_PUBLIC
-
-		if !tbl.IsNew {
-			// NB: This is not using AllNonDropIndexes or directly mutating the
-			// constraints returned by the other usual helpers because we need to
-			// replace the `OutboundFKs` and `Checks` slices of tableDesc with copies
-			// that we can mutate. We need to do that because tableDesc is a shallow
-			// copy of tbl.Desc that we'll be asserting is the current version when we
-			// CPut below.
-			//
-			// Set FK constraints to unvalidated before publishing the table imported
-			// into.
-			tableDesc.OutboundFKs = make([]sqlbase.ForeignKeyConstraint, len(tableDesc.OutboundFKs))
-			copy(tableDesc.OutboundFKs, tbl.Desc.OutboundFKs)
-			for i := range tableDesc.OutboundFKs {
-				tableDesc.OutboundFKs[i].Validity = sqlbase.ConstraintValidity_Unvalidated
-			}
-
-			// Set CHECK constraints to unvalidated before publishing the table imported into.
-			tableDesc.Checks = make([]*sqlbase.TableDescriptor_CheckConstraint, len(tbl.Desc.Checks))
-			for i, c := range tbl.Desc.AllActiveAndInactiveChecks() {
-				ck := *c
-				ck.Validity = sqlbase.ConstraintValidity_Unvalidated
-				tableDesc.Checks[i] = &ck
-			}
-		}
-
-		// TODO(dt): re-validate any FKs?
-		// Note that this CPut is safe with respect to mixed-version descriptor
-		// upgrade and downgrade, because IMPORT does not operate in mixed-version
-		// states.
-		// TODO(jordan,lucy): remove this comment once 19.2 is released.
-		existingDesc, err := sqlbase.ConditionalGetTableDescFromTxn(ctx, txn, tbl.Desc)
-		if err != nil {
-			return errors.Wrap(err, "publishing tables")
-		}
-		b.CPut(
-			sqlbase.MakeDescMetadataKey(tableDesc.ID),
-			sqlbase.WrapDescriptor(&tableDesc),
-			existingDesc)
-	}
-	if err := txn.Run(ctx, b); err != nil {
-		return errors.Wrap(err, "publishing tables")
-	}
-
-	// Initiate a run of CREATE STATISTICS. We don't know the actual number of
-	// rows affected per table, so we use a large number because we want to make
-	// sure that stats always get created/refreshed here.
-	for i := range details.Tables {
-		r.statsRefresher.NotifyMutation(details.Tables[i].Desc.ID, math.MaxInt32 /* rowsAffected */)
-	}
-
 	return nil
 }
 
@@ -1029,7 +1182,6 @@ func (r *importResumer) OnTerminal(
 			tree.NewDFloat(tree.DFloat(1.0)),
 			tree.NewDInt(tree.DInt(r.res.Rows)),
 			tree.NewDInt(tree.DInt(r.res.IndexEntries)),
-			tree.NewDInt(tree.DInt(r.res.SystemRecords)),
 			tree.NewDInt(tree.DInt(r.res.DataSize)),
 		}
 	}

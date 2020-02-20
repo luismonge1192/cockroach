@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -53,6 +54,7 @@ type mysqldumpReader struct {
 var _ inputConverter = &mysqldumpReader{}
 
 func newMysqldumpReader(
+	ctx context.Context,
 	kvCh chan row.KVBatch,
 	tables map[string]*execinfrapb.ReadImportDataSpec_ImportTable,
 	evalCtx *tree.EvalContext,
@@ -65,7 +67,7 @@ func newMysqldumpReader(
 			converters[name] = nil
 			continue
 		}
-		conv, err := row.NewDatumRowConverter(table.Desc, nil /* targetColNames */, evalCtx, kvCh)
+		conv, err := row.NewDatumRowConverter(ctx, table.Desc, nil /* targetColNames */, evalCtx, kvCh)
 		if err != nil {
 			return nil, err
 		}
@@ -104,6 +106,9 @@ func (m *mysqldumpReader) readFile(
 	for _, conv := range m.tables {
 		conv.KvBatch.Source = inputIdx
 		conv.FractionFn = input.ReadFraction
+		conv.CompletedRowFn = func() int64 {
+			return count
+		}
 	}
 
 	for {
@@ -138,6 +143,10 @@ func (m *mysqldumpReader) readFile(
 			startingCount := count
 			for _, inputRow := range rows {
 				count++
+
+				if count <= resumePos {
+					continue
+				}
 				if expected, got := len(conv.VisibleCols), len(inputRow); expected != got {
 					return errors.Errorf("expected %d values, got %d: %v", expected, got, inputRow)
 				}
@@ -210,11 +219,15 @@ func mysqlValueToDatum(
 					}
 				}
 			}
-			return tree.ParseStringAs(desired, s, evalContext)
+			// This uses ParseDatumStringAsWithRawBytes instead of ParseDatumStringAs since mysql emits
+			// raw byte strings that do not use the same escaping as our ParseBytes
+			// function expects, and the difference between ParseStringAs and
+			// ParseDatumStringAs is whether or not it attempts to parse bytes.
+			return sqlbase.ParseDatumStringAsWithRawBytes(desired, s, evalContext)
 		case mysql.IntVal:
-			return tree.ParseStringAs(desired, string(v.Val), evalContext)
+			return sqlbase.ParseDatumStringAs(desired, string(v.Val), evalContext)
 		case mysql.FloatVal:
-			return tree.ParseStringAs(desired, string(v.Val), evalContext)
+			return sqlbase.ParseDatumStringAs(desired, string(v.Val), evalContext)
 		case mysql.HexVal:
 			v, err := v.HexDecode()
 			return tree.NewDBytes(tree.DBytes(v)), err
@@ -394,11 +407,27 @@ func mysqlTableToCockroach(
 		if p != nil {
 			params := p.RunParams(ctx)
 			desc, err = sql.MakeSequenceTableDesc(
-				seqName, opts, parentID, id, time, priv, &params,
+				seqName,
+				opts,
+				parentID,
+				keys.PublicSchemaID,
+				id,
+				time,
+				priv,
+				false, /* temporary */
+				&params,
 			)
 		} else {
 			desc, err = sql.MakeSequenceTableDesc(
-				seqName, opts, parentID, id, time, priv, nil, /* params */
+				seqName,
+				opts,
+				parentID,
+				keys.PublicSchemaID,
+				id,
+				time,
+				priv,
+				false, /* temporary */
+				nil,   /* params */
 			)
 		}
 		if err != nil {
@@ -448,7 +477,7 @@ func mysqlTableToCockroach(
 		stmt.Defs = append(stmt.Defs, c)
 	}
 
-	desc, err := MakeSimpleTableDescriptor(evalCtx.Ctx(), nil, stmt, parentID, id, fks, time.WallTime)
+	desc, err := MakeSimpleTableDescriptor(evalCtx.Ctx(), evalCtx.Settings, stmt, parentID, id, fks, time.WallTime)
 	if err != nil {
 		return nil, nil, err
 	}

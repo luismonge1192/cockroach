@@ -65,14 +65,14 @@ var dataManipulationReplacementInfos = []dataManipulationReplacementInfo{
 		replaceWith:         "Len",
 	},
 	{
-		templatePlaceholder: "execgen.ZERO",
-		numArgs:             1,
-		replaceWith:         "Zero",
+		templatePlaceholder: "execgen.RANGE",
+		numArgs:             4,
+		replaceWith:         "Range",
 	},
 	{
-		templatePlaceholder: "execgen.RANGE",
-		numArgs:             2,
-		replaceWith:         "Range",
+		templatePlaceholder: "execgen.WINDOW",
+		numArgs:             3,
+		replaceWith:         "Window",
 	},
 }
 

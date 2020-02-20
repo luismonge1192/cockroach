@@ -110,6 +110,11 @@ func NewRelationAlreadyExistsError(name string) error {
 	return pgerror.Newf(pgcode.DuplicateRelation, "relation %q already exists", name)
 }
 
+// IsRelationAlreadyExistsError checks whether this is an error for a preexisting relation.
+func IsRelationAlreadyExistsError(err error) bool {
+	return errHasCode(err, pgcode.DuplicateRelation)
+}
+
 // NewWrongObjectTypeError creates a wrong object type error.
 func NewWrongObjectTypeError(name tree.NodeFormatter, desiredObjType string) error {
 	return pgerror.Newf(pgcode.WrongObjectType, "%q is not a %s",
@@ -165,6 +170,11 @@ var QueryTimeoutError = pgerror.New(
 // IsOutOfMemoryError checks whether this is an out of memory error.
 func IsOutOfMemoryError(err error) bool {
 	return errHasCode(err, pgcode.OutOfMemory)
+}
+
+// IsUndefinedColumnError checks whether this is an undefined column error.
+func IsUndefinedColumnError(err error) bool {
+	return errHasCode(err, pgcode.UndefinedColumn)
 }
 
 func errHasCode(err error, code ...string) bool {

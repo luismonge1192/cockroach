@@ -269,7 +269,7 @@ EXPLAIN (VERBOSE) SELECT * FROM [53(1) AS num_ref_alias]
 # Basic filter combinations.
 # ------------------------------------------------------------------------------
 statement ok
-CREATE TABLE a (x INT PRIMARY KEY, y INT);
+CREATE TABLE a (x INT PRIMARY KEY, y INT, FAMILY (x, y));
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM a WHERE x > 1
@@ -416,7 +416,8 @@ CREATE TABLE t (
   c INT,
   d INT,
   INDEX b_idx (b) STORING (c, d),
-  UNIQUE INDEX c_idx (c) STORING (b, d)
+  UNIQUE INDEX c_idx (c) STORING (b, d),
+  FAMILY (a, b, c, d)
 )
 
 query TTBITTBB colnames
@@ -658,7 +659,7 @@ query TTTTT
 EXPLAIN (TYPES) SELECT b FROM computed ORDER BY b
 ----
 ·     distributed  false                    ·           ·
-·     vectorized   false                    ·           ·
+·     vectorized   true                     ·           ·
 scan  ·            ·                        (b string)  +b
 ·     table        computed@computed_b_idx  ·           ·
 ·     spans        ALL                      ·           ·
@@ -899,7 +900,7 @@ query TTTTT
 EXPLAIN (TYPES) SELECT i FROM num WHERE i = -1:::INT
 ----
 ·     distributed  false          ·        ·
-·     vectorized   false          ·        ·
+·     vectorized   true           ·        ·
 scan  ·            ·              (i int)  ·
 ·     table        num@num_i_key  ·        ·
 ·     spans        /-1-/0         ·        ·
@@ -908,7 +909,7 @@ query TTTTT
 EXPLAIN (TYPES) SELECT f FROM num WHERE f = -1:::FLOAT
 ----
 ·     distributed  false              ·          ·
-·     vectorized   false              ·          ·
+·     vectorized   true               ·          ·
 scan  ·            ·                  (f float)  ·
 ·     table        num@num_f_key      ·          ·
 ·     spans        /-1-/-1/PrefixEnd  ·          ·
@@ -917,7 +918,7 @@ query TTTTT
 EXPLAIN (TYPES) SELECT d FROM num WHERE d = -1:::DECIMAL
 ----
 ·     distributed  false              ·            ·
-·     vectorized   false              ·            ·
+·     vectorized   true               ·            ·
 scan  ·            ·                  (d decimal)  ·
 ·     table        num@num_d_key      ·            ·
 ·     spans        /-1-/-1/PrefixEnd  ·            ·
@@ -926,7 +927,7 @@ query TTTTT
 EXPLAIN (TYPES) SELECT n FROM num WHERE n = -'1h':::INTERVAL
 ----
 ·     distributed  false                        ·             ·
-·     vectorized   false                        ·             ·
+·     vectorized   true                         ·             ·
 scan  ·            ·                            (n interval)  ·
 ·     table        num@num_n_key                ·             ·
 ·     spans        /-01:00:00-/1 day -25:00:00  ·             ·
@@ -1236,10 +1237,10 @@ filter     ·            ·                  (x, y, z)  +x,+z
 # Verify that multi-span point lookups are parallelized.
 # ------------------------------------------------------
 statement ok
-CREATE TABLE a (a INT PRIMARY KEY, item STRING, price FLOAT, UNIQUE INDEX item (item), UNIQUE INDEX p (price))
+CREATE TABLE a (a INT PRIMARY KEY, item STRING, price FLOAT, FAMILY (a, item, price), UNIQUE INDEX item (item), UNIQUE INDEX p (price))
 
 statement ok
-CREATE TABLE b (a INT, b INT, c INT NULL, d INT NULL, PRIMARY KEY (a, b))
+CREATE TABLE b (a INT, b INT, c INT NULL, d INT NULL, PRIMARY KEY (a, b), FAMILY (a, b, c, d))
 
 # No parallel line printed out for single-span selects.
 query TTT
@@ -1495,3 +1496,29 @@ WHERE message IN
 querying next range at /Table/73/1/0
 === SPAN START: kv.DistSender: sending partial batch ===
 querying next range at /Table/73/1/10
+
+# Test for 42202 -- ensure filters can get pushed down through project-set.
+statement ok
+CREATE TABLE e (x INT PRIMARY KEY, y INT, z STRING);
+CREATE TABLE s (x INT PRIMARY KEY, y INT, z INT)
+
+query TTT
+EXPLAIN SELECT e.z, s.z, n FROM e, s, generate_series(0, s.z, 1000) as n WHERE e.y = s.y ORDER BY s.z LIMIT 10
+----
+·                              distributed  false
+·                              vectorized   false
+render                         ·            ·
+ └── limit                     ·            ·
+      │                        count        10
+      └── sort                 ·            ·
+           │                   order        +z
+           └── project set     ·            ·
+                └── hash-join  ·            ·
+                     │         type         inner
+                     │         equality     (y) = (y)
+                     ├── scan  ·            ·
+                     │         table        e@primary
+                     │         spans        ALL
+                     └── scan  ·            ·
+·                              table        s@primary
+·                              spans        ALL

@@ -15,13 +15,14 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -97,7 +98,14 @@ func (p *planner) DropTable(ctx context.Context, n *tree.DropTable) (planNode, e
 	return &dropTableNode{n: n, td: td}, nil
 }
 
+// ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
+// This is because DROP TABLE performs multiple KV operations on descriptors
+// and expects to see its own writes.
+func (n *dropTableNode) ReadingOwnWrites() {}
+
 func (n *dropTableNode) startExec(params runParams) error {
+	telemetry.Inc(sqltelemetry.SchemaChangeDrop("table"))
+
 	ctx := params.ctx
 	for _, toDel := range n.td {
 		droppedDesc := toDel.desc
@@ -116,7 +124,7 @@ func (n *dropTableNode) startExec(params runParams) error {
 			return err
 		}
 
-		droppedViews, err := params.p.dropTableImpl(params, droppedDesc)
+		droppedViews, err := params.p.dropTableImpl(ctx, droppedDesc)
 		if err != nil {
 			return err
 		}
@@ -234,10 +242,8 @@ func (p *planner) removeInterleave(ctx context.Context, ref sqlbase.ForeignKeyRe
 // on it if `cascade` is enabled). It returns a list of view names that were
 // dropped due to `cascade` behavior.
 func (p *planner) dropTableImpl(
-	params runParams, tableDesc *sqlbase.MutableTableDescriptor,
+	ctx context.Context, tableDesc *sqlbase.MutableTableDescriptor,
 ) ([]string, error) {
-	ctx := params.ctx
-
 	var droppedViews []string
 
 	// Remove foreign key back references from tables that this table has foreign
@@ -276,14 +282,14 @@ func (p *planner) dropTableImpl(
 
 	// Remove sequence dependencies.
 	for i := range tableDesc.Columns {
-		if err := removeSequenceDependencies(tableDesc, &tableDesc.Columns[i], params); err != nil {
+		if err := p.removeSequenceDependencies(ctx, tableDesc, &tableDesc.Columns[i]); err != nil {
 			return droppedViews, err
 		}
 	}
 
 	// Drop sequences that the columns of the table own
 	for _, col := range tableDesc.Columns {
-		if err := dropSequencesOwnedByCol(&col, params); err != nil {
+		if err := p.dropSequencesOwnedByCol(ctx, &col); err != nil {
 			return droppedViews, err
 		}
 	}
@@ -373,10 +379,13 @@ func (p *planner) initiateDropTable(
 
 	tableDesc.State = sqlbase.TableDescriptor_DROP
 	if drainName {
+		parentSchemaID := tableDesc.GetParentSchemaID()
+
 		// Queue up name for draining.
 		nameDetails := sqlbase.TableDescriptor_NameInfo{
-			ParentID: tableDesc.ParentID,
-			Name:     tableDesc.Name}
+			ParentID:       tableDesc.ParentID,
+			ParentSchemaID: parentSchemaID,
+			Name:           tableDesc.Name}
 		tableDesc.DrainingNames = append(tableDesc.DrainingNames, nameDetails)
 	}
 
@@ -402,12 +411,11 @@ func (p *planner) initiateDropTable(
 			return err
 		}
 
-		if err := job.WithTxn(p.txn).Succeeded(ctx, jobs.NoopFn); err != nil {
+		if err := job.WithTxn(p.txn).Succeeded(ctx, nil); err != nil {
 			return errors.Wrapf(err,
 				"failed to mark job %d as as successful", errors.Safe(jobID))
 		}
 	}
-
 	// Initiate an immediate schema change. When dropping a table
 	// in a session, the data and the descriptor are not deleted.
 	// Instead, that is taken care of asynchronously by the schema
@@ -552,9 +560,15 @@ func (p *planner) removeInterleaveBackReference(
 	if err != nil {
 		return err
 	}
+	foundAncestor := false
 	for k, ref := range targetIdx.InterleavedBy {
 		if ref.Table == tableDesc.ID && ref.Index == idx.ID {
+			if foundAncestor {
+				return errors.AssertionFailedf(
+					"ancestor entry in %s for %s@%s found more than once", t.Name, tableDesc.Name, idx.Name)
+			}
 			targetIdx.InterleavedBy = append(targetIdx.InterleavedBy[:k], targetIdx.InterleavedBy[k+1:]...)
+			foundAncestor = true
 		}
 	}
 	if t != tableDesc {
@@ -607,4 +621,19 @@ func (p *planner) removeTableComment(
 	}
 
 	return err
+}
+
+// dropObject drops a descriptor based its type. Returns the names of any
+// additional views that were also dropped due to `cascade` behavior.
+func (p *planner) dropObject(
+	ctx context.Context, desc *MutableTableDescriptor, behavior tree.DropBehavior,
+) ([]string, error) {
+	if desc.IsView() {
+		// TODO(knz): dependent dropped views should be qualified here.
+		return p.dropViewImpl(ctx, desc, behavior)
+	} else if desc.IsSequence() {
+		return nil, p.dropSequenceImpl(ctx, desc, behavior)
+	}
+	// TODO(knz): dependent dropped table names should be qualified here.
+	return p.dropTableImpl(ctx, desc)
 }

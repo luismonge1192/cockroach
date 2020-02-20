@@ -84,7 +84,8 @@ func (b *Builder) buildZip(exprs tree.Exprs, inScope *scope) (outScope *scope) {
 	for i, expr := range exprs {
 		// Output column names should exactly match the original expression, so we
 		// have to determine the output column name before we perform type
-		// checking.
+		// checking. However, the alias may be overridden later below if the expression
+		// is a function and specifically defines a return label.
 		_, alias, err := tree.ComputeColNameInternal(b.semaCtx.SearchPath, expr)
 		if err != nil {
 			panic(err)
@@ -100,20 +101,29 @@ func (b *Builder) buildZip(exprs tree.Exprs, inScope *scope) (outScope *scope) {
 
 		var outCol *scopeColumn
 		startCols := len(outScope.cols)
-		if def == nil || def.Class != tree.GeneratorClass || len(def.ReturnLabels) == 1 {
+		if def == nil || def.Class != tree.GeneratorClass || b.shouldCreateDefaultColumn(texpr) {
+
+			if def != nil && len(def.ReturnLabels) > 0 {
+				// Override the computed alias with the one defined in the ReturnLabels. This
+				// satisfies a Postgres quirk where some json functions use different labels
+				// when used in a from clause.
+				alias = def.ReturnLabels[0]
+			}
 			outCol = b.addColumn(outScope, alias, texpr)
 		}
-		zip[i].Func = b.buildScalar(texpr, inScope, outScope, outCol, nil)
-		zip[i].Cols = make(opt.ColList, len(outScope.cols)-startCols)
+
+		scalar := b.buildScalar(texpr, inScope, outScope, outCol, nil)
+		cols := make(opt.ColList, len(outScope.cols)-startCols)
 		for j := startCols; j < len(outScope.cols); j++ {
-			zip[i].Cols[j-startCols] = outScope.cols[j].id
+			cols[j-startCols] = outScope.cols[j].id
 		}
+		zip[i] = b.factory.ConstructZipItem(scalar, cols)
 	}
 
 	// Construct the zip as a ProjectSet with empty input.
 	input := b.factory.ConstructValues(memo.ScalarListWithEmptyTuple, &memo.ValuesPrivate{
 		Cols: opt.ColList{},
-		ID:   b.factory.Metadata().NextValuesID(),
+		ID:   b.factory.Metadata().NextUniqueID(),
 	})
 	outScope.expr = b.factory.ConstructProjectSet(input, zip)
 	if len(outScope.cols) == 1 {
@@ -126,10 +136,10 @@ func (b *Builder) buildZip(exprs tree.Exprs, inScope *scope) (outScope *scope) {
 // (SRF) such as generate_series() or unnest(). It synthesizes new columns in
 // outScope for each of the SRF's output columns.
 func (b *Builder) finishBuildGeneratorFunction(
-	f *tree.FuncExpr, fn opt.ScalarExpr, columns int, inScope, outScope *scope, outCol *scopeColumn,
+	f *tree.FuncExpr, fn opt.ScalarExpr, inScope, outScope *scope, outCol *scopeColumn,
 ) (out opt.ScalarExpr) {
 	// Add scope columns.
-	if columns == 1 {
+	if outCol != nil {
 		// Single-column return type.
 		b.populateSynthesizedColumn(outCol, fn)
 	} else {
@@ -165,11 +175,11 @@ func (b *Builder) buildProjectSet(inScope *scope) {
 	// Get the output columns and function expressions of the zip.
 	zip := make(memo.ZipExpr, len(inScope.srfs))
 	for i, srf := range inScope.srfs {
-		zip[i].Func = srf.fn
-		zip[i].Cols = make(opt.ColList, len(srf.cols))
+		cols := make(opt.ColList, len(srf.cols))
 		for j := range srf.cols {
-			zip[i].Cols[j] = srf.cols[j].id
+			cols[j] = srf.cols[j].id
 		}
+		zip[i] = b.factory.ConstructZipItem(srf.fn, cols)
 	}
 
 	inScope.expr = b.factory.ConstructProjectSet(inScope.expr, zip)

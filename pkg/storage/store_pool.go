@@ -17,7 +17,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -89,21 +89,67 @@ var TimeUntilStoreDead = func() *settings.DurationSetting {
 // not decommissioned nodes.
 type NodeCountFunc func() int
 
-// A NodeLivenessFunc accepts a node ID, current time and threshold before
-// a node is considered dead and returns whether or not the node is live.
-type NodeLivenessFunc func(roachpb.NodeID, time.Time, time.Duration) storagepb.NodeLivenessStatus
+// A NodeLivenessFunc accepts a node ID and current time and returns whether or
+// not the node is live. A node is considered dead if its liveness record has
+// expired by more than TimeUntilStoreDead.
+type NodeLivenessFunc func(
+	nid roachpb.NodeID, now time.Time, timeUntilStoreDead time.Duration,
+) storagepb.NodeLivenessStatus
 
 // MakeStorePoolNodeLivenessFunc returns a function which determines
 // the status of a node based on information provided by the specified
 // NodeLiveness.
 func MakeStorePoolNodeLivenessFunc(nodeLiveness *NodeLiveness) NodeLivenessFunc {
-	return func(nodeID roachpb.NodeID, now time.Time, threshold time.Duration) storagepb.NodeLivenessStatus {
+	return func(
+		nodeID roachpb.NodeID, now time.Time, timeUntilStoreDead time.Duration,
+	) storagepb.NodeLivenessStatus {
 		liveness, err := nodeLiveness.GetLiveness(nodeID)
 		if err != nil {
 			return storagepb.NodeLivenessStatus_UNAVAILABLE
 		}
-		return liveness.LivenessStatus(now, threshold, nodeLiveness.clock.MaxOffset())
+		return LivenessStatus(liveness, now, timeUntilStoreDead)
 	}
+}
+
+// LivenessStatus returns a NodeLivenessStatus enumeration value for the
+// provided Liveness based on the provided timestamp and threshold.
+//
+// See the note on IsLive() for considerations on what should be passed in as
+// `now`.
+//
+// The timeline of the states that a liveness goes through as time passes after
+// the respective liveness record is written is the following:
+//
+//  -----|-------LIVE---|------UNAVAILABLE---|------DEAD------------> time
+//       tWrite         tExp                 tExp+threshold
+//
+// Explanation:
+//
+//  - Let's say a node write its liveness record at tWrite. It sets the
+//    Expiration field of the record as tExp=tWrite+livenessThreshold.
+//    The node is considered LIVE (or DECOMISSIONING or UNAVAILABLE if draining).
+//  - At tExp, the IsLive() method starts returning false. The state becomes
+//    UNAVAILABLE (or stays DECOMISSIONING or UNAVAILABLE if draining).
+//  - Once threshold passes, the node is considered DEAD (or DECOMMISSIONED).
+func LivenessStatus(
+	l storagepb.Liveness, now time.Time, deadThreshold time.Duration,
+) storagepb.NodeLivenessStatus {
+	if l.IsDead(now, deadThreshold) {
+		if l.Decommissioning {
+			return storagepb.NodeLivenessStatus_DECOMMISSIONED
+		}
+		return storagepb.NodeLivenessStatus_DEAD
+	}
+	if l.Decommissioning {
+		return storagepb.NodeLivenessStatus_DECOMMISSIONING
+	}
+	if l.Draining {
+		return storagepb.NodeLivenessStatus_UNAVAILABLE
+	}
+	if l.IsLive(now) {
+		return storagepb.NodeLivenessStatus_LIVE
+	}
+	return storagepb.NodeLivenessStatus_UNAVAILABLE
 }
 
 type storeDetail struct {
@@ -266,7 +312,7 @@ func (sp *StorePool) String() string {
 	sort.Sort(ids)
 
 	var buf bytes.Buffer
-	now := sp.clock.PhysicalTime()
+	now := sp.clock.Now().GoTime()
 	timeUntilStoreDead := TimeUntilStoreDead.Get(&sp.st.SV)
 
 	for _, id := range ids {
@@ -431,7 +477,9 @@ func (sp *StorePool) decommissioningReplicas(
 	sp.detailsMu.Lock()
 	defer sp.detailsMu.Unlock()
 
-	now := sp.clock.PhysicalTime()
+	// NB: We use clock.Now().GoTime() instead of clock.PhysicalTime() is order to
+	// take clock signals from remote nodes into consideration.
+	now := sp.clock.Now().GoTime()
 	timeUntilStoreDead := TimeUntilStoreDead.Get(&sp.st.SV)
 
 	for _, repl := range repls {
@@ -462,7 +510,7 @@ func (sp *StorePool) liveAndDeadReplicas(
 	sp.detailsMu.Lock()
 	defer sp.detailsMu.Unlock()
 
-	now := sp.clock.PhysicalTime()
+	now := sp.clock.Now().GoTime()
 	timeUntilStoreDead := TimeUntilStoreDead.Get(&sp.st.SV)
 
 	for _, repl := range repls {
@@ -565,7 +613,7 @@ func (sl StoreList) String() string {
 
 // filter takes a store list and filters it using the passed in constraints. It
 // maintains the original order of the passed in store list.
-func (sl StoreList) filter(constraints []config.Constraints) StoreList {
+func (sl StoreList) filter(constraints []zonepb.Constraints) StoreList {
 	if len(constraints) == 0 {
 		return sl
 	}
@@ -638,7 +686,7 @@ func (sp *StorePool) getStoreListFromIDsRLocked(
 	var throttled throttledStoreReasons
 	var storeDescriptors []roachpb.StoreDescriptor
 
-	now := sp.clock.PhysicalTime()
+	now := sp.clock.Now().GoTime()
 	timeUntilStoreDead := TimeUntilStoreDead.Get(&sp.st.SV)
 
 	for _, storeID := range storeIDs {

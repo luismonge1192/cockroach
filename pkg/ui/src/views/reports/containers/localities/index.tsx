@@ -12,7 +12,8 @@ import _ from "lodash";
 import React from "react";
 import { Helmet } from "react-helmet";
 import { connect } from "react-redux";
-import { bindActionCreators, Dispatch } from "redux";
+import { withRouter } from "react-router-dom";
+
 import { refreshLocations, refreshNodes } from "src/redux/apiReducers";
 import { LocalityTier, LocalityTree, selectLocalityTree } from "src/redux/localities";
 import { LocationTree, selectLocationsRequestStatus, selectLocationTree } from "src/redux/locations";
@@ -86,7 +87,7 @@ interface LocalitiesProps {
   refreshNodes: typeof refreshNodes;
 }
 
-class Localities extends React.Component<LocalitiesProps, {}> {
+export class Localities extends React.Component<LocalitiesProps, {}> {
   componentWillMount() {
     this.props.refreshLocations();
     this.props.refreshNodes();
@@ -100,10 +101,8 @@ class Localities extends React.Component<LocalitiesProps, {}> {
   render() {
     return (
       <div>
-        <Helmet>
-          <title>Localities | Debug</title>
-        </Helmet>
-        <section className="section"><h1>Localities</h1></section>
+        <Helmet title="Localities | Debug" />
+        <section className="section"><h1 className="base-heading page-title">Localities</h1></section>
         <Loading
           loading={ !this.props.localityStatus.data || !this.props.locationStatus.data }
           error={ [this.props.localityStatus.lastError, this.props.locationStatus.lastError] }
@@ -136,13 +135,9 @@ const mapStateToProps = (state: AdminUIState) => ({ // RootState contains declar
   locationStatus: selectLocationsRequestStatus(state),
 });
 
-const mapDispatchToProps = (dispatch: Dispatch<AdminUIState>) =>
-  bindActionCreators(
-    {
-      refreshLocations,
-      refreshNodes,
-    },
-    dispatch,
-  );
+const mapDispatchToProps = {
+  refreshLocations,
+  refreshNodes,
+};
 
-export default connect(mapStateToProps, mapDispatchToProps)(Localities);
+export default withRouter(connect(mapStateToProps, mapDispatchToProps)(Localities));

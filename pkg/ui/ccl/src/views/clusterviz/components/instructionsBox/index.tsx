@@ -7,8 +7,9 @@
 //     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
 
 import React from "react";
-import { connect, Dispatch } from "react-redux";
-import { Link } from "react-router";
+import { Dispatch, Action } from "redux";
+import { connect } from "react-redux";
+import { Link } from "react-router-dom";
 import classNames from "classnames";
 
 import { allNodesHaveLocality } from "src/util/localities";
@@ -108,7 +109,7 @@ function mapStateToProps(state: AdminUIState) {
   };
 }
 
-function mapDispatchToProps(dispatch: Dispatch<AdminUIState>) {
+function mapDispatchToProps(dispatch: Dispatch<Action, AdminUIState>) {
   return {
     expand: () => dispatch(setInstructionsBoxCollapsed(false)),
     collapse: () => dispatch(setInstructionsBoxCollapsed(true)),

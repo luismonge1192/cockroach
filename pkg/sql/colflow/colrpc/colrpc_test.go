@@ -283,19 +283,24 @@ func TestOutboxInbox(t *testing.T) {
 			if cancellationScenario == noCancel {
 				// Accumulate batches to check for correctness.
 				// Copy batch since it's not safe to reuse after calling Next.
-				batchCopy := testAllocator.NewMemBatchWithSize(typs, int(outputBatch.Length()))
-				for i := range typs {
-					testAllocator.Append(
-						batchCopy.ColVec(i),
-						coldata.SliceArgs{
-							ColType:   typs[i],
-							Src:       outputBatch.ColVec(i),
-							SrcEndIdx: uint64(outputBatch.Length()),
-						},
-					)
+				if outputBatch == coldata.ZeroBatch {
+					outputBatches.Add(coldata.ZeroBatch)
+				} else {
+					batchCopy := testAllocator.NewMemBatchWithSize(typs, int(outputBatch.Length()))
+					testAllocator.PerformOperation(batchCopy.ColVecs(), func() {
+						for i := range typs {
+							batchCopy.ColVec(i).Append(
+								coldata.SliceArgs{
+									ColType:   typs[i],
+									Src:       outputBatch.ColVec(i),
+									SrcEndIdx: uint64(outputBatch.Length()),
+								},
+							)
+						}
+					})
+					batchCopy.SetLength(outputBatch.Length())
+					outputBatches.Add(batchCopy)
 				}
-				batchCopy.SetLength(outputBatch.Length())
-				outputBatches.Add(batchCopy)
 			}
 			if outputBatch.Length() == 0 {
 				break
@@ -329,8 +334,8 @@ func TestOutboxInbox(t *testing.T) {
 				for i := range typs {
 					require.Equal(
 						t,
-						inputBatch.ColVec(i).Slice(typs[i], 0, uint64(inputBatch.Length())),
-						outputBatch.ColVec(i).Slice(typs[i], 0, uint64(outputBatch.Length())),
+						inputBatch.ColVec(i).Window(typs[i], 0, uint64(inputBatch.Length())),
+						outputBatch.ColVec(i).Window(typs[i], 0, uint64(outputBatch.Length())),
 						"batchNum: %d", batchNum,
 					)
 				}
@@ -530,7 +535,7 @@ func BenchmarkOutboxInbox(b *testing.B) {
 	batch := testAllocator.NewMemBatch(typs)
 	batch.SetLength(coldata.BatchSize())
 
-	input := colexec.NewRepeatableBatchSource(batch)
+	input := colexec.NewRepeatableBatchSource(testAllocator, batch)
 
 	outboxMemAcc := testMemMonitor.MakeBoundAccount()
 	defer outboxMemAcc.Close(ctx)

@@ -10,7 +10,9 @@
 
 import classNames from "classnames";
 import _ from "lodash";
+import getHighlightedText from "oss/src/util/highlightedText";
 import React from "react";
+import { DrawerComponent } from "../drawer";
 import "./sortabletable.styl";
 
 /**
@@ -65,6 +67,8 @@ interface TableProps {
   // i.e. each row has an expand/collapse arrow on its left, and renders
   // a full-width area below it when expanded.
   expandableConfig?: ExpandableConfig;
+  drawer?: boolean;
+  firstCellBordered?: boolean;
 }
 
 export interface ExpandableConfig {
@@ -97,6 +101,15 @@ export class SortableTable extends React.Component<TableProps> {
     },
     onChangeSortSetting: (_ss) => { },
     rowClass: (_rowIndex) => "",
+  };
+
+  state = {
+    visible: false,
+    drawerData: {
+      statement: "",
+      search: "",
+    },
+    activeIndex: NaN,
   };
 
   clickSort(clickedSortKey: any) {
@@ -132,11 +145,11 @@ export class SortableTable extends React.Component<TableProps> {
   }
 
   renderRow = (rowIndex: number) => {
-    const { columns, expandableConfig } = this.props;
-
+    const { columns, expandableConfig, drawer, firstCellBordered } = this.props;
     const classes = classNames(
       "sort-table__row",
       "sort-table__row--body",
+      this.state.activeIndex === rowIndex ? "drawer-active" : "",
       this.props.rowClass(rowIndex),
       { "sort-table__row--expandable": !!expandableConfig },
     );
@@ -146,12 +159,20 @@ export class SortableTable extends React.Component<TableProps> {
       <tr
         key={rowIndex}
         className={classes}
-        onClick={() => onClickExpand(rowIndex, !expanded)}
+        onClick={() => {
+          if (drawer) {
+            this.setState({ activeIndex: rowIndex });
+            this.showDrawer(rowIndex);
+          }
+          if (onClickExpand) {
+            onClickExpand(rowIndex, !expanded);
+          }
+        }}
       >
         {expandableConfig ? this.expansionControl(expanded) : null}
         {_.map(columns, (c: SortableColumn, colIndex: number) => {
           return (
-            <td className={classNames("sort-table__cell", c.className)} key={colIndex}>
+            <td className={classNames("sort-table__cell", { "sort-table__cell--header": firstCellBordered && colIndex === 0 }, c.className)} key={colIndex}>
               {c.cell(rowIndex)}
             </td>
           );
@@ -183,42 +204,87 @@ export class SortableTable extends React.Component<TableProps> {
     return output;
   }
 
-  render() {
-    const { sortSetting, columns, expandableConfig } = this.props;
-    return (
-      <table className={classNames("sort-table", this.props.className)}>
-        <thead>
-          <tr className="sort-table__row sort-table__row--header">
-            {expandableConfig ? <th className="sort-table__cell" /> : null}
-            {_.map(columns, (c: SortableColumn, colIndex: number) => {
-              const classes = ["sort-table__cell"];
-              let onClick: (e: any) => void = undefined;
+  showDrawer = (rowIndex: number) => {
+    const { drawer, columns } = this.props;
+    const { drawerData } = this.state;
+    const values: any = columns[0].cell(rowIndex);
+    this.setState({
+      visible: true,
+      drawerData: drawer ? values.props : drawerData,
+    });
+  }
 
-              if (!_.isUndefined(c.sortKey)) {
-                classes.push("sort-table__cell--sortable");
-                onClick = () => {
-                  this.clickSort(c.sortKey);
-                };
-                if (c.sortKey === sortSetting.sortKey) {
-                  if (sortSetting.ascending) {
-                    classes.push(" sort-table__cell--ascending");
-                  } else {
-                    classes.push("sort-table__cell--descending");
+  onClose = () => {
+    this.setState({
+      visible: false,
+      drawerData: {
+        statement: "",
+        search: "",
+      },
+      activeIndex: NaN,
+    });
+  }
+
+  onChange = (e: { target: { value: any; }; }) => {
+    this.setState({
+      placement: e.target.value,
+    });
+  }
+
+  render() {
+    const { sortSetting, columns, expandableConfig, drawer, firstCellBordered, count } = this.props;
+    const { visible, drawerData } = this.state;
+    return (
+      <React.Fragment>
+        <table className={classNames("sort-table", this.props.className)}>
+          <thead>
+            <tr className="sort-table__row sort-table__row--header">
+              {expandableConfig ? <th className="sort-table__cell" /> : null}
+              {_.map(columns, (c: SortableColumn, colIndex: number) => {
+                const classes = ["sort-table__cell"];
+                let onClick: (e: any) => void = undefined;
+
+                if (!_.isUndefined(c.sortKey)) {
+                  classes.push("sort-table__cell--sortable");
+                  onClick = () => {
+                    this.clickSort(c.sortKey);
+                  };
+                  if (c.sortKey === sortSetting.sortKey) {
+                    if (sortSetting.ascending) {
+                      classes.push(" sort-table__cell--ascending");
+                    } else {
+                      classes.push("sort-table__cell--descending");
+                    }
                   }
                 }
-              }
-              return (
-                <th className={classNames(classes)} key={colIndex} onClick={onClick}>
-                  {c.title}
-                </th>
-              );
-            })}
-          </tr>
-        </thead>
-        <tbody>
-          {_.times(this.props.count, this.renderRow)}
-        </tbody>
-      </table>
+                if (firstCellBordered && colIndex === 0) {
+                  classes.push("sort-table__cell--header");
+                }
+                return (
+                  <th className={classNames(classes)} key={colIndex} onClick={onClick}>
+                    {c.title}
+                    {!_.isUndefined(c.sortKey) && <span className="sortable__actions" />}
+                  </th>
+                );
+              })}
+            </tr>
+          </thead>
+          <tbody>
+            {_.times(this.props.count, this.renderRow)}
+          </tbody>
+        </table>
+        {drawer && (
+          <DrawerComponent visible={visible} onClose={this.onClose} data={drawerData} details>
+            <span className="drawer__content">{getHighlightedText(drawerData.statement, drawerData.search, true)}</span>
+          </DrawerComponent>
+        )}
+        {count === 0 && (
+          <div className="table__no-results">
+            <p>There are no SQL statements that match your search or filter since this page was last cleared.</p>
+            <a href="https://www.cockroachlabs.com/docs/stable/admin-ui-statements-page.html" target="_blank">Learn more about the statement page</a>
+          </div>
+        )}
+      </React.Fragment>
     );
   }
 }

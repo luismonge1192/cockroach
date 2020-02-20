@@ -350,12 +350,7 @@ func init() {
 		VarFlag(f, &serverCfg.StorageEngine, cliflags.StorageEngine)
 		VarFlag(f, &serverCfg.MaxOffset, cliflags.MaxOffset)
 
-		// Usage for the unix socket is odd as we use a real file, whereas
-		// postgresql and clients consider it a directory and build a filename
-		// inside it using the port.
-		// Thus, we keep it hidden and use it for testing only.
 		StringFlag(f, &serverCfg.SocketFile, cliflags.Socket, serverCfg.SocketFile)
-		_ = f.MarkHidden(cliflags.Socket.Name)
 
 		StringFlag(f, &startCtx.listeningURLFile, cliflags.ListeningURLFile, startCtx.listeningURLFile)
 
@@ -450,8 +445,6 @@ func init() {
 	// PKCS8 key format is only available for the client cert command.
 	BoolFlag(createClientCertCmd.Flags(), &generatePKCS8Key, cliflags.GeneratePKCS8Key, false)
 
-	BoolFlag(setUserCmd.Flags(), &password, cliflags.Password, false)
-
 	clientCmds := []*cobra.Command{
 		debugGossipValuesCmd,
 		debugTimeSeriesDumpCmd,
@@ -462,10 +455,11 @@ func init() {
 		sqlShellCmd,
 		/* StartCmds are covered above */
 	}
-	clientCmds = append(clientCmds, userCmds...)
+	clientCmds = append(clientCmds, authCmds...)
 	clientCmds = append(clientCmds, nodeCmds...)
 	clientCmds = append(clientCmds, systemBenchCmds...)
 	clientCmds = append(clientCmds, initCmd)
+	clientCmds = append(clientCmds, nodeLocalCmds...)
 	for _, cmd := range clientCmds {
 		f := cmd.PersistentFlags()
 		VarFlag(f, addrSetter{&cliCtx.clientConnHost, &cliCtx.clientConnPort}, cliflags.ClientHost)
@@ -476,6 +470,13 @@ func init() {
 
 		// Certificate flags.
 		StringFlag(f, &baseCfg.SSLCertsDir, cliflags.CertsDir, baseCfg.SSLCertsDir)
+	}
+
+	// Auth commands.
+	{
+		f := loginCmd.Flags()
+		DurationFlag(f, &authCtx.validityPeriod, cliflags.AuthTokenValidityPeriod, authCtx.validityPeriod)
+		BoolFlag(f, &authCtx.onlyCookie, cliflags.OnlyCookie, authCtx.onlyCookie)
 	}
 
 	timeoutCmds := []*cobra.Command{
@@ -546,8 +547,9 @@ func init() {
 
 	// Commands that establish a SQL connection.
 	sqlCmds := []*cobra.Command{sqlShellCmd, dumpCmd, demoCmd}
-	sqlCmds = append(sqlCmds, userCmds...)
+	sqlCmds = append(sqlCmds, authCmds...)
 	sqlCmds = append(sqlCmds, demoCmd.Commands()...)
+	sqlCmds = append(sqlCmds, nodeLocalCmds...)
 	for _, cmd := range sqlCmds {
 		f := cmd.Flags()
 		BoolFlag(f, &sqlCtx.echo, cliflags.EchoSQL, sqlCtx.echo)
@@ -576,8 +578,8 @@ func init() {
 	tableOutputCommands := append(
 		[]*cobra.Command{sqlShellCmd, genSettingsListCmd, demoCmd},
 		demoCmd.Commands()...)
-	tableOutputCommands = append(tableOutputCommands, userCmds...)
 	tableOutputCommands = append(tableOutputCommands, nodeCmds...)
+	tableOutputCommands = append(tableOutputCommands, authCmds...)
 
 	// By default, these commands print their output as pretty-formatted
 	// tables on terminals, and TSV when redirected to a file. The user
@@ -597,6 +599,8 @@ func init() {
 	BoolFlag(demoFlags, &demoCtx.runWorkload, cliflags.RunDemoWorkload, false)
 	VarFlag(demoFlags, &demoCtx.localities, cliflags.DemoNodeLocality)
 	BoolFlag(demoFlags, &demoCtx.geoPartitionedReplicas, cliflags.DemoGeoPartitionedReplicas, false)
+	VarFlag(demoFlags, demoNodeSQLMemSizeValue, cliflags.DemoNodeSQLMemSize)
+	VarFlag(demoFlags, demoNodeCacheSizeValue, cliflags.DemoNodeCacheSize)
 	// Mark the --global flag as hidden until we investigate it more.
 	BoolFlag(demoFlags, &demoCtx.simulateLatency, cliflags.Global, false)
 	_ = demoFlags.MarkHidden(cliflags.Global.Name)

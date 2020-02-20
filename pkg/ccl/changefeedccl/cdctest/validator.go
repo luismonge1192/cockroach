@@ -73,7 +73,7 @@ func (v *orderValidator) NoteRow(
 
 	timestamps := v.keyTimestamps[key]
 	timestampsIdx := sort.Search(len(timestamps), func(i int) bool {
-		return !timestamps[i].Less(updated)
+		return updated.LessEq(timestamps[i])
 	})
 	seen := timestampsIdx < len(timestamps) && timestamps[timestampsIdx] == updated
 
@@ -127,7 +127,7 @@ type beforeAfterValidator struct {
 func NewBeforeAfterValidator(sqlDB *gosql.DB, table string) (Validator, error) {
 	primaryKeyCols, err := fetchPrimaryKeyCols(sqlDB, table)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "fetchPrimaryKeyCols failed")
 	}
 
 	return &beforeAfterValidator{
@@ -346,13 +346,12 @@ func (v *fingerprintValidator) NoteRow(
 }
 
 // applyRowUpdate applies the update represented by `row` to the scratch table.
-func (v *fingerprintValidator) applyRowUpdate(row validatorRow) error {
-	txn, err := v.sqlDB.Begin()
-	if err != nil {
-		return err
-	}
-	var args []interface{}
+func (v *fingerprintValidator) applyRowUpdate(row validatorRow) (_err error) {
+	defer func() {
+		_err = errors.Wrap(_err, "fingerprintValidator failed")
+	}()
 
+	var args []interface{}
 	var primaryKeyDatums []interface{}
 	if err := gojson.Unmarshal([]byte(row.key), &primaryKeyDatums); err != nil {
 		return err
@@ -419,20 +418,15 @@ func (v *fingerprintValidator) applyRowUpdate(row validatorRow) error {
 			args = append(args, datum)
 		}
 	}
-	if _, err := txn.Exec(stmtBuf.String(), args...); err != nil {
-		return err
-	}
-	if err := txn.Commit(); err != nil {
-		return err
-	}
-	return nil
+	_, err := v.sqlDB.Exec(stmtBuf.String(), args...)
+	return err
 }
 
 // NoteResolved implements the Validator interface.
 func (v *fingerprintValidator) NoteResolved(partition string, resolved hlc.Timestamp) error {
 	if r, ok := v.partitionResolved[partition]; !ok {
 		return errors.Errorf(`unknown partition: %s`, partition)
-	} else if !r.Less(resolved) {
+	} else if resolved.LessEq(r) {
 		return nil
 	}
 	v.partitionResolved[partition] = resolved
@@ -446,7 +440,7 @@ func (v *fingerprintValidator) NoteResolved(partition string, resolved hlc.Times
 			newResolved = r
 		}
 	}
-	if !v.resolved.Less(newResolved) {
+	if newResolved.LessEq(v.resolved) {
 		return nil
 	}
 	v.resolved = newResolved
@@ -492,7 +486,7 @@ func (v *fingerprintValidator) NoteResolved(partition string, resolved hlc.Times
 		v.previousRowUpdateTs = row.updated
 	}
 
-	if !v.firstRowTimestamp.IsEmpty() && !resolved.Less(v.firstRowTimestamp) &&
+	if !v.firstRowTimestamp.IsEmpty() && v.firstRowTimestamp.LessEq(resolved) &&
 		lastFingerprintedAt != resolved {
 		return v.fingerprint(resolved)
 	}

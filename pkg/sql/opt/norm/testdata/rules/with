@@ -72,7 +72,7 @@ values
 norm format=show-all expect=InlineWith
 WITH foo AS (SELECT 1) SELECT * FROM foo CROSS JOIN (VALUES (2))
 ----
-inner-join (hash)
+inner-join (cross)
  ├── columns: "?column?":2(int!null) column1:3(int!null)
  ├── cardinality: [1 - 1]
  ├── stats: [rows=1]
@@ -105,7 +105,7 @@ inner-join (hash)
 norm expect=InlineWith
 WITH foo AS (SELECT 1), bar AS (SELECT 2) SELECT * FROM foo CROSS JOIN bar
 ----
-inner-join (hash)
+inner-join (cross)
  ├── columns: "?column?":3(int!null) "?column?":4(int!null)
  ├── cardinality: [1 - 1]
  ├── key: ()
@@ -212,12 +212,12 @@ with &2 (bar)
  │    ├── key: ()
  │    ├── fd: ()-->(2)
  │    └── (2,) [type=tuple{int}]
- └── inner-join (hash)
+ └── inner-join (cross)
       ├── columns: "?column?":3(int!null) "?column?":4(int!null) "?column?":5(int!null)
       ├── cardinality: [1 - 1]
       ├── key: ()
       ├── fd: ()-->(3-5)
-      ├── inner-join (hash)
+      ├── inner-join (cross)
       │    ├── columns: "?column?":3(int!null) "?column?":4(int!null)
       │    ├── cardinality: [1 - 1]
       │    ├── key: ()
@@ -290,7 +290,7 @@ with &1 (foo)
       │    ├── prune: (2)
       │    └── tuple [type=tuple{int}]
       │         └── const: 2 [type=int]
-      └── inner-join (hash)
+      └── inner-join (cross)
            ├── columns: "?column?":3(int!null) "?column?":4(int!null) "?column?":5(int!null) "?column?":6(int!null)
            ├── cardinality: [1 - 1]
            ├── stats: [rows=1]
@@ -299,7 +299,7 @@ with &1 (foo)
            ├── fd: ()-->(3-6)
            ├── prune: (3-6)
            ├── cte-uses: map[1:2 2:2]
-           ├── inner-join (hash)
+           ├── inner-join (cross)
            │    ├── columns: "?column?":3(int!null) "?column?":4(int!null) "?column?":5(int!null)
            │    ├── cardinality: [1 - 1]
            │    ├── stats: [rows=1]
@@ -309,7 +309,7 @@ with &1 (foo)
            │    ├── prune: (3-5)
            │    ├── join-size: 3
            │    ├── cte-uses: map[1:1 2:2]
-           │    ├── inner-join (hash)
+           │    ├── inner-join (cross)
            │    │    ├── columns: "?column?":3(int!null) "?column?":4(int!null)
            │    │    ├── cardinality: [1 - 1]
            │    │    ├── stats: [rows=1]
@@ -498,3 +498,48 @@ values
  ├── key: ()
  ├── fd: ()-->(5)
  └── (12,) [type=tuple{int}]
+
+# Regression test for #43148: WithScans with no columns should still be
+# uniquely identifiable. Without this uniqueness, they can't be assigned
+# different required physical properties.
+norm
+WITH cte AS (SELECT * FROM a) (SELECT 1 FROM cte LIMIT 9) UNION (SELECT 1 FROM cte LIMIT 10)
+----
+with &1 (cte)
+ ├── columns: "?column?":18(int!null)
+ ├── cardinality: [0 - 19]
+ ├── key: (18)
+ ├── scan a
+ │    ├── columns: a.k:1(int!null) a.i:2(int) a.f:3(float) a.s:4(string) a.j:5(jsonb)
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2-5)
+ └── union
+      ├── columns: "?column?":18(int!null)
+      ├── left columns: "?column?":11(int)
+      ├── right columns: "?column?":17(int)
+      ├── cardinality: [0 - 19]
+      ├── key: (18)
+      ├── project
+      │    ├── columns: "?column?":11(int!null)
+      │    ├── cardinality: [0 - 9]
+      │    ├── fd: ()-->(11)
+      │    ├── limit
+      │    │    ├── cardinality: [0 - 9]
+      │    │    ├── with-scan &1 (cte)
+      │    │    │    ├── mapping:
+      │    │    │    └── limit hint: 9.00
+      │    │    └── const: 9 [type=int]
+      │    └── projections
+      │         └── const: 1 [type=int]
+      └── project
+           ├── columns: "?column?":17(int!null)
+           ├── cardinality: [0 - 10]
+           ├── fd: ()-->(17)
+           ├── limit
+           │    ├── cardinality: [0 - 10]
+           │    ├── with-scan &1 (cte)
+           │    │    ├── mapping:
+           │    │    └── limit hint: 10.00
+           │    └── const: 10 [type=int]
+           └── projections
+                └── const: 1 [type=int]

@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
@@ -326,40 +327,74 @@ func TestDFloatCompare(t *testing.T) {
 	}
 }
 
-// TestParseDIntervalWithField tests that the additional features available
-// to tree.ParseDIntervalWithField beyond those in tree.ParseDInterval behave as expected.
-func TestParseDIntervalWithField(t *testing.T) {
+// TestParseDIntervalWithTypeMetadata tests that the additional features available
+// to tree.ParseDIntervalWithTypeMetadata beyond those in tree.ParseDInterval behave as expected.
+func TestParseDIntervalWithTypeMetadata(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
+	var (
+		second = types.IntervalTypeMetadata{
+			DurationField: types.IntervalDurationField{
+				DurationType: types.IntervalDurationType_SECOND,
+			},
+		}
+		minute = types.IntervalTypeMetadata{
+			DurationField: types.IntervalDurationField{
+				DurationType: types.IntervalDurationType_MINUTE,
+			},
+		}
+		hour = types.IntervalTypeMetadata{
+			DurationField: types.IntervalDurationField{
+				DurationType: types.IntervalDurationType_HOUR,
+			},
+		}
+		day = types.IntervalTypeMetadata{
+			DurationField: types.IntervalDurationField{
+				DurationType: types.IntervalDurationType_DAY,
+			},
+		}
+		month = types.IntervalTypeMetadata{
+			DurationField: types.IntervalDurationField{
+				DurationType: types.IntervalDurationType_MONTH,
+			},
+		}
+		year = types.IntervalTypeMetadata{
+			DurationField: types.IntervalDurationField{
+				DurationType: types.IntervalDurationType_YEAR,
+			},
+		}
+	)
+
 	testData := []struct {
 		str      string
-		field    tree.DurationField
+		dtype    types.IntervalTypeMetadata
 		expected string
 	}{
 		// Test cases for raw numbers with fields
-		{"5", tree.Second, "5s"},
-		{"5.8", tree.Second, "5.8s"},
-		{"5", tree.Minute, "5m"},
-		{"5.8", tree.Minute, "5m"},
-		{"5", tree.Hour, "5h"},
-		{"5.8", tree.Hour, "5h"},
-		{"5", tree.Day, "5 day"},
-		{"5.8", tree.Day, "5 day"},
-		{"5", tree.Month, "5 month"},
-		{"5.8", tree.Month, "5 month"},
-		{"5", tree.Year, "5 year"},
-		{"5.8", tree.Year, "5 year"},
+		{"5", second, "5s"},
+		{"5.8", second, "5.8s"},
+		{"5", minute, "5m"},
+		{"5.8", minute, "5m"},
+		{"5", hour, "5h"},
+		{"5.8", hour, "5h"},
+		{"5", day, "5 day"},
+		{"5.8", day, "5 day"},
+		{"5", month, "5 month"},
+		{"5.8", month, "5 month"},
+		{"5", year, "5 year"},
+		{"5.8", year, "5 year"},
 		// Test cases for truncation based on fields
-		{"1-2 3 4:56:07", tree.Second, "1-2 3 4:56:07"},
-		{"1-2 3 4:56:07", tree.Minute, "1-2 3 4:56:00"},
-		{"1-2 3 4:56:07", tree.Hour, "1-2 3 4:00:00"},
-		{"1-2 3 4:56:07", tree.Day, "1-2 3 0:"},
-		{"1-2 3 4:56:07", tree.Month, "1-2 0 0:"},
-		{"1-2 3 4:56:07", tree.Year, "1 year"},
+		{"1-2 3 4:56:07", second, "1-2 3 4:56:07"},
+		{"1-2 3 4:56:07", minute, "1-2 3 4:56:00"},
+		{"1-2 3 4:56:07", hour, "1-2 3 4:00:00"},
+		{"1-2 3 4:56:07", day, "1-2 3 0:"},
+		{"1-2 3 4:56:07", month, "1-2 0 0:"},
+		{"1-2 3 4:56:07", year, "1 year"},
 	}
 	for _, td := range testData {
-		actual, err := tree.ParseDIntervalWithField(td.str, td.field)
+		actual, err := tree.ParseDIntervalWithTypeMetadata(td.str, td.dtype)
 		if err != nil {
-			t.Errorf("unexpected error while parsing INTERVAL %s %d: %s", td.str, td.field, err)
+			t.Errorf("unexpected error while parsing INTERVAL %s %#v: %s", td.str, td.dtype, err)
 			continue
 		}
 		expected, err := tree.ParseDInterval(td.expected)
@@ -370,7 +405,7 @@ func TestParseDIntervalWithField(t *testing.T) {
 		evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 		defer evalCtx.Stop(context.Background())
 		if expected.Compare(evalCtx, actual) != 0 {
-			t.Errorf("INTERVAL %s %v: got %s, expected %s", td.str, td.field, actual, expected)
+			t.Errorf("INTERVAL %s %#v: got %s, expected %s", td.str, td.dtype, actual, expected)
 		}
 	}
 }
@@ -484,19 +519,30 @@ func TestParseDTime(t *testing.T) {
 	// Since ParseDTime mostly delegates parsing logic to ParseDTimestamp, we only test a subset of
 	// the timestamp test cases.
 	testData := []struct {
-		str      string
-		expected timeofday.TimeOfDay
+		str       string
+		precision time.Duration
+		expected  timeofday.TimeOfDay
 	}{
-		{"04:05:06", timeofday.New(4, 5, 6, 0)},
-		{"04:05:06.000001", timeofday.New(4, 5, 6, 1)},
-		{"04:05:06-07", timeofday.New(4, 5, 6, 0)},
-		{"4:5:6", timeofday.New(4, 5, 6, 0)},
-		{"24:00:00", timeofday.Time2400},
-		{"24:00:00.000", timeofday.Time2400},
-		{"24:00:00.000000", timeofday.Time2400},
+		{" 04:05:06 ", time.Microsecond, timeofday.New(4, 5, 6, 0)},
+		{"04:05:06", time.Microsecond, timeofday.New(4, 5, 6, 0)},
+		{"04:05:06.000001", time.Microsecond, timeofday.New(4, 5, 6, 1)},
+		{"04:05:06.000001", time.Second, timeofday.New(4, 5, 6, 0)},
+		{"04:05:06-07", time.Microsecond, timeofday.New(4, 5, 6, 0)},
+		{"0000-01-01 04:05:06", time.Microsecond, timeofday.New(4, 5, 6, 0)},
+		{"2001-01-01 04:05:06", time.Microsecond, timeofday.New(4, 5, 6, 0)},
+		{"4:5:6", time.Microsecond, timeofday.New(4, 5, 6, 0)},
+		{"24:00:00", time.Microsecond, timeofday.Time2400},
+		{"24:00:00.000", time.Microsecond, timeofday.Time2400},
+		{"24:00:00.000000", time.Microsecond, timeofday.Time2400},
+		{"0000-01-01T24:00:00", time.Microsecond, timeofday.Time2400},
+		{"0000-01-01T24:00:00.0", time.Microsecond, timeofday.Time2400},
+		{"0000-01-01 24:00:00", time.Microsecond, timeofday.Time2400},
+		{"0000-01-01 24:00:00.0", time.Microsecond, timeofday.Time2400},
+		{" 24:00:00.0", time.Microsecond, timeofday.Time2400},
+		{" 24:00:00.0  ", time.Microsecond, timeofday.Time2400},
 	}
 	for _, td := range testData {
-		actual, err := tree.ParseDTime(nil, td.str)
+		actual, err := tree.ParseDTime(nil, td.str, td.precision)
 		if err != nil {
 			t.Errorf("unexpected error while parsing TIME %s: %s", td.str, err)
 			continue
@@ -515,7 +561,7 @@ func TestParseDTimeError(t *testing.T) {
 		"01",
 	}
 	for _, s := range testData {
-		actual, _ := tree.ParseDTime(nil, s)
+		actual, _ := tree.ParseDTime(nil, s, time.Microsecond)
 		if actual != nil {
 			t.Errorf("TIME %s: got %s, expected error", s, actual)
 		}
@@ -592,15 +638,23 @@ func TestMakeDJSON(t *testing.T) {
 func TestDTimeTZ(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	maxTime, err := tree.ParseDTimeTZ(nil, "24:00:00-1559")
+	ctx := &tree.EvalContext{
+		SessionData: &sessiondata.SessionData{
+			DataConversion: sessiondata.DataConversionConfig{
+				Location: time.UTC,
+			},
+		},
+	}
+
+	maxTime, err := tree.ParseDTimeTZ(ctx, "24:00:00-1559", time.Microsecond)
 	require.NoError(t, err)
-	minTime, err := tree.ParseDTimeTZ(nil, "00:00:00+1559")
+	minTime, err := tree.ParseDTimeTZ(ctx, "00:00:00+1559", time.Microsecond)
 	require.NoError(t, err)
 
 	// These are all the same UTC time equivalents.
-	utcTime, err := tree.ParseDTimeTZ(nil, "11:14:15+0")
+	utcTime, err := tree.ParseDTimeTZ(ctx, "11:14:15+0", time.Microsecond)
 	require.NoError(t, err)
-	sydneyTime, err := tree.ParseDTimeTZ(nil, "21:14:15+10")
+	sydneyTime, err := tree.ParseDTimeTZ(ctx, "21:14:15+10", time.Microsecond)
 	require.NoError(t, err)
 
 	// No daylight savings in Hawaii!
@@ -670,7 +724,7 @@ func TestDTimeTZ(t *testing.T) {
 	for i, tc := range testCases {
 		t.Run(fmt.Sprintf("#%d %s", i, tc.t.String()), func(t *testing.T) {
 			var largerThan []tree.Datum
-			prev, ok := tc.t.Prev(nil)
+			prev, ok := tc.t.Prev(ctx)
 			if !tc.isMin {
 				assert.True(t, ok)
 				largerThan = append(largerThan, prev)
@@ -678,11 +732,11 @@ func TestDTimeTZ(t *testing.T) {
 				assert.False(t, ok)
 			}
 			for _, largerThan := range append(largerThan, tc.largerThan...) {
-				assert.Equal(t, 1, tc.t.Compare(nil, largerThan), "%s > %s", tc.t.String(), largerThan.String())
+				assert.Equal(t, 1, tc.t.Compare(ctx, largerThan), "%s > %s", tc.t.String(), largerThan.String())
 			}
 
 			var smallerThan []tree.Datum
-			next, ok := tc.t.Next(nil)
+			next, ok := tc.t.Next(ctx)
 			if !tc.isMax {
 				assert.True(t, ok)
 				smallerThan = append(smallerThan, next)
@@ -690,15 +744,15 @@ func TestDTimeTZ(t *testing.T) {
 				assert.False(t, ok)
 			}
 			for _, smallerThan := range append(smallerThan, tc.smallerThan...) {
-				assert.Equal(t, -1, tc.t.Compare(nil, smallerThan), "%s < %s", tc.t.String(), smallerThan.String())
+				assert.Equal(t, -1, tc.t.Compare(ctx, smallerThan), "%s < %s", tc.t.String(), smallerThan.String())
 			}
 
 			for _, equalTo := range tc.equalTo {
-				assert.Equal(t, 0, tc.t.Compare(nil, equalTo), "%s = %s", tc.t.String(), equalTo.String())
+				assert.Equal(t, 0, tc.t.Compare(ctx, equalTo), "%s = %s", tc.t.String(), equalTo.String())
 			}
 
-			assert.Equal(t, tc.isMax, tc.t.IsMax(nil))
-			assert.Equal(t, tc.isMin, tc.t.IsMin(nil))
+			assert.Equal(t, tc.isMax, tc.t.IsMax(ctx))
+			assert.Equal(t, tc.isMin, tc.t.IsMin(ctx))
 		})
 	}
 }
@@ -804,7 +858,7 @@ func TestAllTypesAsJSON(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	for _, typ := range types.Scalar {
 		d := tree.SampleDatum(typ)
-		_, err := tree.AsJSON(d)
+		_, err := tree.AsJSON(d, time.UTC)
 		if err != nil {
 			t.Errorf("couldn't convert %s to JSON: %s", d, err)
 		}
